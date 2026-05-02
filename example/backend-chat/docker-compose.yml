@@ -1,0 +1,12 @@
+version: "3.9"
+
+services:
+  centrifugo:
+    image: centrifugo/centrifugo:v6
+    container_name: backend-chat-centrifugo
+    command: centrifugo -c /centrifugo/config.json
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./centrifugo/config.json:/centrifugo/config.json:ro
+    restart: unless-stopped

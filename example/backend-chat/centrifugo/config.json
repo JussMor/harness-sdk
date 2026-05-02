@@ -1,0 +1,8 @@
+{
+  "engine": "memory",
+  "api_key": "backend-chat-dev-api-key",
+  "token_hmac_secret_key": "backend-chat-dev-token-secret",
+  "admin_password": "admin",
+  "admin_secret": "backend-chat-admin-secret",
+  "allowed_origins": ["*"]
+}

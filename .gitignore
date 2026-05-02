@@ -1,2 +1,10 @@
-.DS_Store
+example/backend-chat/chat.db-shm
+example/backend-chat/chat.db-wal
+example/backend-chat/example/
 .vscode/
+.DS_Store
+example/.DS_Store
+example/backend-chat/.DS_Store
+example/backend-chat/.env
+example/backend-chat/.env.*
+!example/backend-chat/.env.example
