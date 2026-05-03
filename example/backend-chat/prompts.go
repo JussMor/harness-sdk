@@ -86,6 +86,7 @@ func runWithMode(ctx context.Context, provider ab.LLMProvider, mode, model strin
 	if runtime.events != nil && onRuntimeEvent != nil {
 		subscriptions = append(subscriptions, runtime.events.Subscribe(ab.EventRunnerCompleted, onRuntimeEvent))
 		subscriptions = append(subscriptions, runtime.events.Subscribe(ab.EventRunnerFailed, onRuntimeEvent))
+		subscriptions = append(subscriptions, runtime.events.Subscribe(ab.EventExecutableUpdated, onRuntimeEvent))
 	}
 	if runtime.events != nil && onTrace != nil {
 		subscriptions = append(subscriptions, ab.SubscribeTransformed(runtime.events, ab.EventAgentTraceStep, func(event ab.Event) (any, bool) {
@@ -108,6 +109,11 @@ func runWithMode(ctx context.Context, provider ab.LLMProvider, mode, model strin
 		}
 	}()
 
+	planRunners, planSummary, err := executeFormalPlan(ctx, engine, runtime, messages, model)
+	if err != nil {
+		return AssistantRunResult{}, err
+	}
+
 	enhancedPrompt := strings.TrimSpace(`
 Regla de salida obligatoria:
 - No describas acciones futuras como si ya estuvieran hechas.
@@ -115,6 +121,7 @@ Regla de salida obligatoria:
 - Si falta información para ejecutar, pide solo los datos faltantes sin decir "voy a ejecutar".
 - Solo puedes usar y mencionar herramientas realmente cargadas en este backend.
 - Si una herramienta aparece en el texto del modo pero no está cargada, di claramente que no está disponible.
+- Este backend ejecuta subtareas en la capa formal (workflow + plan); no existe la herramienta spawn-runner expuesta al modelo.
 
 Usa todo el historial de conversación para mantener contexto.
 
@@ -126,6 +133,12 @@ Instrucción para el último mensaje del usuario:
 
 	enhancedMessages := make([]ab.ChatMessage, len(messages))
 	copy(enhancedMessages, messages)
+	if strings.TrimSpace(planSummary) != "" {
+		enhancedMessages = append(enhancedMessages, ab.ChatMessage{
+			Role:    ab.RoleSystem,
+			Content: planSummary,
+		})
+	}
 	for i := len(enhancedMessages) - 1; i >= 0; i-- {
 		if enhancedMessages[i].Role == ab.RoleUser {
 			enhancedMessages[i].Content = enhancedPrompt + enhancedMessages[i].Content
@@ -141,7 +154,10 @@ Instrucción para el último mensaje del usuario:
 		return AssistantRunResult{}, err
 	}
 
-	runners := runtime.threads.Wait(5 * time.Second)
+	runners := planRunners
+	if len(runners) == 0 {
+		runners = runtime.threads.Wait(5 * time.Second)
+	}
 	content := strings.TrimSpace(result.FinalContent)
 	if content == "" && len(runners) > 0 {
 		content = fmt.Sprintf("Se ejecutaron %d runners en paralelo.", len(runners))

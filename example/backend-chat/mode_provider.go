@@ -22,6 +22,8 @@ func newModeEngine(provider ab.LLMProvider, model string, logContext RuntimeLogC
 		ab.WithToolRegistry(runtime.tools),
 		ab.WithThreads(runtime.threads),
 		ab.WithEventBus(runtime.events),
+		ab.WithPlanning(runtime.plans),
+		ab.WithWorkflow(runtime.workflow),
 	}
 	if skills != nil {
 		options = append(options, ab.WithSkills(skills))

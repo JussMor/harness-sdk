@@ -356,23 +356,42 @@ func (a *BackendChatApp) handleRun(w http.ResponseWriter, r *http.Request, chatI
 
 	emitRunnerEvent := func(event ab.Event) {
 		threadID := strings.TrimSpace(event.Source)
-		if threadID == "" {
-			return
-		}
+		summary := RunnerSummary{Model: effectiveModel, Status: "running"}
 
-		summary := RunnerSummary{
-			ID:     threadID,
-			Model:  effectiveModel,
-			Status: "running",
+		if payloadThreadID := strings.TrimSpace(asString(event.Payload["thread_id"])); payloadThreadID != "" {
+			threadID = payloadThreadID
+		}
+		if threadID != "" {
+			summary.ID = threadID
+		}
+		if task := strings.TrimSpace(asString(event.Payload["task"])); task != "" {
+			summary.Task = task
+		}
+		if tier := strings.TrimSpace(asString(event.Payload["tier"])); tier != "" {
+			summary.Tier = tier
+		}
+		if model := strings.TrimSpace(asString(event.Payload["model"])); model != "" {
+			summary.Model = model
 		}
 
 		switch event.Type {
+		case ab.EventExecutableUpdated:
+			status := strings.TrimSpace(asString(event.Payload["status"]))
+			if status != "" {
+				summary.Status = status
+			}
+			summary.Result = asString(event.Payload["result"])
 		case ab.EventRunnerCompleted:
 			summary.Status = "success"
 			summary.Result = asString(event.Payload["result"])
 		case ab.EventRunnerFailed:
 			summary.Status = "failure"
 			summary.Result = asString(event.Payload["error"])
+		default:
+			return
+		}
+		if strings.TrimSpace(summary.ID) == "" {
+			return
 		}
 		log.Printf("run.event chat_id=%d run_id=%s mode=%s event=%s thread_id=%s status=%s", chatID, runID, firstNonEmpty(logContext.Mode, "balanced"), event.Type, threadID, summary.Status)
 

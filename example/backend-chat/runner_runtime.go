@@ -32,6 +32,8 @@ type agentRuntime struct {
 	events      *ab.InMemoryEventBus
 	tools       *ab.ToolRegistry
 	threads     *inMemoryThreadProvider
+	plans       ab.PlanProvider
+	workflow    ab.WorkflowEngine
 	skills      ab.SkillProvider
 	memory      ab.MemoryProvider
 	checkpoints *checkpointStore
@@ -47,6 +49,8 @@ func newAgentRuntime(provider ab.LLMProvider, model string, logContext RuntimeLo
 		memory:      memory,
 		checkpoints: &checkpointStore{},
 	}
+	runtime.plans = newInMemoryPlanProvider(runtime.events)
+	runtime.workflow = newInMemoryWorkflowEngine(runtime.events)
 	runtime.threads = newInMemoryThreadProvider(runtime)
 	runtime.tools = runtime.buildToolRegistry()
 	return runtime
@@ -56,7 +60,6 @@ func (r *agentRuntime) buildToolRegistry() *ab.ToolRegistry {
 	reg := ab.NewToolRegistry()
 	reg.Register(r.newCheckpointTool())
 	reg.Register(r.newDocumentTool())
-	reg.Register(r.newSpawnRunnerTool())
 	if r.skills != nil {
 		reg.Register(r.newSkillsTool())
 	}
@@ -490,6 +493,17 @@ func (p *inMemoryThreadProvider) Spawn(_ context.Context, r ab.Runner) (string, 
 	p.threads[id] = &ab.Thread{ID: id, Status: ab.ThreadStatusActive}
 	p.runners[id] = summary
 	p.mu.Unlock()
+	p.runtime.events.Publish(ab.Event{
+		Type:   ab.EventExecutableUpdated,
+		Source: id,
+		Payload: map[string]any{
+			"thread_id": id,
+			"tier":      summary.Tier,
+			"task":      summary.Task,
+			"status":    summary.Status,
+			"model":     summary.Model,
+		},
+	})
 	log.Printf("runner.spawn chat_id=%d run_id=%s mode=%s thread_id=%s tier=%s task=%q", p.runtime.logContext.ChatID, p.runtime.logContext.RunID, p.runtime.logContext.Mode, id, summary.Tier, previewText(summary.Task, 120))
 
 	p.wg.Add(1)
@@ -505,6 +519,17 @@ func (p *inMemoryThreadProvider) run(threadID string, r ab.Runner) {
 	p.mu.Lock()
 	if summary, ok := p.runners[threadID]; ok {
 		summary.Status = "running"
+		p.runtime.events.Publish(ab.Event{
+			Type:   ab.EventExecutableUpdated,
+			Source: threadID,
+			Payload: map[string]any{
+				"thread_id": threadID,
+				"tier":      summary.Tier,
+				"task":      summary.Task,
+				"status":    summary.Status,
+				"model":     summary.Model,
+			},
+		})
 	}
 	p.mu.Unlock()
 	log.Printf("runner.start chat_id=%d run_id=%s mode=%s thread_id=%s tier=%s", p.runtime.logContext.ChatID, p.runtime.logContext.RunID, p.runtime.logContext.Mode, threadID, r.Tier)
@@ -547,6 +572,18 @@ func (p *inMemoryThreadProvider) Wait(timeout time.Duration) []RunnerSummary {
 		<-done
 	}
 
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	out := make([]RunnerSummary, 0, len(p.runners))
+	for _, runner := range p.runners {
+		out = append(out, *runner)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].ID < out[j].ID })
+	return out
+}
+
+func (p *inMemoryThreadProvider) Snapshot() []RunnerSummary {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
