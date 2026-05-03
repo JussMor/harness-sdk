@@ -399,7 +399,8 @@ func previewReasoningText(value string, limit int) string {
 // Sandbox, and Events from an Engine and resolves the mode. Use this when
 // you have a full Engine. Use RunAgentLoop directly for maximum control.
 func RunAgentLoopWithEngine(ctx context.Context, engine *Engine, modeID string, cfg AgentLoopConfig, messages []ChatMessage) (*AgentLoopResult, error) {
-	// Resolve mode → populate Provider, Model, SystemPrompt, Tools
+	// Resolve mode → populate Model, SystemPrompt
+	var resolvedModel string
 	if engine.HasModes() && modeID != "" {
 		mode, err := engine.Modes.Get(ctx, modeID)
 		if err != nil {
@@ -411,18 +412,25 @@ func RunAgentLoopWithEngine(ctx context.Context, engine *Engine, modeID string, 
 		if cfg.SystemPrompt == "" {
 			cfg.SystemPrompt = mode.PromptContent
 		}
+		resolvedModel = cfg.Model
 	}
 
-	// Resolve provider if not explicitly set
+	// If a SystemPromptBuilder is wired, apply the mode as LayerMode and build.
+	if engine.HasPrompt() && modeID != "" && cfg.SystemPrompt != "" {
+		engine.Prompt.Set(LayerMode, cfg.SystemPrompt)
+		cfg.SystemPrompt = engine.Prompt.Build()
+	}
+
+	// Resolve provider using model for routing (fixes the original bug where
+	// Router was wired but never used).
 	if cfg.Provider == nil {
-		p, err := resolveProvider(engine)
+		p, err := resolveProvider(engine, resolvedModel)
 		if err != nil {
 			return nil, err
 		}
 		cfg.Provider = p
 	}
 
-	// Fill from engine if not set
 	if cfg.Tools == nil && engine.HasTools() {
 		cfg.Tools = engine.Tools
 	}
@@ -473,15 +481,19 @@ func defaultBuildRequest(cfg AgentLoopConfig, messages []ChatMessage) ChatReques
 }
 
 // resolveProvider picks the right LLMProvider from the engine.
-func resolveProvider(engine *Engine) (LLMProvider, error) {
-	if engine.HasRouter() {
-		// Router exists but we can't route without a model name at this point.
-		// Fall through to default LLM.
+// If the LLM implements ModelRouter (e.g. RoutedLLMProvider) and a model
+// name is known, routing is applied automatically via duck typing.
+// No separate Router field is needed on the Engine.
+func resolveProvider(engine *Engine, model string) (LLMProvider, error) {
+	if !engine.HasLLM() {
+		return nil, fmt.Errorf("no LLM provider configured — set WithLLM()")
 	}
-	if engine.HasLLM() {
-		return engine.LLM, nil
+	if model != "" {
+		if router, ok := engine.LLM.(ModelRouter); ok {
+			return router.Route(model)
+		}
 	}
-	return nil, fmt.Errorf("no LLM provider configured — set WithLLM() or WithRouter()")
+	return engine.LLM, nil
 }
 
 // callWithRetry calls the LLM and retries on error if OnError allows it.
