@@ -6,23 +6,41 @@ import (
 )
 
 // EventType identifies the kind of event published on the bus.
+//
+// Events are the SDK's observability primitive for things consumers care
+// about: agent loop progress, phase transitions, tool calls. Internal
+// state (per-span timing) belongs in Tracing instead.
 type EventType string
 
 const (
-	EventRunnerCompleted    EventType = "runner.completed"
-	EventRunnerFailed       EventType = "runner.failed"
+	// Agent loop lifecycle
 	EventAgentLoopStarted   EventType = "agent.loop.started"
 	EventAgentTurnCompleted EventType = "agent.turn.completed"
 	EventAgentTraceStep     EventType = "agent.trace.step"
 	EventAgentLoopCompleted EventType = "agent.loop.completed"
 	EventAgentLoopFailed    EventType = "agent.loop.failed"
-	EventPhaseAdvanced      EventType = "phase.advanced"
-	EventTaskStepCompleted  EventType = "task.step.completed"
-	EventGateResolved       EventType = "gate.resolved"
-	EventCheckpointCreated  EventType = "checkpoint.created"
-	EventThreadMessage      EventType = "thread.message"
-	EventPlanApproved       EventType = "plan.approved"
-	EventExecutableUpdated  EventType = "executable.updated"
+
+	// Phase transitions (driven by ExecutionContext)
+	EventPhaseAdvanced EventType = "phase.advanced"
+
+	// Plan lifecycle (within ExecutionContext)
+	EventPlanProposed      EventType = "plan.proposed"
+	EventPlanApproved      EventType = "plan.approved"
+	EventExecutableUpdated EventType = "executable.updated"
+
+	// Safety events
+	EventSafetyBlocked EventType = "safety.blocked"
+
+	// Verification events
+	EventVerificationPassed EventType = "verification.passed"
+	EventVerificationFailed EventType = "verification.failed"
+
+	// Memory events
+	EventMemoryWritten EventType = "memory.written"
+
+	// Subagent events
+	EventSubagentStarted   EventType = "subagent.started"
+	EventSubagentCompleted EventType = "subagent.completed"
 )
 
 // Event is an immutable notification published on the EventBus.

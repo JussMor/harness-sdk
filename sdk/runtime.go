@@ -599,12 +599,6 @@ func DefaultMemoryTriggerDetector(message string) (MemoryLayer, string, bool) {
 	return "", "", false
 }
 
-// EstimateTokens is the legacy heuristic — kept for backward compat.
-// Prefer Tokenizer.Count via Runtime.WithTokenizer.
-func EstimateTokens(text string) int {
-	return HeuristicTokenizer{}.Count(text)
-}
-
 func wellbeingResponse(s WellbeingSignal) string {
 	switch s.Category {
 	case WellbeingCategorySelfHarm:
