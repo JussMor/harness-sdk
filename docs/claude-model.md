@@ -170,6 +170,42 @@ runtime.WithMaxVerifyRetry(2)
 
 ---
 
+## Alignment + Planner
+
+The Alignment phase decides whether the user's request warrants a structured
+Plan. If yes, the Planner proposes one and Runtime registers it on
+`engine.Execution.ActivePlan()`. Hooks registered with
+`engine.Execution.RegisterHook(PhaseExecution, ...)` can inspect the plan
+before Execution begins.
+
+```go
+// Heuristic: cheap, no LLM call. Detects multi-step tasks by keyword count.
+runtime.WithPlanner(autobuild.DefaultHeuristicPlanner())
+
+// LLM-driven: more accurate, costs one extra call per turn.
+runtime.WithPlanner(&autobuild.LLMPlanner{
+    Provider:       myLLM,
+    Model:          "claude-haiku-4-5",
+    MaxExecutables: 5,
+})
+
+// Auto-approve plans (skip explicit Approve step)
+runtime.WithAutoApprovePlan(true)
+```
+
+Inspect the proposed plan in the result:
+
+```go
+result, _ := runtime.Run(ctx, conv, "Refactor auth and update billing tests")
+if result.PlanProposed != nil {
+    for _, exec := range result.PlanProposed.Executables {
+        fmt.Printf("- %s (deps: %v)\n", exec.Name, exec.Dependencies)
+    }
+}
+```
+
+---
+
 ## Subagents
 
 ```go

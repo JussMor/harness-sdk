@@ -399,6 +399,10 @@ func previewReasoningText(value string, limit int) string {
 // Sandbox, and Events from an Engine and resolves the mode. Use this when
 // you have a full Engine. Use RunAgentLoop directly for maximum control.
 func RunAgentLoopWithEngine(ctx context.Context, engine *Engine, modeID string, cfg AgentLoopConfig, messages []ChatMessage) (*AgentLoopResult, error) {
+	// Track whether the caller already supplied a fully-assembled SystemPrompt.
+	// If yes, we trust them and skip our own Build — this is what Runtime does.
+	callerSuppliedPrompt := cfg.SystemPrompt != ""
+
 	// Resolve mode → populate Model, SystemPrompt
 	var resolvedModel string
 	if engine.HasModes() && modeID != "" {
@@ -409,20 +413,23 @@ func RunAgentLoopWithEngine(ctx context.Context, engine *Engine, modeID string, 
 		if cfg.Model == "" && mode.ModelSettings != nil {
 			cfg.Model = mode.ModelSettings.Model
 		}
-		if cfg.SystemPrompt == "" {
-			cfg.SystemPrompt = mode.PromptContent
+		// Only fill SystemPrompt from mode if caller didn't supply one.
+		// If a builder is wired, route the mode prompt into LayerMode instead.
+		if !callerSuppliedPrompt {
+			if engine.HasPrompt() {
+				engine.Prompt.Set(LayerMode, mode.PromptContent)
+				cfg.SystemPrompt = engine.Prompt.Build()
+			} else {
+				cfg.SystemPrompt = mode.PromptContent
+			}
 		}
 		resolvedModel = cfg.Model
-	}
-
-	// If a SystemPromptBuilder is wired, apply the mode as LayerMode and build.
-	if engine.HasPrompt() && modeID != "" && cfg.SystemPrompt != "" {
-		engine.Prompt.Set(LayerMode, cfg.SystemPrompt)
+	} else if !callerSuppliedPrompt && engine.HasPrompt() {
+		// No mode but a builder exists — assemble what we have.
 		cfg.SystemPrompt = engine.Prompt.Build()
 	}
 
-	// Resolve provider using model for routing (fixes the original bug where
-	// Router was wired but never used).
+	// Resolve provider using model for routing.
 	if cfg.Provider == nil {
 		p, err := resolveProvider(engine, resolvedModel)
 		if err != nil {

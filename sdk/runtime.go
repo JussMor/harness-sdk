@@ -47,9 +47,10 @@ type Runtime struct {
 	verification    VerificationStrategy
 	safety          SafetyFilter
 	memoryWriter    *InferredMemoryWriter
-	evictionPolicy  SkillEvictionPolicy
 	tokenizer       Tokenizer
 	store           ConversationStore
+	planner         Planner
+	autoApprovePlan bool
 }
 
 // Tokenizer estimates token count for a string. Replace the default heuristic
@@ -85,7 +86,6 @@ func NewRuntime(engine *Engine) *Runtime {
 		wellbeing:       DefaultWellbeingDetector{},
 		verification:    NoOpVerification{},
 		safety:          nil,
-		evictionPolicy:  LRUEvictionPolicy{},
 		tokenizer:       HeuristicTokenizer{},
 	}
 }
@@ -103,12 +103,25 @@ func (r *Runtime) WithTokenizer(t Tokenizer) *Runtime           { r.tokenizer = 
 func (r *Runtime) WithConversationStore(s ConversationStore) *Runtime { r.store = s; return r }
 func (r *Runtime) WithMaxVerifyRetry(n int) *Runtime            { r.maxVerifyRetry = n; return r }
 
+// WithPlanner enables Alignment-phase planning. When set, Runtime asks
+// the planner whether the turn warrants a structured Plan and, if so,
+// proposes one on engine.Execution before Execution.
+func (r *Runtime) WithPlanner(p Planner) *Runtime { r.planner = p; return r }
+
+// WithAutoApprovePlan auto-approves any plan proposed during Alignment.
+// Default false: plans are proposed but require explicit Approve to run.
+func (r *Runtime) WithAutoApprovePlan(b bool) *Runtime { r.autoApprovePlan = b; return r }
+
 // Run executes a conversation turn. The Conversation accumulates state
 // across calls — first call is "cold" (full orientation), subsequent calls
 // are "warm" (reuse loaded skills and memory).
 //
 // Cancellation propagates through ctx into every phase. If ctx is cancelled
 // mid-phase, Runtime returns immediately without proceeding.
+//
+// Phase ownership: this Run drives engine.Execution as the single source
+// of truth for phase state. Hooks registered via engine.Execution.RegisterHook
+// fire on transitions. The tracing spans mirror the phase advance.
 func (r *Runtime) Run(ctx context.Context, conv *Conversation, userMessage string) (*RuntimeResult, error) {
 	if !r.engine.HasLLM() {
 		return nil, fmt.Errorf("runtime: no LLM provider — set engine.LLM")
@@ -133,47 +146,81 @@ func (r *Runtime) Run(ctx context.Context, conv *Conversation, userMessage strin
 	}
 	defer func() { finishRun(nil) }()
 
+	// Always append user message first — even on wellbeing intercept,
+	// the turn must be recorded for safety/audit reasons.
+	conv.AppendUser(userMessage)
+
 	// Wellbeing pre-check on user message
 	if r.wellbeing != nil {
 		signal := r.wellbeing.Detect(userMessage)
 		if signal.Detected {
 			rr.WellbeingSignal = &signal
-			// High severity: short-circuit. Don't dispatch tools, surface support.
 			if signal.Severity >= WellbeingSeverityHigh {
+				// High severity: short-circuit, but PERSIST the turn.
+				// Skipping persistence here would silently lose the user's
+				// most critical message — exactly the wrong move.
 				rr.Response = wellbeingResponse(signal)
 				rr.StopReason = "wellbeing_intercept"
+				conv.AppendAssistant(rr.Response)
+				conv.IncrementTurn()
+				if r.store != nil {
+					_ = r.store.Save(ctx, conv)
+				}
 				rr.CompletedAt = time.Now()
+				rr.Trace = tracer.Spans()
 				return rr, nil
 			}
 		}
 	}
 
-	// Append user message to conversation
-	conv.AppendUser(userMessage)
+	// Reset ExecutionContext to Orientation for this turn.
+	// Each Run starts fresh through the lifecycle.
+	if r.engine.HasExecution() {
+		_ = r.engine.Execution.SetPhase(ctx, PhaseOrientation)
+	}
 
-	// ── Cold start: full orientation ──
+	// ── Phase 0: Orientation ──
+	// Cold: full read of memory + skills + observations.
+	// Warm: just refresh observations and look for new skill matches.
+	ctxOri, finishOri := StartSpan(ctx, "phase.orientation", map[string]any{
+		"cold": conv.IsCold(),
+	})
+	var oriErr error
 	if conv.IsCold() {
-		ctxOri, finishOri := StartSpan(ctx, "phase.orientation", nil)
-		if err := r.orientation(ctxOri, userMessage, conv, rr); err != nil {
-			finishOri(err)
-			return rr, fmt.Errorf("orientation: %w", err)
-		}
-		finishOri(nil)
+		oriErr = r.orientation(ctxOri, userMessage, conv, rr)
 	} else {
-		// Warm turn: only refresh observations and re-match skills if message differs significantly
-		ctxWarm, finishWarm := StartSpan(ctx, "phase.warm_refresh", nil)
-		if err := r.warmRefresh(ctxWarm, userMessage, conv); err != nil {
-			finishWarm(err)
-			return rr, fmt.Errorf("warm refresh: %w", err)
-		}
-		finishWarm(nil)
+		oriErr = r.warmRefresh(ctxOri, userMessage, conv)
+	}
+	finishOri(oriErr)
+	if oriErr != nil {
+		return rr, fmt.Errorf("orientation: %w", oriErr)
 	}
 
 	if err := ctx.Err(); err != nil {
 		return rr, err
 	}
 
-	// ── Preparation: checkpoint + budget enforcement ──
+	// ── Phase 1: Alignment ──
+	// Decide if this task warrants a plan. Propose, register on
+	// ExecutionContext, optionally auto-approve.
+	if err := r.advancePhase(ctx, PhaseAlignment); err != nil {
+		return rr, fmt.Errorf("advance to alignment: %w", err)
+	}
+	ctxAlign, finishAlign := StartSpan(ctx, "phase.alignment", nil)
+	if err := r.alignment(ctxAlign, userMessage, conv, rr); err != nil {
+		finishAlign(err)
+		return rr, fmt.Errorf("alignment: %w", err)
+	}
+	finishAlign(nil)
+
+	if err := ctx.Err(); err != nil {
+		return rr, err
+	}
+
+	// ── Phase 2: Preparation ──
+	if err := r.advancePhase(ctx, PhasePreparation); err != nil {
+		return rr, fmt.Errorf("advance to preparation: %w", err)
+	}
 	ctxPrep, finishPrep := StartSpan(ctx, "phase.preparation", nil)
 	if err := r.preparation(ctxPrep, conv, rr); err != nil {
 		finishPrep(err)
@@ -185,7 +232,10 @@ func (r *Runtime) Run(ctx context.Context, conv *Conversation, userMessage strin
 		return rr, err
 	}
 
-	// ── Execution + Verification with retry loop ──
+	// ── Phase 3+4: Execution + Verification with retry loop ──
+	if err := r.advancePhase(ctx, PhaseExecution); err != nil {
+		return rr, fmt.Errorf("advance to execution: %w", err)
+	}
 	var loopResult *AgentLoopResult
 	for attempt := 0; attempt <= r.maxVerifyRetry; attempt++ {
 		ctxExec, finishExec := StartSpan(ctx, "phase.execution", map[string]any{"attempt": attempt + 1})
@@ -196,7 +246,10 @@ func (r *Runtime) Run(ctx context.Context, conv *Conversation, userMessage strin
 			return rr, fmt.Errorf("execution: %w", err)
 		}
 
-		// Verification
+		// Verification phase
+		if err := r.advancePhase(ctx, PhaseVerification); err != nil {
+			return rr, fmt.Errorf("advance to verification: %w", err)
+		}
 		ctxVer, finishVer := StartSpan(ctx, "phase.verification", nil)
 		verdict := r.verification.Verify(ctxVer, loopResult, conv)
 		finishVer(nil)
@@ -209,8 +262,12 @@ func (r *Runtime) Run(ctx context.Context, conv *Conversation, userMessage strin
 			rr.Warnings = append(rr.Warnings, "verification failed: "+verdict.Reason)
 			break
 		}
-		// Push retry message back into conversation
+		// Retry: push verdict back as a user message and re-enter Execution.
 		conv.AppendUser(fmt.Sprintf("Verification failed: %s. Please address and retry.", verdict.Reason))
+		_ = r.engine.Execution
+		if r.engine.HasExecution() {
+			_ = r.engine.Execution.SetPhase(ctx, PhaseExecution)
+		}
 	}
 
 	// Append final response to conversation
@@ -222,7 +279,10 @@ func (r *Runtime) Run(ctx context.Context, conv *Conversation, userMessage strin
 		return rr, err
 	}
 
-	// ── Closure: memory writes ──
+	// ── Phase 5: Closure ──
+	if err := r.advancePhase(ctx, PhaseClosure); err != nil {
+		return rr, fmt.Errorf("advance to closure: %w", err)
+	}
 	ctxClose, finishClose := StartSpan(ctx, "phase.closure", nil)
 	if err := r.closure(ctxClose, userMessage, loopResult, conv, rr); err != nil {
 		finishClose(err)
@@ -242,6 +302,48 @@ func (r *Runtime) Run(ctx context.Context, conv *Conversation, userMessage strin
 	rr.CompletedAt = time.Now()
 	rr.Trace = tracer.Spans()
 	return rr, nil
+}
+
+// advancePhase moves engine.Execution to the target phase, firing any
+// registered hooks. No-op if Execution is not wired.
+func (r *Runtime) advancePhase(ctx context.Context, target Phase) error {
+	if !r.engine.HasExecution() {
+		return nil
+	}
+	return r.engine.Execution.SetPhase(ctx, target)
+}
+
+// ── Phase 1: Alignment ───────────────────────────────────────────────────────
+
+// alignment decides whether this turn needs a structured plan. If yes,
+// the Planner proposes one and (optionally) auto-approves. The Plan lives
+// on engine.Execution and can be inspected via engine.Execution.ActivePlan().
+func (r *Runtime) alignment(ctx context.Context, userMessage string, conv *Conversation, rr *RuntimeResult) error {
+	if r.planner == nil || !r.engine.HasExecution() {
+		return nil
+	}
+	if !r.planner.ShouldPlan(ctx, userMessage, conv) {
+		return nil
+	}
+	plan, err := r.planner.Propose(ctx, userMessage, conv)
+	if err != nil {
+		// Don't fail the turn just because planning failed; log and proceed.
+		rr.Warnings = append(rr.Warnings, "plan proposal failed: "+err.Error())
+		return nil
+	}
+	if plan == nil {
+		// Planner declined to propose — fine, continue without a plan.
+		return nil
+	}
+	if _, err := r.engine.Execution.Propose(ctx, *plan); err != nil {
+		rr.Warnings = append(rr.Warnings, "plan registration failed: "+err.Error())
+		return nil
+	}
+	if r.autoApprovePlan {
+		_ = r.engine.Execution.Approve(ctx, true)
+	}
+	rr.PlanProposed = plan
+	return nil
 }
 
 // ── Phase 0: Orientation (cold start only) ───────────────────────────────────
@@ -437,7 +539,18 @@ func (r *Runtime) execution(ctx context.Context, conv *Conversation, rr *Runtime
 		},
 	}
 
+	// Single point of prompt assembly: apply mode → LayerMode, then Build once.
+	// Pass as cfg.SystemPrompt so RunAgentLoopWithEngine treats it as caller-supplied
+	// and skips its own Build path.
 	if r.engine.HasPrompt() {
+		if r.mode != "" && r.engine.HasModes() {
+			if mode, err := r.engine.Modes.Get(ctx, r.mode); err == nil {
+				r.engine.Prompt.Set(LayerMode, mode.PromptContent)
+				if cfg.Model == "" && mode.ModelSettings != nil {
+					cfg.Model = mode.ModelSettings.Model
+				}
+			}
+		}
 		cfg.SystemPrompt = r.engine.Prompt.Build()
 	}
 
@@ -507,6 +620,7 @@ type RuntimeResult struct {
 	MemoryWritten     []string           `json:"memory_written,omitempty"`
 	InferredFacts     []InferredFact     `json:"inferred_facts,omitempty"`
 	CheckpointID      string             `json:"checkpoint_id,omitempty"`
+	PlanProposed      *Plan              `json:"plan_proposed,omitempty"`
 	Warnings          []string           `json:"warnings,omitempty"`
 	WellbeingSignal   *WellbeingSignal   `json:"wellbeing_signal,omitempty"`
 	VerificationVerdict *Verdict         `json:"verification_verdict,omitempty"`
