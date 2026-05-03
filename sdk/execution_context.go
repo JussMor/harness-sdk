@@ -2,6 +2,60 @@ package autobuild
 
 import "context"
 
+// ── Phase ────────────────────────────────────────────────────────────────────
+
+// Phase represents a stage in the 6-phase workflow lifecycle.
+type Phase int
+
+const (
+	PhaseOrientation  Phase = iota
+	PhaseAlignment
+	PhasePreparation
+	PhaseExecution
+	PhaseVerification
+	PhaseClosure
+)
+
+func (p Phase) String() string {
+	switch p {
+	case PhaseOrientation:
+		return "orientation"
+	case PhaseAlignment:
+		return "alignment"
+	case PhasePreparation:
+		return "preparation"
+	case PhaseExecution:
+		return "execution"
+	case PhaseVerification:
+		return "verification"
+	case PhaseClosure:
+		return "closure"
+	default:
+		return "unknown"
+	}
+}
+
+// TodoStatus is the state of a single todo item.
+type TodoStatus string
+
+const (
+	TodoStatusPending    TodoStatus = "pending"
+	TodoStatusInProgress TodoStatus = "in_progress"
+	TodoStatusCompleted  TodoStatus = "completed"
+)
+
+// Todo is a trackable unit of work. Only one should be in_progress at a time.
+type Todo struct {
+	ID      string     `json:"id"`
+	Content string     `json:"content"`
+	Status  TodoStatus `json:"status"`
+}
+
+// PhaseHook is a callback invoked on entry to a phase. Return error to abort.
+type PhaseHook func(ctx context.Context, from, to Phase) error
+
+// ── ExecutionContext ──────────────────────────────────────────────────────────
+
 // ExecutionContext is the single source of truth for what the agent is doing
 // right now. It fuses what were previously three separate concerns:
 //

@@ -1,7 +1,6 @@
 package autobuild
 
 import (
-	"context"
 	"fmt"
 )
 
@@ -196,22 +195,6 @@ func (p *Plan) ExecutableByID(id string) *Executable {
 	return nil
 }
 
-// ──────────────────────────────────────────────
-// PlanProvider
-// ──────────────────────────────────────────────
-
-// PlanProvider abstracts plan lifecycle: proposal, approval, status tracking.
-type PlanProvider interface {
-	// Propose creates a new plan and presents it for approval.
-	Propose(ctx context.Context, p Plan) (*Plan, error)
-
-	// Approve marks a plan as approved, optionally with auto-approve for
-	// subsequent phases.
-	Approve(ctx context.Context, planID string, autoApprove bool) error
-
-	// UpdateStatus updates the status of a single executable within a plan.
-	UpdateStatus(ctx context.Context, planID string, execID string, status ExecutableStatus, result string) error
-
-	// GetPlan returns the current state of a plan.
-	GetPlan(ctx context.Context, planID string) (*Plan, error)
-}
+// PlanProvider has been removed. Plan lifecycle (propose, approve, update)
+// is now owned by ExecutionContext, which keeps phase, plan, and todos
+// in a single coherent object. See execution_context.go.
