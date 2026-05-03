@@ -369,7 +369,138 @@ runtime.
     WithMemoryWriter(&autobuild.InferredMemoryWriter{...}).
     WithTokenizer(realTokenizer). // replace HeuristicTokenizer
     WithConversationStore(myStore).
-    WithMaxVerifyRetry(3)
+    WithMaxVerifyRetry(3).
+    WithSessionContext(myContextProvider).
+    WithOutputFilter(myOutputFilter)
+```
+
+---
+
+## Session context — time, location, user identity
+
+Every turn, the agent needs to know who the user is, where they are, what
+time it is. Without this, search queries use stale dates and recommendations
+ignore geography.
+
+```go
+runtime.WithSessionContext(autobuild.SessionContextProviderFunc(
+    func(ctx context.Context, conv *autobuild.Conversation) (*autobuild.SessionContext, error) {
+        user := lookupUser(conv.ThreadID)
+        return &autobuild.SessionContext{
+            Now:         time.Now(),
+            Timezone:    user.Timezone,
+            Locale:      "es-EC",
+            UserName:    user.Name,
+            UserCity:    user.City,
+            UserCountry: user.Country,
+            Surface:     "chat",
+        }, nil
+    },
+))
+
+// Or for single-user apps:
+runtime.WithSessionContext(autobuild.StaticSessionContext(autobuild.SessionContext{
+    UserName: "Juss", UserCity: "La Concordia", UserCountry: "Ecuador",
+    Timezone: "America/Guayaquil", Locale: "es-EC",
+}))
+
+// Bare minimum (just time):
+runtime.WithSessionContext(autobuild.LocalTimeSessionContext())
+```
+
+Rendered into LayerSession of the system prompt every turn.
+
+---
+
+## Output filter — protecting the user from the LLM
+
+Symmetric counterpart of `WithSafety` (which inspects tool calls).
+`WithOutputFilter` inspects the LLM's final response before returning.
+
+```go
+runtime.WithOutputFilter(autobuild.NewOutputFilterChain(
+    autobuild.DefaultSecretRedactionFilter(),       // redact leaked tokens
+    &autobuild.MaxLengthFilter{MaxChars: 10_000},   // hard size cap
+    &autobuild.DisclaimerFilter{
+        Triggers:   []string{"diagnosis", "prescription", "lawsuit"},
+        Disclaimer: "*Not professional advice. Consult a qualified expert.*",
+    },
+))
+```
+
+Block: response replaced, `StopReason="output_blocked"`. Transform: text replaced.
+
+---
+
+## Streaming
+
+For chat UIs that need token-by-token output:
+
+```go
+events, err := runtime.RunStream(ctx, conv, "Explain monads")
+
+for ev := range events {
+    switch ev.Type {
+    case autobuild.StreamEventDelta:
+        fmt.Print(ev.Delta)
+    case autobuild.StreamEventDone:
+        fmt.Println()
+    case autobuild.StreamEventError:
+        return ev.Error
+    }
+}
+```
+
+Falls back to sentence-chunked emission if the LLM provider doesn't
+implement `StreamingLLMProvider` — same UX, no provider lock-in.
+
+---
+
+## Semantic memory + skills (embeddings)
+
+Keyword matching undermatches when users phrase things differently than
+the trigger list. Wrap with embeddings:
+
+```go
+embedder := myEmbedder // implements autobuild.Embedder
+
+// Semantic skill matching alongside keyword match
+engine.Skills = autobuild.NewSemanticSkillMatcher(rawSkillProvider, embedder)
+
+// Semantic observation retrieval
+engine.Observations = autobuild.NewSemanticObservationStore(embedder)
+```
+
+Both wrappers fall back to keyword matching if the embedder errors —
+safe to deploy without breaking working systems.
+
+---
+
+## Replay + snapshot testing
+
+Detect drift between SDK or model versions:
+
+```go
+// Capture at known-good state
+snap, _ := autobuild.CaptureSnapshot(ctx, runtime, "auth-refactor", "Help me refactor auth")
+autobuild.SaveSnapshot(snap, "testdata/snapshots/auth-refactor.json")
+
+// Later, compare
+saved, _ := autobuild.LoadSnapshot("testdata/snapshots/auth-refactor.json")
+conv := autobuild.NewConversation("test")
+result, _ := runtime.Run(ctx, conv, saved.Input)
+diff := autobuild.CompareSnapshot(saved, result, saved.Input)
+if !diff.ResponseNormalized {
+    fmt.Printf("Drift: %d chars, %d turns\n", diff.LengthDelta, diff.TurnsDelta)
+}
+
+// Full conversation replay
+replay := &autobuild.Replay{
+    Runtime:     runtime,
+    CompareMode: autobuild.ReplayCompareNormalized,
+}
+result, _ := replay.Run(ctx, originalConversation)
+fmt.Printf("Drift: %d/%d turns\n", result.TotalDrift, len(result.Turns))
 ```
 
 ---
@@ -378,10 +509,10 @@ runtime.
 
 - **RLHF-trained judgment** — `DefaultBehaviorPrompt` approximates it.
 - **Anthropic's actual system prompt** — not public.
-- **Real tokenizer** — `HeuristicTokenizer` is chars/4. Replace with
-  tiktoken or a Claude tokenizer for production.
-- **Vector search** — `ObservationStore` is keyword-based. Replace with
-  embeddings for semantic relevance.
+- **Real tokenizer bundled** — `HeuristicTokenizer` is chars/4. Bring your own
+  via `WithTokenizer` (tiktoken, claude-tokenizer).
+- **Embedder bundled** — `Embedder` interface exists; bring your own
+  (Voyage, OpenAI, local).
 
 The SDK is the skeleton. The LLM is the brain. The system prompt is the
 personality. Together they get structurally close to Claude — but the model

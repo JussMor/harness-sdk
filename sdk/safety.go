@@ -2,6 +2,7 @@ package autobuild
 
 import (
 	"context"
+	"fmt"
 	"strings"
 )
 
@@ -317,4 +318,169 @@ func ApplyFilter(filter SafetyFilter, ctx context.Context, calls []ToolCallEntry
 		}
 	}
 	return allowed, blocked
+}
+
+// ── Output filtering ─────────────────────────────────────────────────────────
+
+// OutputFilter inspects the LLM's final response BEFORE it reaches the user
+// or downstream consumers. This is the symmetric counterpart of SafetyFilter
+// (which inspects tool calls): SafetyFilter protects the system from the LLM,
+// OutputFilter protects the user from the LLM.
+//
+// Common uses:
+//   - Strip leaked secrets or PII from the response
+//   - Replace verbatim copyrighted content with a refusal
+//   - Add disclaimers to sensitive content
+//   - Block responses entirely if they violate policy
+//
+// Multiple filters chain — first Block wins. Transforms stack.
+type OutputFilter interface {
+	// Inspect returns the verdict for an output text.
+	Inspect(ctx context.Context, output string) OutputVerdict
+}
+
+// OutputVerdict is the outcome of an output check.
+type OutputVerdict struct {
+	Decision  OutputDecision
+	Reason    string
+	NewOutput string // only used when Decision == OutputTransform
+}
+
+// OutputDecision is what to do with the LLM's output.
+type OutputDecision int
+
+const (
+	OutputAllow OutputDecision = iota
+	OutputBlock
+	OutputTransform
+)
+
+// OutputFilterFunc adapts a function to OutputFilter.
+type OutputFilterFunc func(ctx context.Context, output string) OutputVerdict
+
+func (f OutputFilterFunc) Inspect(ctx context.Context, output string) OutputVerdict {
+	return f(ctx, output)
+}
+
+// OutputFilterChain runs multiple filters in order. First Block wins.
+// Transforms stack: each filter sees the previous filter's output.
+type OutputFilterChain struct {
+	filters []OutputFilter
+}
+
+// NewOutputFilterChain composes filters into a chain.
+func NewOutputFilterChain(filters ...OutputFilter) *OutputFilterChain {
+	return &OutputFilterChain{filters: filters}
+}
+
+// Inspect runs the chain.
+func (c *OutputFilterChain) Inspect(ctx context.Context, output string) OutputVerdict {
+	current := output
+	for _, f := range c.filters {
+		v := f.Inspect(ctx, current)
+		switch v.Decision {
+		case OutputBlock:
+			return v
+		case OutputTransform:
+			current = v.NewOutput
+		}
+	}
+	if current == output {
+		return OutputVerdict{Decision: OutputAllow}
+	}
+	return OutputVerdict{Decision: OutputTransform, NewOutput: current}
+}
+
+// ── Built-in output filters ──────────────────────────────────────────────────
+
+// SecretRedactionFilter scans the LLM's output for secret-looking patterns
+// and redacts them. Symmetric counterpart of SecretLeakFilter (which
+// inspects tool args).
+type SecretRedactionFilter struct {
+	Patterns []string
+}
+
+// DefaultSecretRedactionFilter returns a filter that redacts common token formats.
+func DefaultSecretRedactionFilter() *SecretRedactionFilter {
+	return &SecretRedactionFilter{
+		Patterns: []string{
+			"sk-ant-", "sk-proj-", "sk-",
+			"ghp_", "github_pat_",
+			"AKIA", "AIza",
+			"xoxb-", "xoxp-",
+		},
+	}
+}
+
+func (f *SecretRedactionFilter) Inspect(_ context.Context, output string) OutputVerdict {
+	redacted := output
+	changed := false
+	for _, p := range f.Patterns {
+		for {
+			idx := strings.Index(redacted, p)
+			if idx < 0 {
+				break
+			}
+			// Find end of token: whitespace, quote, or 80 chars max
+			end := idx + len(p)
+			for end < len(redacted) && end-idx < 80 && !isTokenBoundary(redacted[end]) {
+				end++
+			}
+			redacted = redacted[:idx] + "[REDACTED]" + redacted[end:]
+			changed = true
+		}
+	}
+	if !changed {
+		return OutputVerdict{Decision: OutputAllow}
+	}
+	return OutputVerdict{
+		Decision:  OutputTransform,
+		Reason:    "redacted secret-looking patterns",
+		NewOutput: redacted,
+	}
+}
+
+func isTokenBoundary(c byte) bool {
+	return c == ' ' || c == '\t' || c == '\n' || c == '"' || c == '\'' ||
+		c == '`' || c == ',' || c == ')' || c == ']' || c == '}'
+}
+
+// MaxLengthFilter blocks responses that exceed a length cap.
+// Useful when you want hard limits on output size for cost or UI reasons.
+type MaxLengthFilter struct {
+	MaxChars int
+}
+
+func (f *MaxLengthFilter) Inspect(_ context.Context, output string) OutputVerdict {
+	if f.MaxChars <= 0 || len(output) <= f.MaxChars {
+		return OutputVerdict{Decision: OutputAllow}
+	}
+	return OutputVerdict{
+		Decision: OutputBlock,
+		Reason:   fmt.Sprintf("output exceeds %d char limit (got %d)", f.MaxChars, len(output)),
+	}
+}
+
+// DisclaimerFilter appends a disclaimer to outputs containing certain triggers.
+// Use for medical/legal/financial domains where the application requires it.
+type DisclaimerFilter struct {
+	Triggers   []string // case-insensitive substrings
+	Disclaimer string   // appended at the end if any trigger matches
+}
+
+func (f *DisclaimerFilter) Inspect(_ context.Context, output string) OutputVerdict {
+	if f.Disclaimer == "" {
+		return OutputVerdict{Decision: OutputAllow}
+	}
+	lower := strings.ToLower(output)
+	for _, t := range f.Triggers {
+		if strings.Contains(lower, strings.ToLower(t)) {
+			return OutputVerdict{
+				Decision:  OutputTransform,
+				Reason:    "added disclaimer for sensitive content",
+				NewOutput: output + "\n\n" + f.Disclaimer,
+			}
+		}
+	}
+	return OutputVerdict{Decision: OutputAllow}
 }

@@ -51,6 +51,8 @@ type Runtime struct {
 	store           ConversationStore
 	planner         Planner
 	autoApprovePlan bool
+	sessionContext  SessionContextProvider
+	outputFilter    OutputFilter
 }
 
 // Tokenizer estimates token count for a string. Replace the default heuristic
@@ -111,6 +113,23 @@ func (r *Runtime) WithPlanner(p Planner) *Runtime { r.planner = p; return r }
 // WithAutoApprovePlan auto-approves any plan proposed during Alignment.
 // Default false: plans are proposed but require explicit Approve to run.
 func (r *Runtime) WithAutoApprovePlan(b bool) *Runtime { r.autoApprovePlan = b; return r }
+
+// WithSessionContext attaches a provider that supplies SessionContext
+// (time, location, user info, active artifact) on every turn.
+// The context is rendered into LayerSession of the system prompt.
+func (r *Runtime) WithSessionContext(p SessionContextProvider) *Runtime {
+	r.sessionContext = p
+	return r
+}
+
+// WithOutputFilter installs a filter that inspects the LLM's final response
+// before returning it to the caller. Symmetric counterpart of WithSafety
+// (which inspects tool calls). Use to redact secrets, add disclaimers,
+// or block responses that violate output policy.
+func (r *Runtime) WithOutputFilter(f OutputFilter) *Runtime {
+	r.outputFilter = f
+	return r
+}
 
 // Run executes a conversation turn. The Conversation accumulates state
 // across calls — first call is "cold" (full orientation), subsequent calls
@@ -380,8 +399,8 @@ func (r *Runtime) orientation(ctx context.Context, userMessage string, conv *Con
 		return err
 	}
 
-	// Surface observations → LayerSession
-	r.surfaceObservations(ctx, userMessage)
+	// Build LayerSession: session context (time/location/user) + observations
+	r.buildSessionLayer(ctx, conv, userMessage)
 	return nil
 }
 
@@ -389,9 +408,9 @@ func (r *Runtime) orientation(ctx context.Context, userMessage string, conv *Con
 
 func (r *Runtime) warmRefresh(ctx context.Context, userMessage string, conv *Conversation) error {
 	// On warm turns we only:
-	//   1. Re-surface observations (cheap, relevant per-turn)
+	//   1. Rebuild LayerSession (time changes every turn, observations may be new)
 	//   2. Match for new skills not already loaded
-	r.surfaceObservations(ctx, userMessage)
+	r.buildSessionLayer(ctx, conv, userMessage)
 
 	if r.engine.HasSkills() {
 		matches, err := r.engine.Skills.Match(ctx, userMessage)
@@ -453,24 +472,48 @@ func (r *Runtime) matchAndLoadSkills(ctx context.Context, userMessage string, co
 	return nil
 }
 
-func (r *Runtime) surfaceObservations(ctx context.Context, userMessage string) {
-	if !r.engine.HasObservations() || !r.engine.HasPrompt() {
-		return
-	}
-	obs, err := r.engine.Observations.Relevant(ctx, userMessage, 5)
-	if err != nil || len(obs) == 0 {
+// buildSessionLayer assembles LayerSession from the SessionContextProvider
+// (time, location, user info) and the ObservationStore (recent observations).
+// Both pieces are independent — either may produce content. Combined, they
+// form the situational awareness layer the agent uses every turn.
+//
+// The layer is rebuilt fresh each call: session context is new each turn,
+// and relevant observations depend on the current message.
+func (r *Runtime) buildSessionLayer(ctx context.Context, conv *Conversation, userMessage string) {
+	if !r.engine.HasPrompt() {
 		return
 	}
 	var b strings.Builder
-	b.WriteString("Recent observations:\n")
-	for _, o := range obs {
-		b.WriteString("- [")
-		b.WriteString(o.Source)
-		b.WriteString("] ")
-		b.WriteString(o.Content)
-		b.WriteString("\n")
+
+	// Session context: time, location, user info, surface
+	if r.sessionContext != nil {
+		if sc, err := r.sessionContext.Get(ctx, conv); err == nil && sc != nil {
+			if rendered := sc.Format(); rendered != "" {
+				b.WriteString(rendered)
+				b.WriteString("\n\n")
+			}
+		}
 	}
-	r.engine.Prompt.Set(LayerSession, b.String())
+
+	// Recent observations relevant to current message
+	if r.engine.HasObservations() {
+		if obs, err := r.engine.Observations.Relevant(ctx, userMessage, 5); err == nil && len(obs) > 0 {
+			b.WriteString("Recent observations:\n")
+			for _, o := range obs {
+				b.WriteString("- [")
+				b.WriteString(o.Source)
+				b.WriteString("] ")
+				b.WriteString(o.Content)
+				b.WriteString("\n")
+			}
+		}
+	}
+
+	if b.Len() == 0 {
+		r.engine.Prompt.Clear(LayerSession)
+		return
+	}
+	r.engine.Prompt.Set(LayerSession, strings.TrimRight(b.String(), "\n"))
 }
 
 // ── Phase 2: Preparation ─────────────────────────────────────────────────────
@@ -564,6 +607,26 @@ func (r *Runtime) execution(ctx context.Context, conv *Conversation, rr *Runtime
 	rr.Usage.TotalTokens += loopResult.TotalUsage.TotalTokens
 	rr.StopReason = loopResult.StopReason
 	rr.Response = loopResult.FinalContent
+
+	// Apply OutputFilter to the LLM's response before it reaches the caller.
+	// Symmetric counterpart of SafetyFilter (which inspects tool calls).
+	// Block: replace with reason, mark stop reason. Transform: replace text.
+	if r.outputFilter != nil && rr.Response != "" {
+		verdict := r.outputFilter.Inspect(ctx, rr.Response)
+		switch verdict.Decision {
+		case OutputBlock:
+			rr.Response = "[output blocked: " + verdict.Reason + "]"
+			rr.StopReason = "output_blocked"
+			rr.Warnings = append(rr.Warnings, "output blocked: "+verdict.Reason)
+			loopResult.FinalContent = rr.Response
+		case OutputTransform:
+			rr.Response = verdict.NewOutput
+			loopResult.FinalContent = rr.Response
+			if verdict.Reason != "" {
+				rr.Warnings = append(rr.Warnings, "output transformed: "+verdict.Reason)
+			}
+		}
+	}
 	return loopResult, nil
 }
 
