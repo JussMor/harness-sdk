@@ -496,16 +496,104 @@ func resolveProvider(engine *Engine, model string) (LLMProvider, error) {
 	return engine.LLM, nil
 }
 
-// callWithRetry calls the LLM and retries on error if OnError allows it.
+// callWithRetry calls the LLM and retries on transient errors with
+// exponential backoff. Retry classification:
+//   - Rate limit / 429 / "rate limit"  → retry with backoff
+//   - Network / timeout / 5xx / "EOF"   → retry with backoff
+//   - Auth / 401 / 403 / "unauthorized" → fail immediately
+//   - Validation / 400 / "invalid"      → fail immediately
+//   - Unknown                           → consult OnError hook
+//
+// Backoff: 1s, 2s, 4s, 8s (capped at 30s).
 func callWithRetry(ctx context.Context, provider LLMProvider, req ChatRequest, maxRetries int, onError func(error, int) bool) (*ChatResponse, error) {
+	var lastErr error
 	for attempt := 1; attempt <= maxRetries; attempt++ {
 		resp, err := provider.Chat(ctx, req)
 		if err == nil {
 			return resp, nil
 		}
-		if onError == nil || !onError(err, attempt) {
+		lastErr = err
+
+		switch classifyError(err) {
+		case errClassPermanent:
+			// Don't retry. Fail fast.
 			return nil, err
+		case errClassTransient:
+			// Retry automatically with backoff.
+			if attempt < maxRetries {
+				delay := backoffDelay(attempt)
+				select {
+				case <-ctx.Done():
+					return nil, ctx.Err()
+				case <-time.After(delay):
+				}
+				continue
+			}
+		default: // errClassUnknown
+			// Consult hook.
+			if onError == nil || !onError(err, attempt) {
+				return nil, err
+			}
 		}
 	}
-	return nil, fmt.Errorf("max retries (%d) exceeded", maxRetries)
+	return nil, fmt.Errorf("max retries (%d) exceeded: %w", maxRetries, lastErr)
+}
+
+type errClass int
+
+const (
+	errClassUnknown errClass = iota
+	errClassTransient
+	errClassPermanent
+)
+
+func classifyError(err error) errClass {
+	if err == nil {
+		return errClassUnknown
+	}
+	msg := strings.ToLower(err.Error())
+
+	// Permanent errors — never retry
+	permanent := []string{
+		"unauthorized", "401", "403",
+		"forbidden",
+		"invalid api key", "authentication",
+		"invalid request", "400",
+		"not found", "404",
+		"context length", "context window",
+		"content_filter", "content filter",
+	}
+	for _, p := range permanent {
+		if strings.Contains(msg, p) {
+			return errClassPermanent
+		}
+	}
+
+	// Transient errors — retry with backoff
+	transient := []string{
+		"rate limit", "429",
+		"too many requests",
+		"timeout", "deadline",
+		"connection reset", "connection refused",
+		"eof", "broken pipe",
+		"500", "502", "503", "504",
+		"server error", "service unavailable",
+		"temporary",
+	}
+	for _, t := range transient {
+		if strings.Contains(msg, t) {
+			return errClassTransient
+		}
+	}
+
+	return errClassUnknown
+}
+
+func backoffDelay(attempt int) time.Duration {
+	// 1s, 2s, 4s, 8s, 16s, 30s (cap)
+	d := time.Duration(1<<uint(attempt-1)) * time.Second
+	if d > 30*time.Second {
+		d = 30 * time.Second
+	}
+	return d
 }

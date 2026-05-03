@@ -1,13 +1,13 @@
 # Harness SDK — Claude Model Implementation Guide
 
-How to wire the SDK so an agent behaves structurally like Claude:
-same lifecycle, same memory discipline, same tool judgment, same
-layered system prompt. This is the skeleton. The LLM you plug in
-is the brain.
+How to wire the SDK so an agent operates structurally like Claude:
+multi-turn conversations, layered prompt assembly, memory discipline,
+safety filters, verification, subagents, tracing. The SDK is the
+skeleton. The LLM you plug in is the brain.
 
 ---
 
-## TL;DR — The fast path
+## TL;DR — Multi-turn fast path
 
 ```go
 engine := autobuild.NewWithDefaults(128_000)
@@ -16,271 +16,337 @@ engine.Memory = myMemory
 engine.Tools = myTools
 engine.Skills = mySkills
 
-runtime := autobuild.NewRuntime(engine)
-result, _ := runtime.Run(ctx, "Help me refactor auth")
-```
+runtime := autobuild.NewRuntime(engine).
+    WithMode("balanced").
+    WithSafety(autobuild.NewSafetyChain(
+        autobuild.DefaultDangerousCommandFilter(),
+        autobuild.DefaultSecretLeakFilter(),
+    )).
+    WithVerification(autobuild.CompletionVerification{MinLength: 10})
 
-The `Runtime` orchestrator runs the full 6-phase lifecycle, reads memory,
-matches and loads skills, surfaces observations, dispatches tools, and
-detects memory write triggers — all automatically. Skip to "Manual control"
-below if you need fine-grained control.
+conv := autobuild.NewConversation("conv-123")
+
+// Turn 1 — cold start: full orientation
+result1, _ := runtime.Run(ctx, conv, "Help me refactor auth")
+
+// Turn 2 — warm: reuses loaded skills + memory
+result2, _ := runtime.Run(ctx, conv, "Now apply the same pattern to billing")
+```
 
 ---
 
-## What changed from the original SDK
-
-| Removed | Replaced by | Why |
-|---|---|---|
-| `WorkflowEngine` + `PlanProvider` | `ExecutionContext` | They always move together — one object owns phase, plan, and todos |
-| `TaskProvider` | `ExecutionContext` (Plan absorbs Task) | Same concept (steps + dependencies), different scope — redundant |
-| `Engine.Router ModelRouter` | Duck typing on `LLM` field | `RoutedLLMProvider` already implements both interfaces |
-| `MemoryProvider.Insert(line int)` | Use `StrReplace` instead | Line numbers go stale the moment the file changes |
-| `Skill.MatchesTrigger` (bool) | `Skill.MatchScore` (float) + `SkillMatch` | Naive substring match doesn't rank — replaced with scored matching |
-
-New additions:
-
-- `Runtime` — the orchestrator that connects every provider automatically
-- `ExecutionContext` — phase + plan + todos unified
-- `MemoryLayer` — Explicit > Inferred > Session priority
-- `ObservationStore` — session working memory (not permanent)
-- `SystemPromptBuilder` — layered prompt assembly with `Get`/`Has`/`Set`/`Append`
-- `ContextBudget` — token budget across context layers
-- `DispatchParallel` — parallel tool execution (was promised, now real)
-- `AreIndependent` — heuristic for parallel-safe tool calls
-- `SkillMatch` + `MatchScore` — scored skill ranking
-- `DefaultObservationFilter` — auto-filters tool results into observations
-- `DefaultMemoryTriggerDetector` — recognizes "remember that", "I moved to", etc.
-- `Scope.Session` — third memory scope (delegates to ObservationStore)
-
----
-
-## The Runtime — what it does for you
-
-The `Runtime` is what closes the gap between "bag of providers" and
-"working agent". It wires the providers automatically:
+## The 6-phase lifecycle (cold start)
 
 ```
-Run(userMessage)
+Run(conv, message)
   │
-  ├── Orientation
+  ├── Wellbeing check (intercept if high-severity distress)
+  │
+  ├── Orientation [cold only]
   │     ├── Read memory → LayerMemory
-  │     ├── Match skills → load top N → LayerSkills
+  │     ├── Match + load skills → LayerSkills
   │     └── Surface observations → LayerSession
   │
-  ├── Alignment
-  │     └── (LLM proposes plan during Execution if needed)
+  ├── Warm refresh [warm turns only]
+  │     ├── Re-surface observations
+  │     └── Match new skills not yet loaded
   │
   ├── Preparation
-  │     ├── Auto-checkpoint (if CheckpointProvider wired)
-  │     └── Verify ContextBudget
+  │     ├── Auto-checkpoint
+  │     └── Budget enforcement (evict skills, truncate history)
   │
-  ├── Execution
-  │     ├── RunAgentLoopWithEngine
-  │     └── OnToolResult → ObservationFilter → record
-  │
-  ├── Verification
-  │     └── (consumer-defined hooks)
+  ├── Execution → Verification (loop with retry)
+  │     ├── Safety filter on tool calls
+  │     ├── OnToolResult → ObservationFilter → record
+  │     └── Verify output — retry if Retry=true
   │
   └── Closure
-        └── MemoryTriggerDetector → write to memory
+        ├── Explicit memory triggers ("remember that...")
+        ├── Inferred memory writes (LLM extracts persistent facts)
+        └── Persist conversation to ConversationStore
 ```
-
-What the consumer no longer has to write:
-
-- 50+ lines of memory-read-and-inject boilerplate
-- Skill match-and-load loop
-- Observation filtering on every tool result
-- Memory write trigger detection
-- Phase advancement logic
-- Context budget verification
 
 ---
 
-## Manual control — when you need it
-
-If the Runtime's defaults don't fit your case, drive `RunAgentLoopWithEngine`
-directly. The Runtime is a wrapper, not a replacement:
+## Multi-turn conversations
 
 ```go
-engine := autobuild.NewWithDefaults(128_000)
-exec := engine.Execution
+conv := autobuild.NewConversation("user-123-thread-456")
 
-// Phase 0: Orientation — your way
-memContent, _ := engine.Memory.View(ctx, autobuild.ScopeUser, "/profile")
-engine.Prompt.Set(autobuild.LayerMemory, memContent)
-
-matches, _ := engine.Skills.Match(ctx, userMessage)
-for _, m := range matches[:3] {
-    if m.Score < 0.3 { break }
-    skill, _ := engine.Skills.Load(ctx, m.Skill.Name)
-    engine.Prompt.Append(autobuild.LayerSkills, skill.Content)
+// Restore from store if exists
+if existing, _ := store.Load(ctx, conv.ID); existing != nil {
+    conv = existing
 }
 
-exec.Advance(ctx)
-
-// Phase 1: Alignment — propose plan if complex
-if isComplexTask(userMessage) {
-    plan, _ := exec.Propose(ctx, autobuild.Plan{
-        Title: "Refactor auth",
-        Executables: []autobuild.Executable{ /* ... */ },
-    })
-    _ = plan
+// Multi-turn — first cold, rest warm
+for _, message := range userInputs {
+    result, err := runtime.Run(ctx, conv, message)
+    if err != nil { break }
+    fmt.Println(result.Response)
 }
 
-exec.Advance(ctx)
+store.Save(ctx, conv)
+```
 
-// Phase 2: Preparation
-engine.Checkpoints.Create(ctx, "Before refactor")
+First call triggers full orientation. Subsequent calls skip memory re-read,
+only refresh observations and check for new skill matches.
 
-exec.Advance(ctx)
+---
 
-// Phase 3: Execution
-result, _ := autobuild.RunAgentLoopWithEngine(ctx, engine, "code-agent",
-    autobuild.AgentLoopConfig{
-        MaxTurns: 50,
-        OnToolResult: func(call autobuild.ToolCallEntry, r autobuild.ToolResult) autobuild.ToolResult {
-            obs := autobuild.DefaultObservationFilter(call, r)
-            if obs.Content != "" {
-                engine.Observations.Record(ctx, obs)
+## Memory layers + scopes
+
+```
+Layers (priority):              Scopes (boundary):
+  Explicit  → user said it       User    → cross-project
+  Inferred  → LLM derived it     Project → per-project
+  Session   → this conv only     Session → → ObservationStore
+```
+
+Conflict resolution: Explicit > Inferred > Session. Inferred only writes
+when LLM confidence ≥ threshold.
+
+```go
+runtime.WithMemoryWriter(&autobuild.InferredMemoryWriter{
+    Provider:      myLLM,
+    Model:         "claude-haiku-4-5",
+    MaxFacts:      3,
+    MinConfidence: 0.7,
+})
+```
+
+---
+
+## Safety filters
+
+```go
+runtime.WithSafety(autobuild.NewSafetyChain(
+    autobuild.DefaultDangerousCommandFilter(),
+    autobuild.DefaultSecretLeakFilter(),
+    // Custom
+    autobuild.SafetyFilterFunc(func(ctx context.Context, call autobuild.ToolCallEntry) autobuild.SafetyVerdict {
+        if call.Name == "send_email" && containsForbidden(call.Arguments) {
+            return autobuild.SafetyVerdict{
+                Decision: autobuild.SafetyBlock,
+                Reason:   "recipient not in allowlist",
             }
-            return r
-        },
-    },
-    messages,
-)
-
-exec.Advance(ctx) // Verification
-exec.Advance(ctx) // Closure
-
-// Closure: detect memory triggers manually
-if layer, content, ok := autobuild.DefaultMemoryTriggerDetector(userMessage); ok {
-    engine.Memory.Create(ctx, autobuild.ScopeUser, "/facts/new.md", content)
-    _ = layer
-}
+        }
+        return autobuild.SafetyVerdict{Decision: autobuild.SafetyAllow}
+    }),
+))
 ```
+
+Blocked calls return the reason as the tool result so the LLM can self-correct.
 
 ---
 
-## Memory layers — how to write correctly
+## Verification
 
 ```go
-// User said it explicitly → Explicit layer (top priority)
-layeredMem.WriteLayered(ctx, autobuild.ScopeUser, "/profile/work.md",
-    "Works at Maxwell Clinic on EverBetter EHR",
-    autobuild.MemoryLayerExplicit)
+// Lightweight: completion + min length
+runtime.WithVerification(autobuild.CompletionVerification{MinLength: 50})
 
-// You inferred from conversation → Inferred layer
-layeredMem.WriteLayered(ctx, autobuild.ScopeUser, "/profile/preferences.md",
-    "Prefers short responses with code examples",
-    autobuild.MemoryLayerInferred)
-
-// Only this session → ObservationStore, not memory
-engine.Observations.Record(ctx, autobuild.Observation{
-    Source:  "user_message",
-    Content: "Currently debugging a race condition in payment flow",
+// Strong: LLM self-check against criteria
+runtime.WithVerification(autobuild.CriteriaVerification{
+    Provider: myLLM,
+    Criteria: []string{
+        "Response includes a code example",
+        "Response addresses the specific question",
+        "No placeholder text like TODO",
+    },
 })
 
-// On conflict, Explicit always wins
-entries, _ := layeredMem.SearchLayered(ctx, autobuild.ScopeUser, "work")
-autobuild.SortByPriority(entries) // Explicit first
+// Custom: run tests
+runtime.WithVerification(autobuild.VerificationStrategyFunc(
+    func(ctx context.Context, r *autobuild.AgentLoopResult, c *autobuild.Conversation) autobuild.Verdict {
+        if !runTests() {
+            return autobuild.Verdict{Pass: false, Reason: "tests failed", Retry: true}
+        }
+        return autobuild.Verdict{Pass: true}
+    },
+))
+
+runtime.WithMaxVerifyRetry(2)
 ```
 
 ---
 
-## System prompt layers — assembly order
-
-```
-LayerCore      → who the agent is, invariant
-LayerBehavior  → DefaultBehaviorPrompt (set automatically by Runtime)
-LayerMemory    → injected from MemoryProvider at orientation
-LayerSkills    → content of loaded skills (added by Runtime)
-LayerSession   → time, observations, current state (added by Runtime)
-LayerMode      → active mode's overlay (applied last)
-```
-
-The Runtime fills LayerBehavior, LayerMemory, LayerSkills, and LayerSession.
-You fill LayerCore once at startup.
-
----
-
-## Multi-model routing — the right way
-
-No separate `Router` field. Duck typing handles it:
+## Subagents
 
 ```go
-engine.LLM = autobuild.NewRoutedLLMProvider("anthropic",
-    map[string]autobuild.LLMProvider{
-        "anthropic": anthropicProvider,
-        "ollama":    ollamaProvider,
-    })
+subs := []autobuild.Subagent{
+    {ID: "research-1", Task: "Find papers on agent memory", Engine: subEngine},
+    {ID: "research-2", Task: "Survey existing SDKs", Engine: subEngine},
+}
 
-// In mode's system.md frontmatter:
-// model: anthropic/claude-sonnet-4-20250514  → routes to anthropic
-// model: ollama/llama3                        → routes to ollama
-```
-
----
-
-## Parallel tool dispatch
-
-```go
-calls := response.ToolCalls
-
-if autobuild.AreIndependent(calls) {
-    results := dispatcher.DispatchParallel(ctx, calls, sandboxID)
-    _ = results
-} else {
-    results := dispatcher.DispatchAll(ctx, calls, sandboxID)
-    _ = results
+results := autobuild.RunSubagentsInParallel(ctx, subs)
+for _, r := range results {
+    if r.Error != nil { continue }
+    fmt.Printf("[%s] %s\n", r.ID, r.Output)
 }
 ```
 
-The rule: if the result of A does not feed parameters of B, they are independent.
+Isolated context, shared LLM + Memory (read-only), structured results.
 
 ---
 
-## Customizing Runtime behavior
+## Dynamic tool discovery
 
 ```go
-runtime := autobuild.NewRuntime(engine).
-    WithMode("code-agent").
-    WithMaxSkills(5).            // load up to 5 skills per turn
-    WithSkillThreshold(0.5).      // require higher relevance
-    WithObservationFilter(myFilter).
-    WithMemoryTrigger(myDetector)
+registry.Register(...)
+registry.Hide("rare_tool") // not in default ToolDefs
+
+// Add tool_search as a meta-tool
+registry.Register(&autobuild.Tool{
+    Name:        "tool_search",
+    Description: "Search for available tools",
+    Execute: func(ctx context.Context, _ string, args map[string]any) (string, error) {
+        query := args["query"].(string)
+        matches := registry.Search(query)
+        for _, m := range matches[:3] {
+            registry.Reveal(m.Tool.Name)
+        }
+        return formatMatches(matches), nil
+    },
+})
 ```
 
-- `ObservationFilter` decides which tool results become observations
-- `MemoryTriggerDetector` decides when to write to memory based on user message
+---
+
+## Budget enforcement (real, not warnings)
+
+```go
+// On overflow:
+// 1. Evict skills (LRU)
+// 2. Truncate oldest non-system messages
+// 3. Report remaining overflow as StillOverflow=true
+
+result, _ := runtime.Run(ctx, conv, message)
+if result.Enforcement != nil {
+    log.Printf("Evicted: %v, dropped: %d",
+        result.Enforcement.EvictedSkills,
+        result.Enforcement.HistoryDropped)
+}
+```
 
 ---
 
-## What this gives you vs raw LLM
+## Tracing
 
-| Capability | Raw LLM API | SDK + Runtime |
-|---|---|---|
-| Phase discipline | Implicit in prompt | Explicit, enforced by ExecutionContext |
-| Memory persistence | None | MemoryProvider with auto-read at orientation |
-| Skill loading | Manual | Auto-match + load via Runtime |
-| Plan + todos | Manual | ExecutionContext owns both |
-| Multi-model routing | Manual | RoutedLLMProvider + duck typing |
-| Observation store | None | Auto-filtered from tool results |
-| Context budget | None | ContextBudget with overflow warnings |
-| Checkpoint discipline | None | Auto-checkpoint in Preparation |
-| Parallel tools | Manual goroutines | DispatchParallel + AreIndependent |
-| Memory write triggers | None | DefaultMemoryTriggerDetector |
-| Token observability | Usage in response | ReasoningTrace + TotalUsage |
+```go
+tracer := autobuild.NewTracer()
+ctx = autobuild.WithTracer(ctx, tracer)
+
+runtime.Run(ctx, conv, message)
+
+for _, span := range tracer.Spans() {
+    log.Printf("[%s] %s %v %s",
+        span.SpanID, span.Name, span.Duration, span.Status)
+}
+```
+
+Spans propagate parent IDs. Trace IDs span subagents.
 
 ---
 
-## What this does NOT give you
+## Eval suite
 
-- **RLHF-trained judgment** — `DefaultBehaviorPrompt` approximates it,
-  but the model's ability to infer when to use a tool comes from training.
+```go
+suite := &autobuild.EvalSuite{
+    Cases: []autobuild.EvalCase{
+        {
+            Name:  "memory_recall",
+            Input: "What's my name?",
+            Assertions: []autobuild.Assertion{
+                {Type: autobuild.AssertContains, Value: "Juss"},
+                {Type: autobuild.AssertMaxTurns, Value: "1"},
+            },
+        },
+        {
+            Name:  "tool_use",
+            Input: "What's the weather in Quito?",
+            Assertions: []autobuild.Assertion{
+                {Type: autobuild.AssertToolCalled, Value: "weather"},
+            },
+        },
+    },
+}
+
+results, _ := suite.Run(ctx, runtime)
+summary := autobuild.Summarize(results)
+fmt.Printf("Pass: %.0f%% (%d/%d)\n",
+    summary.PassRate*100, summary.Passed, summary.Total)
+```
+
+---
+
+## Multilingual triggers
+
+`DefaultMemoryTriggerDetector` and `DefaultWellbeingDetector` work in
+English and Spanish out of the box:
+
+```
+"recuerda que vivo en Quito"  → MemoryLayerExplicit
+"me mudé a Cuenca"            → MemoryLayerExplicit (state change)
+"olvida lo de mi trabajo"     → forget trigger
+"quiero morir"                → WellbeingSeverityHigh, intercepted
+```
+
+---
+
+## Retry policy
+
+`callWithRetry` classifies errors and retries with exponential backoff:
+
+```
+Permanent (no retry): 401, 403, 400, 404, content_filter, context_length
+Transient (retry):    429, 5xx, timeout, EOF, connection errors
+Backoff:              1s → 2s → 4s → 8s → 16s → 30s (cap)
+```
+
+---
+
+## Cancellation
+
+`ctx` propagates through every phase. Cancel mid-flight:
+
+```go
+ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+defer cancel()
+result, err := runtime.Run(ctx, conv, message)
+// err == context.DeadlineExceeded if timeout hit
+```
+
+---
+
+## Configuration knobs
+
+```go
+runtime.
+    WithMode("code-agent").
+    WithSkillThreshold(0.5).
+    WithMaxSkills(5).
+    WithObservationFilter(myFilter).
+    WithMemoryTrigger(myTrigger).
+    WithWellbeing(myWellbeingDetector).
+    WithSafety(myChain).
+    WithVerification(myStrategy).
+    WithMemoryWriter(&autobuild.InferredMemoryWriter{...}).
+    WithTokenizer(realTokenizer). // replace HeuristicTokenizer
+    WithConversationStore(myStore).
+    WithMaxVerifyRetry(3)
+```
+
+---
+
+## What still does NOT exist
+
+- **RLHF-trained judgment** — `DefaultBehaviorPrompt` approximates it.
 - **Anthropic's actual system prompt** — not public.
-- **Model quality** — swap a weaker model and decisions get worse regardless
-  of scaffolding.
+- **Real tokenizer** — `HeuristicTokenizer` is chars/4. Replace with
+  tiktoken or a Claude tokenizer for production.
+- **Vector search** — `ObservationStore` is keyword-based. Replace with
+  embeddings for semantic relevance.
 
 The SDK is the skeleton. The LLM is the brain. The system prompt is the
-personality. All three together get you structurally close.
-
+personality. Together they get structurally close to Claude — but the model
+quality determines the ceiling.
