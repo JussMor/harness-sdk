@@ -358,29 +358,29 @@ func (a *BackendChatApp) handleRun(w http.ResponseWriter, r *http.Request, chatI
 		threadID := strings.TrimSpace(event.Source)
 		summary := RunnerSummary{Model: effectiveModel, Status: "running"}
 
-		if payloadThreadID := strings.TrimSpace(asString(event.Payload["thread_id"])); payloadThreadID != "" {
+		if payloadThreadID := payloadString(event.Payload, "thread_id"); payloadThreadID != "" {
 			threadID = payloadThreadID
 		}
 		if threadID != "" {
 			summary.ID = threadID
 		}
-		if task := strings.TrimSpace(asString(event.Payload["task"])); task != "" {
+		if task := payloadString(event.Payload, "task"); task != "" {
 			summary.Task = task
 		}
-		if tier := strings.TrimSpace(asString(event.Payload["tier"])); tier != "" {
+		if tier := payloadString(event.Payload, "tier"); tier != "" {
 			summary.Tier = tier
 		}
-		if model := strings.TrimSpace(asString(event.Payload["model"])); model != "" {
+		if model := payloadString(event.Payload, "model"); model != "" {
 			summary.Model = model
 		}
 
 		switch event.Type {
 		case ab.EventExecutableUpdated:
-			status := strings.TrimSpace(asString(event.Payload["status"]))
+			status := payloadString(event.Payload, "status")
 			if status != "" {
 				summary.Status = status
 			}
-			summary.Result = asString(event.Payload["result"])
+			summary.Result = payloadString(event.Payload, "result")
 		case ab.EventRunnerCompleted:
 			summary.Status = "success"
 			summary.Result = asString(event.Payload["result"])
@@ -433,6 +433,21 @@ func (a *BackendChatApp) handleRun(w http.ResponseWriter, r *http.Request, chatI
 		"user":      userMsg,
 		"assistant": assistantPayload,
 	})
+}
+
+func payloadString(payload map[string]any, key string) string {
+	if payload == nil {
+		return ""
+	}
+	value, ok := payload[key]
+	if !ok || value == nil {
+		return ""
+	}
+	text := strings.TrimSpace(fmt.Sprintf("%v", value))
+	if text == "" || text == "<nil>" {
+		return ""
+	}
+	return text
 }
 
 func firstNonEmpty(values ...string) string {

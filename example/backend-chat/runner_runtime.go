@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"log"
 	"os"
@@ -397,62 +396,6 @@ func (r *agentRuntime) newDocumentTool() *ab.Tool {
 	}
 }
 
-func (r *agentRuntime) newSpawnRunnerTool() *ab.Tool {
-	return &ab.Tool{
-		Name:        "spawn-runner",
-		Description: "Spawn a parallel runner for an autonomous subtask.",
-		Category:    ab.ToolCategoryCompute,
-		Parameters: ab.ToolFuncParams{
-			Type: "object",
-			Properties: map[string]ab.ToolParam{
-				"tier": {Type: "string", Description: "Runner tier: nano or mini."},
-				"task": {Type: "string", Description: "Self-contained task for the runner."},
-				"resourceBundle": {
-					Type:        "array",
-					Description: "Optional resources for the runner.",
-					Items: &ab.ToolParam{
-						Type: "object",
-						Properties: map[string]ab.ToolParam{
-							"id":          {Type: "string"},
-							"type":        {Type: "string"},
-							"description": {Type: "string"},
-						},
-					},
-				},
-			},
-			Required: []string{"tier", "task"},
-		},
-		Execute: func(ctx context.Context, _ string, args map[string]any) (string, error) {
-			tier := strings.ToLower(strings.TrimSpace(asString(args["tier"])))
-			if tier == "" {
-				tier = string(ab.RunnerTierMini)
-			}
-
-			runner := ab.Runner{
-				Tier:           parseRunnerTier(tier),
-				Task:           strings.TrimSpace(asString(args["task"])),
-				ResourceBundle: parseResourceBundle(args["resourceBundle"]),
-			}
-			if runner.Task == "" {
-				return "", fmt.Errorf("runner task is required")
-			}
-
-			threadID, err := r.threads.Spawn(ctx, runner)
-			if err != nil {
-				return "", err
-			}
-
-			payload, _ := json.Marshal(map[string]any{
-				"threadId": threadID,
-				"tier":     runner.Tier,
-				"task":     runner.Task,
-				"status":   ab.ObjectiveStatusPending,
-			})
-			return string(payload), nil
-		},
-	}
-}
-
 type checkpointStore struct {
 	nextID atomic.Uint64
 }
@@ -665,34 +608,6 @@ func providerOrEcho(provider ab.LLMProvider, model string) ab.LLMProvider {
 		return provider
 	}
 	return &EchoLLM{Model: model}
-}
-
-func parseRunnerTier(value string) ab.RunnerTier {
-	if value == string(ab.RunnerTierNano) {
-		return ab.RunnerTierNano
-	}
-	return ab.RunnerTierMini
-}
-
-func parseResourceBundle(value any) []ab.ResourceRef {
-	rawItems, ok := value.([]any)
-	if !ok {
-		return nil
-	}
-
-	items := make([]ab.ResourceRef, 0, len(rawItems))
-	for _, item := range rawItems {
-		obj, ok := item.(map[string]any)
-		if !ok {
-			continue
-		}
-		items = append(items, ab.ResourceRef{
-			ID:          asString(obj["id"]),
-			Type:        asString(obj["type"]),
-			Description: asString(obj["description"]),
-		})
-	}
-	return items
 }
 
 func asString(value any) string {

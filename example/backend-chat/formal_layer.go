@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"fmt"
+	"log"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -200,6 +201,119 @@ func (w *inMemoryWorkflowEngine) SetTodos(todos []ab.Todo) {
 	w.todos = append([]ab.Todo(nil), todos...)
 }
 
+func executeFormalPlanWithTasks(ctx context.Context, engine *ab.Engine, runtime *agentRuntime, messages []ab.ChatMessage, model string, proposedTasks []string) ([]RunnerSummary, string, error) {
+	if engine == nil || engine.Plans == nil || engine.Workflow == nil || runtime == nil || len(proposedTasks) < 2 {
+		return nil, "", nil
+	}
+
+	prompt := latestUserPrompt(messages)
+	if prompt == "" {
+		return nil, "", nil
+	}
+
+	// State shared across workflow hooks
+	var plan *ab.Plan
+	var runners []RunnerSummary
+	var planErr error
+	
+	workflow := engine.Workflow
+
+	// Hook: Create Plan in Preparation phase
+	workflow.RegisterHook(ab.PhasePreparation, func(ctx context.Context, from, to ab.Phase) error {
+		log.Printf("Workflow PhasePreparation: creating plan with %d tasks", len(proposedTasks))
+		
+		executables := buildExecutablesFromTasks(proposedTasks)
+		var err error
+		plan, err = engine.Plans.Propose(ctx, ab.Plan{
+			Title:       "backend-chat formal run",
+			Objective:   prompt,
+			AutoApprove: true,
+			Executables: executables,
+		})
+		if err != nil {
+			planErr = err
+			return err
+		}
+
+		if err := engine.Plans.Approve(ctx, plan.ID, true); err != nil {
+			planErr = err
+			return err
+		}
+		
+		log.Printf("Workflow PhasePreparation: plan created %s with %d executables", plan.ID, len(plan.Executables))
+		return nil
+	})
+
+	// Hook: Execute Plan in Execution phase
+	workflow.RegisterHook(ab.PhaseExecution, func(ctx context.Context, from, to ab.Phase) error {
+		if plan == nil {
+			return fmt.Errorf("plan not created in preparation phase")
+		}
+		
+		log.Printf("Workflow PhaseExecution: spawning runners for plan %s", plan.ID)
+		
+		ready := plan.NextReady()
+		for _, exec := range ready {
+			_ = engine.Plans.UpdateStatus(ctx, plan.ID, exec.ID, ab.ExecStatusQueued, "queued for execution")
+			
+			task := strings.TrimSpace(exec.Description)
+			if task == "" {
+				task = strings.TrimSpace(exec.Name)
+			}
+			
+			threadID, spawnErr := runtime.threads.Spawn(ctx, ab.Runner{
+				Tier: ab.RunnerTierMini,
+				Task: task,
+			})
+			if spawnErr != nil {
+				_ = engine.Plans.UpdateStatus(ctx, plan.ID, exec.ID, ab.ExecStatusFailed, spawnErr.Error())
+				continue
+			}
+			
+			_ = engine.Plans.UpdateStatus(ctx, plan.ID, exec.ID, ab.ExecStatusInProgress, "execution started")
+			log.Printf("Workflow PhaseExecution: spawned runner %s for exec %s", threadID, exec.ID)
+		}
+		
+		return nil
+	})
+
+	// Hook: Collect results in Verification phase
+	workflow.RegisterHook(ab.PhaseVerification, func(ctx context.Context, from, to ab.Phase) error {
+		if plan == nil {
+			return fmt.Errorf("plan not available for verification")
+		}
+		
+		log.Printf("Workflow PhaseVerification: collecting results for plan %s", plan.ID)
+		
+		// Wait long enough so run.completed is emitted after runner.completed events.
+		runners = runtime.threads.Wait(30 * time.Second)
+		log.Printf("Workflow PhaseVerification: collected %d runners", len(runners))
+		
+		return nil
+	})
+
+	// Workflow orchestrates the phases
+	log.Printf("Workflow: starting formal plan execution with LLM-proposed tasks")
+	_ = workflow.SetPhase(ctx, ab.PhaseOrientation)
+	_ = workflow.SetPhase(ctx, ab.PhaseAlignment)
+	_ = workflow.SetPhase(ctx, ab.PhasePreparation)    // Hook: Plan created
+	_ = workflow.SetPhase(ctx, ab.PhaseExecution)      // Hook: Runners spawned
+	_ = workflow.SetPhase(ctx, ab.PhaseVerification)   // Hook: Results collected
+	_ = workflow.SetPhase(ctx, ab.PhaseClosure)
+
+	if planErr != nil {
+		return nil, "", planErr
+	}
+
+	var summary string
+	if plan != nil {
+		summary = summarizePlanForPrompt(plan)
+	}
+	
+	log.Printf("Workflow: formal plan execution complete, plan=%v runners=%d", plan != nil, len(runners))
+	return runners, summary, nil
+}
+
 func executeFormalPlan(ctx context.Context, engine *ab.Engine, runtime *agentRuntime, messages []ab.ChatMessage, model string) ([]RunnerSummary, string, error) {
 	if engine == nil || engine.Plans == nil || runtime == nil {
 		return nil, "", nil
@@ -210,12 +324,20 @@ func executeFormalPlan(ctx context.Context, engine *ab.Engine, runtime *agentRun
 		return nil, "", nil
 	}
 
+	chunks := splitPromptIntoTasks(prompt)
+	if len(chunks) < 2 {
+		chunks = []string{prompt}
+	}
+
+	// Plan execution is controlled by useFormalPlan flag from frontend;
+	// no heuristic validation needed here
+
 	if engine.Workflow != nil {
 		_ = engine.Workflow.SetPhase(ctx, ab.PhaseOrientation)
 		_ = engine.Workflow.SetPhase(ctx, ab.PhaseAlignment)
 	}
 
-	executables := buildExecutablesFromPrompt(prompt)
+	executables := buildExecutablesFromTasks(chunks)
 	plan, err := engine.Plans.Propose(ctx, ab.Plan{
 		Title:       "backend-chat formal run",
 		Objective:   prompt,
@@ -295,22 +417,13 @@ func latestUserPrompt(messages []ab.ChatMessage) string {
 	return ""
 }
 
-func buildExecutablesFromPrompt(prompt string) []ab.Executable {
-	chunks := splitPromptIntoTasks(prompt)
+func buildExecutablesFromTasks(chunks []string) []ab.Executable {
 	execs := make([]ab.Executable, 0, len(chunks))
 	for i, task := range chunks {
 		execs = append(execs, ab.Executable{
 			ID:          fmt.Sprintf("exec_%d", i+1),
 			Name:        fmt.Sprintf("Subtask %d", i+1),
 			Description: task,
-			Status:      ab.ExecStatusPlanned,
-		})
-	}
-	if len(execs) == 0 {
-		execs = append(execs, ab.Executable{
-			ID:          "exec_1",
-			Name:        "Main task",
-			Description: prompt,
 			Status:      ab.ExecStatusPlanned,
 		})
 	}
@@ -348,7 +461,7 @@ func splitPromptIntoTasks(prompt string) []string {
 		return bullets
 	}
 
-	for _, sep := range []string{";", " y ", " then ", " despues ", " después "} {
+	for _, sep := range []string{";", " then ", " despues ", " después ", " y luego ", " y también "} {
 		parts := strings.Split(trimmed, sep)
 		if len(parts) >= 2 {
 			out := make([]string, 0, len(parts))
@@ -366,6 +479,7 @@ func splitPromptIntoTasks(prompt string) []string {
 
 	return []string{trimmed}
 }
+
 
 func summarizePlanForPrompt(plan *ab.Plan) string {
 	if plan == nil {

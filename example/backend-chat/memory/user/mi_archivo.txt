@@ -1,3 +1,0 @@
-Archivo de prueba creado en memory-operations
-Scope: user
-Contenido inicial guardado
