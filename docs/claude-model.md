@@ -7,198 +7,156 @@ is the brain.
 
 ---
 
+## TL;DR — The fast path
+
+```go
+engine := autobuild.NewWithDefaults(128_000)
+engine.LLM = myLLM
+engine.Memory = myMemory
+engine.Tools = myTools
+engine.Skills = mySkills
+
+runtime := autobuild.NewRuntime(engine)
+result, _ := runtime.Run(ctx, "Help me refactor auth")
+```
+
+The `Runtime` orchestrator runs the full 6-phase lifecycle, reads memory,
+matches and loads skills, surfaces observations, dispatches tools, and
+detects memory write triggers — all automatically. Skip to "Manual control"
+below if you need fine-grained control.
+
+---
+
 ## What changed from the original SDK
 
 | Removed | Replaced by | Why |
 |---|---|---|
 | `WorkflowEngine` + `PlanProvider` | `ExecutionContext` | They always move together — one object owns phase, plan, and todos |
-| `Engine.Router ModelRouter` | Duck typing on `LLM` field | `RoutedLLMProvider` already implements both interfaces; separate field was a bug waiting to happen |
+| `TaskProvider` | `ExecutionContext` (Plan absorbs Task) | Same concept (steps + dependencies), different scope — redundant |
+| `Engine.Router ModelRouter` | Duck typing on `LLM` field | `RoutedLLMProvider` already implements both interfaces |
 | `MemoryProvider.Insert(line int)` | Use `StrReplace` instead | Line numbers go stale the moment the file changes |
-| `RunnerTierNano/Mini` as the only tiers | Use `Mode.ModelSettings` directly | Tiers should map to models, not be named opaquely |
+| `Skill.MatchesTrigger` (bool) | `Skill.MatchScore` (float) + `SkillMatch` | Naive substring match doesn't rank — replaced with scored matching |
 
 New additions:
 
+- `Runtime` — the orchestrator that connects every provider automatically
 - `ExecutionContext` — phase + plan + todos unified
 - `MemoryLayer` — Explicit > Inferred > Session priority
 - `ObservationStore` — session working memory (not permanent)
-- `SystemPromptBuilder` — layered prompt assembly
+- `SystemPromptBuilder` — layered prompt assembly with `Get`/`Has`/`Set`/`Append`
 - `ContextBudget` — token budget across context layers
-- `DispatchParallel` — parallel tool execution (was documented but not provided)
+- `DispatchParallel` — parallel tool execution (was promised, now real)
+- `AreIndependent` — heuristic for parallel-safe tool calls
+- `SkillMatch` + `MatchScore` — scored skill ranking
+- `DefaultObservationFilter` — auto-filters tool results into observations
+- `DefaultMemoryTriggerDetector` — recognizes "remember that", "I moved to", etc.
+- `Scope.Session` — third memory scope (delegates to ObservationStore)
 
 ---
 
-## The full wiring
+## The Runtime — what it does for you
 
-```go
-package main
+The `Runtime` is what closes the gap between "bag of providers" and
+"working agent". It wires the providers automatically:
 
-import (
-    "context"
-    autobuild "github.com/JussMor/harness-sdk/sdk"
-)
-
-func main() {
-    ctx := context.Background()
-
-    // 1. Build the engine with defaults
-    engine := autobuild.NewWithDefaults(128_000) // 128k context window
-
-    // 2. Wire your LLM — use RoutedLLMProvider for multi-model
-    engine.LLM = autobuild.NewRoutedLLMProvider("anthropic", map[string]autobuild.LLMProvider{
-        "anthropic": NewAnthropicProvider("claude-sonnet-4-20250514"),
-        "ollama":    NewOllamaProvider("llama3"),
-    })
-
-    // 3. Wire memory — implement MemoryProvider against your DB
-    engine.Memory = NewSurrealDBMemoryProvider(db)
-
-    // 4. Wire skills from disk
-    modes, _ := autobuild.LoadModesDir("./modes")
-    engine.Modes = autobuild.NewStaticModeProvider(modes)
-
-    skills, _ := autobuild.LoadSkillsDir("./skills")
-    engine.Skills = NewStaticSkillProvider(skills)
-
-    // 5. Wire tools
-    registry := autobuild.NewToolRegistry()
-    registry.Register(&autobuild.Tool{
-        Name:     "web_search",
-        Category: autobuild.ToolCategoryWeb,
-        // ... parameters and Execute func
-    })
-    engine.Tools = registry
-
-    // 6. Wire sandbox (optional — only needed if tools execute shell commands)
-    engine.Sandbox = NewDockerSandbox()
-
-    // 7. Wire checkpoints
-    engine.Checkpoints = NewPostgresCheckpointProvider(db)
-
-    // 8. Assemble the system prompt
-    orientationPrompt := buildOrientationPrompt(ctx, engine)
-    engine.Prompt.Set(autobuild.LayerCore, coreIdentityPrompt)
-    engine.Prompt.Set(autobuild.LayerBehavior, autobuild.DefaultBehaviorPrompt)
-    engine.Prompt.Set(autobuild.LayerMemory, orientationPrompt)
-
-    // 9. Run
-    result, err := autobuild.RunAgentLoopWithEngine(ctx, engine, "balanced", autobuild.AgentLoopConfig{
-        MaxTurns: 50,
-    }, []autobuild.ChatMessage{
-        {Role: autobuild.RoleUser, Content: "Help me refactor the auth module"},
-    })
-}
+```
+Run(userMessage)
+  │
+  ├── Orientation
+  │     ├── Read memory → LayerMemory
+  │     ├── Match skills → load top N → LayerSkills
+  │     └── Surface observations → LayerSession
+  │
+  ├── Alignment
+  │     └── (LLM proposes plan during Execution if needed)
+  │
+  ├── Preparation
+  │     ├── Auto-checkpoint (if CheckpointProvider wired)
+  │     └── Verify ContextBudget
+  │
+  ├── Execution
+  │     ├── RunAgentLoopWithEngine
+  │     └── OnToolResult → ObservationFilter → record
+  │
+  ├── Verification
+  │     └── (consumer-defined hooks)
+  │
+  └── Closure
+        └── MemoryTriggerDetector → write to memory
 ```
 
+What the consumer no longer has to write:
+
+- 50+ lines of memory-read-and-inject boilerplate
+- Skill match-and-load loop
+- Observation filtering on every tool result
+- Memory write trigger detection
+- Phase advancement logic
+- Context budget verification
+
 ---
 
-## The 6-phase lifecycle — how to drive it
+## Manual control — when you need it
 
-The `ExecutionContext` is the single object that owns phase, plan, and todos.
-You drive it explicitly — the SDK does not auto-advance phases.
+If the Runtime's defaults don't fit your case, drive `RunAgentLoopWithEngine`
+directly. The Runtime is a wrapper, not a replacement:
 
 ```go
+engine := autobuild.NewWithDefaults(128_000)
 exec := engine.Execution
 
-// ── Phase 0: Orientation ──────────────────────────────────────────────
-// Read memory before anything else.
-// This is what prevents redundant questions and wrong assumptions.
+// Phase 0: Orientation — your way
+memContent, _ := engine.Memory.View(ctx, autobuild.ScopeUser, "/profile")
+engine.Prompt.Set(autobuild.LayerMemory, memContent)
 
-memContent, _ := engine.Memory.View(ctx, autobuild.ScopeUser, "/")
-projectContent, _ := engine.Memory.View(ctx, autobuild.ScopeProject, "/README.md")
-engine.Prompt.Set(autobuild.LayerMemory, memContent+"\n\n"+projectContent)
-
-// Match skills to the user's request
-matched, _ := engine.Skills.Match(ctx, userMessage)
-var skillContent strings.Builder
-for _, m := range matched {
-    skill, _ := engine.Skills.Load(ctx, m.Name)
-    skillContent.WriteString(skill.Content + "\n\n")
+matches, _ := engine.Skills.Match(ctx, userMessage)
+for _, m := range matches[:3] {
+    if m.Score < 0.3 { break }
+    skill, _ := engine.Skills.Load(ctx, m.Skill.Name)
+    engine.Prompt.Append(autobuild.LayerSkills, skill.Content)
 }
-engine.Prompt.Set(autobuild.LayerSkills, skillContent.String())
 
-exec.Advance(ctx) // → Alignment
+exec.Advance(ctx)
 
-// ── Phase 1: Alignment ────────────────────────────────────────────────
-// One question max. Propose a plan for complex tasks.
-
+// Phase 1: Alignment — propose plan if complex
 if isComplexTask(userMessage) {
     plan, _ := exec.Propose(ctx, autobuild.Plan{
-        Title:     "Refactor auth module",
-        Objective: "Decouple JWT validation from the handler layer",
-        Executables: []autobuild.Executable{
-            {ID: "e1", Name: "Audit current auth flow", Status: autobuild.ExecStatusPlanned},
-            {ID: "e2", Name: "Extract JWT middleware", Status: autobuild.ExecStatusPlanned, Dependencies: []string{"e1"}},
-            {ID: "e3", Name: "Update handler tests", Status: autobuild.ExecStatusPlanned, Dependencies: []string{"e2"}},
-        },
+        Title: "Refactor auth",
+        Executables: []autobuild.Executable{ /* ... */ },
     })
-    _ = plan // present to user for approval
+    _ = plan
 }
 
-exec.Advance(ctx) // → Preparation
+exec.Advance(ctx)
 
-// ── Phase 2: Preparation ──────────────────────────────────────────────
-// Checkpoint before touching anything. Set todos.
+// Phase 2: Preparation
+engine.Checkpoints.Create(ctx, "Before refactor")
 
-if engine.HasCheckpoints() {
-    engine.Checkpoints.Create(ctx, "Before auth refactor")
-}
+exec.Advance(ctx)
 
-exec.SetTodos([]autobuild.Todo{
-    {ID: "t1", Content: "Audit current auth flow", Status: autobuild.TodoStatusInProgress},
-    {ID: "t2", Content: "Extract JWT middleware", Status: autobuild.TodoStatusPending},
-    {ID: "t3", Content: "Update handler tests", Status: autobuild.TodoStatusPending},
-})
-
-exec.Advance(ctx) // → Execution
-
-// ── Phase 3: Execution ────────────────────────────────────────────────
-// Run the agent loop. Parallel dispatch for independent tools.
-// Update todos and plan executables as work completes.
-
+// Phase 3: Execution
 result, _ := autobuild.RunAgentLoopWithEngine(ctx, engine, "code-agent",
     autobuild.AgentLoopConfig{
         MaxTurns: 50,
-        OnToolResult: func(call autobuild.ToolCallEntry, result autobuild.ToolResult) autobuild.ToolResult {
-            // Record interesting tool results as observations
-            engine.Observations.Record(ctx, autobuild.Observation{
-                Source:    call.Name,
-                Content:   result.Content,
-                Relevance: 0.8,
-            })
-            return result
+        OnToolResult: func(call autobuild.ToolCallEntry, r autobuild.ToolResult) autobuild.ToolResult {
+            obs := autobuild.DefaultObservationFilter(call, r)
+            if obs.Content != "" {
+                engine.Observations.Record(ctx, obs)
+            }
+            return r
         },
     },
     messages,
 )
 
-exec.MarkDone("t1")
-exec.UpdateExecutable(ctx, "e1", autobuild.ExecStatusCompleted, "Audit complete")
-exec.Advance(ctx) // → Verification
+exec.Advance(ctx) // Verification
+exec.Advance(ctx) // Closure
 
-// ── Phase 4: Verification ─────────────────────────────────────────────
-// Sanity check before closing. If it fails, retry execution.
-
-if verificationFails {
-    exec.SetPhase(ctx, autobuild.PhaseExecution) // retry — attempt counter increments
-    if exec.Attempt() > 3 {
-        // surface to user, don't loop forever
-    }
-    return
+// Closure: detect memory triggers manually
+if layer, content, ok := autobuild.DefaultMemoryTriggerDetector(userMessage); ok {
+    engine.Memory.Create(ctx, autobuild.ScopeUser, "/facts/new.md", content)
+    _ = layer
 }
-
-exec.Advance(ctx) // → Closure
-
-// ── Phase 5: Closure ──────────────────────────────────────────────────
-// Checkpoint. Update memory if something has leverage. Clear session obs.
-
-engine.Checkpoints.Create(ctx, "After auth refactor")
-
-if somethingWorthRemembering {
-    engine.Memory.StrReplace(ctx, autobuild.ScopeProject, "/README.md",
-        "## Auth", "## Auth\nJWT validation now lives in middleware/jwt.go")
-}
-
-engine.Observations.Clear(ctx) // session done
 ```
 
 ---
@@ -206,27 +164,25 @@ engine.Observations.Clear(ctx) // session done
 ## Memory layers — how to write correctly
 
 ```go
-// User said it explicitly → Explicit layer
+// User said it explicitly → Explicit layer (top priority)
 layeredMem.WriteLayered(ctx, autobuild.ScopeUser, "/profile/work.md",
     "Works at Maxwell Clinic on EverBetter EHR",
     autobuild.MemoryLayerExplicit)
 
-// You inferred it from conversation → Inferred layer
+// You inferred from conversation → Inferred layer
 layeredMem.WriteLayered(ctx, autobuild.ScopeUser, "/profile/preferences.md",
     "Prefers short responses with code examples",
     autobuild.MemoryLayerInferred)
 
-// Only relevant this session → ObservationStore, not memory
+// Only this session → ObservationStore, not memory
 engine.Observations.Record(ctx, autobuild.Observation{
     Source:  "user_message",
-    Content: "User is currently debugging a race condition in the payment flow",
-    Tags:    []string{"session", "debugging"},
+    Content: "Currently debugging a race condition in payment flow",
 })
 
 // On conflict, Explicit always wins
-entries, _ := layeredMem.SearchLayered(ctx, autobuild.ScopeUser, "work location")
+entries, _ := layeredMem.SearchLayered(ctx, autobuild.ScopeUser, "work")
 autobuild.SortByPriority(entries) // Explicit first
-winning := entries[0]
 ```
 
 ---
@@ -235,77 +191,32 @@ winning := entries[0]
 
 ```
 LayerCore      → who the agent is, invariant
-LayerBehavior  → DefaultBehaviorPrompt (tool judgment, memory discipline, etc.)
-LayerMemory    → read from MemoryProvider at conversation start
-LayerSkills    → content of loaded skills (added/removed dynamically)
-LayerSession   → current time, thread ID, what user is viewing
-LayerMode      → active mode's system.md content
+LayerBehavior  → DefaultBehaviorPrompt (set automatically by Runtime)
+LayerMemory    → injected from MemoryProvider at orientation
+LayerSkills    → content of loaded skills (added by Runtime)
+LayerSession   → time, observations, current state (added by Runtime)
+LayerMode      → active mode's overlay (applied last)
 ```
 
-```go
-prompt := autobuild.NewSystemPromptBuilder()
-prompt.Set(autobuild.LayerCore, `You are an engineering assistant for Maxwell Clinic,
-working on the EverBetter EHR system. You have deep knowledge of TypeScript,
-Go, and healthcare data standards.`)
-
-prompt.Set(autobuild.LayerBehavior, autobuild.DefaultBehaviorPrompt)
-
-// Refresh memory layer at each conversation start
-memContent := readRelevantMemory(ctx, engine.Memory)
-prompt.Set(autobuild.LayerMemory, memContent)
-
-// Skills added dynamically
-prompt.Append(autobuild.LayerSkills, loadedSkill.Content)
-
-// Session context from your platform
-prompt.Set(autobuild.LayerSession, fmt.Sprintf(
-    "Current time: %s | Thread: %s | User viewing: %s",
-    time.Now().Format(time.RFC3339), threadID, viewingArtifact,
-))
-
-// Mode applied last in RunAgentLoopWithEngine automatically
-finalPrompt := prompt.Build()
-```
+The Runtime fills LayerBehavior, LayerMemory, LayerSkills, and LayerSession.
+You fill LayerCore once at startup.
 
 ---
 
 ## Multi-model routing — the right way
 
-No separate `Router` field. `RoutedLLMProvider` implements `LLMProvider`.
-Duck typing handles the routing automatically in `resolveProvider`.
+No separate `Router` field. Duck typing handles it:
 
 ```go
-// Wire once
-engine.LLM = autobuild.NewRoutedLLMProvider("anthropic", map[string]autobuild.LLMProvider{
-    "anthropic": anthropicProvider,
-    "ollama":    ollamaProvider,
-})
+engine.LLM = autobuild.NewRoutedLLMProvider("anthropic",
+    map[string]autobuild.LLMProvider{
+        "anthropic": anthropicProvider,
+        "ollama":    ollamaProvider,
+    })
 
-// Use in mode's system.md frontmatter:
+// In mode's system.md frontmatter:
 // model: anthropic/claude-sonnet-4-20250514  → routes to anthropic
 // model: ollama/llama3                        → routes to ollama
-// model: claude-sonnet-4-20250514            → routes to default (anthropic)
-```
-
----
-
-## Context budget — prevent silent overflow
-
-```go
-budget := autobuild.DefaultContextBudget(128_000)
-
-skillTokens  := estimateTokens(loadedSkillsContent)
-memoryTokens := estimateTokens(memoryContent)
-historyTokens := estimateTokens(conversationHistory)
-
-if budget.WouldOverflow(skillTokens, memoryTokens, historyTokens) {
-    // Evict oldest skills first
-    evict := budget.SkillEvictionCount(len(loadedSkills), avgTokensPerSkill)
-    for i := 0; i < evict; i++ {
-        engine.Skills.Unload(ctx, oldestSkills[i])
-    }
-    // If still over, summarize memory or truncate history
-}
 ```
 
 ---
@@ -313,47 +224,63 @@ if budget.WouldOverflow(skillTokens, memoryTokens, historyTokens) {
 ## Parallel tool dispatch
 
 ```go
-// Independent tools → run in parallel
-results := dispatcher.DispatchParallel(ctx, independentCalls, sandboxID)
+calls := response.ToolCalls
 
-// Dependent tools → run sequentially
-for _, call := range dependentCalls {
-    result := dispatcher.Dispatch(ctx, call, sandboxID)
-    // use result to build next call
+if autobuild.AreIndependent(calls) {
+    results := dispatcher.DispatchParallel(ctx, calls, sandboxID)
+    _ = results
+} else {
+    results := dispatcher.DispatchAll(ctx, calls, sandboxID)
+    _ = results
 }
 ```
 
-The rule: if result of A does not determine parameters of B, they are independent.
+The rule: if the result of A does not feed parameters of B, they are independent.
 
 ---
 
-## What this gives you vs raw Claude
+## Customizing Runtime behavior
 
-| Capability | Raw Claude API | SDK + Claude Model |
+```go
+runtime := autobuild.NewRuntime(engine).
+    WithMode("code-agent").
+    WithMaxSkills(5).            // load up to 5 skills per turn
+    WithSkillThreshold(0.5).      // require higher relevance
+    WithObservationFilter(myFilter).
+    WithMemoryTrigger(myDetector)
+```
+
+- `ObservationFilter` decides which tool results become observations
+- `MemoryTriggerDetector` decides when to write to memory based on user message
+
+---
+
+## What this gives you vs raw LLM
+
+| Capability | Raw LLM API | SDK + Runtime |
 |---|---|---|
-| Phase discipline | Implicit in system prompt | Explicit, enforced by ExecutionContext |
-| Memory persistence | Manual | MemoryProvider + LayeredMemory |
-| Skill loading | Manual injection | SkillProvider with trigger matching |
+| Phase discipline | Implicit in prompt | Explicit, enforced by ExecutionContext |
+| Memory persistence | None | MemoryProvider with auto-read at orientation |
+| Skill loading | Manual | Auto-match + load via Runtime |
 | Plan + todos | Manual | ExecutionContext owns both |
 | Multi-model routing | Manual | RoutedLLMProvider + duck typing |
-| Observation store | None | InMemoryObservationStore |
-| Context budget | None | ContextBudget with eviction hints |
-| Checkpoint discipline | None | CheckpointProvider in lifecycle |
+| Observation store | None | Auto-filtered from tool results |
+| Context budget | None | ContextBudget with overflow warnings |
+| Checkpoint discipline | None | Auto-checkpoint in Preparation |
+| Parallel tools | Manual goroutines | DispatchParallel + AreIndependent |
+| Memory write triggers | None | DefaultMemoryTriggerDetector |
 | Token observability | Usage in response | ReasoningTrace + TotalUsage |
 
 ---
 
 ## What this does NOT give you
 
-- **RLHF-trained judgment** — the DefaultBehaviorPrompt approximates it,
-  but Claude's ability to infer when to use a tool without being told
-  comes from training, not configuration.
+- **RLHF-trained judgment** — `DefaultBehaviorPrompt` approximates it,
+  but the model's ability to infer when to use a tool comes from training.
+- **Anthropic's actual system prompt** — not public.
+- **Model quality** — swap a weaker model and decisions get worse regardless
+  of scaffolding.
 
-- **The real system prompt** — Anthropic's actual instructions are not
-  public. DefaultBehaviorPrompt is a structural approximation.
+The SDK is the skeleton. The LLM is the brain. The system prompt is the
+personality. All three together get you structurally close.
 
-- **Model quality** — the SDK is model-agnostic. Swap in a weaker model
-  and the quality of decisions drops regardless of the scaffolding.
-
-The SDK gives you the skeleton. The LLM is the brain. The system prompt
-is the personality. All three together get you structurally close.

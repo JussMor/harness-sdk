@@ -24,7 +24,6 @@ type Engine struct {
 	Skills       SkillProvider
 	Threads      ThreadProvider
 	Checkpoints  CheckpointProvider
-	Tasks        TaskProvider
 	Modes        ModeProvider
 	Events       EventBus
 	LLM          LLMProvider         // primary LLM — use RoutedLLMProvider for multi-model
@@ -63,7 +62,6 @@ func (e *Engine) HasTools() bool        { return e.Tools != nil }
 func (e *Engine) HasSkills() bool       { return e.Skills != nil }
 func (e *Engine) HasThreads() bool      { return e.Threads != nil }
 func (e *Engine) HasCheckpoints() bool  { return e.Checkpoints != nil }
-func (e *Engine) HasTasks() bool        { return e.Tasks != nil }
 func (e *Engine) HasModes() bool        { return e.Modes != nil }
 func (e *Engine) HasEvents() bool       { return e.Events != nil }
 func (e *Engine) HasLLM() bool          { return e.LLM != nil }

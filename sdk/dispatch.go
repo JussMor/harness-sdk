@@ -4,6 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"strings"
+	"sync"
 )
 
 // ToolDispatcher resolves tool calls from the LLM into actual executions.
@@ -85,15 +87,67 @@ func (d *ToolDispatcher) Dispatch(ctx context.Context, call ToolCallEntry, sandb
 	}
 }
 
-// DispatchAll executes all tool calls from a ChatResponse sequentially
-// and returns results in order. For parallel execution, the caller can
-// use goroutines and call Dispatch individually.
+// DispatchAll executes all tool calls sequentially and returns results in order.
+// Use when tool calls are dependent on each other.
 func (d *ToolDispatcher) DispatchAll(ctx context.Context, calls []ToolCallEntry, sandboxID string) []ToolResult {
 	results := make([]ToolResult, len(calls))
 	for i, call := range calls {
 		results[i] = d.Dispatch(ctx, call, sandboxID)
 	}
 	return results
+}
+
+// DispatchParallel executes all tool calls concurrently and returns results
+// in the same order as the input. Use when tool calls are independent —
+// the result of one does not feed the parameters of another.
+//
+// This mirrors how Claude executes tools: independent calls fire together,
+// dependent calls serialize. The caller decides which calls are independent
+// (typically the LLM, but a static analyzer could too).
+//
+// All goroutines share the parent context. If ctx is cancelled, in-flight
+// tools see the cancellation but already-returned results are preserved.
+func (d *ToolDispatcher) DispatchParallel(ctx context.Context, calls []ToolCallEntry, sandboxID string) []ToolResult {
+	if len(calls) == 0 {
+		return nil
+	}
+	if len(calls) == 1 {
+		return []ToolResult{d.Dispatch(ctx, calls[0], sandboxID)}
+	}
+
+	results := make([]ToolResult, len(calls))
+	var wg sync.WaitGroup
+	wg.Add(len(calls))
+
+	for i, call := range calls {
+		go func(idx int, c ToolCallEntry) {
+			defer wg.Done()
+			results[idx] = d.Dispatch(ctx, c, sandboxID)
+		}(i, call)
+	}
+
+	wg.Wait()
+	return results
+}
+
+// AreIndependent returns true when none of the calls reference values
+// that another call would produce. This is a heuristic — final independence
+// determination should come from the LLM. Useful as a static fallback
+// when the LLM does not classify its own calls.
+//
+// Independent here means: no call's argument JSON contains a value that
+// looks like a placeholder for another call's output (e.g. "${call_1.result}").
+func AreIndependent(calls []ToolCallEntry) bool {
+	if len(calls) <= 1 {
+		return true
+	}
+	// Look for placeholder patterns "${...}" or "{{...}}" in arguments.
+	for _, c := range calls {
+		if strings.Contains(c.Arguments, "${") || strings.Contains(c.Arguments, "{{") {
+			return false
+		}
+	}
+	return true
 }
 
 // ToMessages converts tool results into ChatMessages ready to append

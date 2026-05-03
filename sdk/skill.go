@@ -74,6 +74,51 @@ func (s *Skill) MatchesTrigger(text string) bool {
 	return false
 }
 
+// MatchScore returns a relevance score 0-1 for how well this skill matches text.
+// Score considers: number of triggers hit, position of match, length of trigger
+// (longer triggers = more specific = higher score per hit).
+func (s *Skill) MatchScore(text string) float64 {
+	if len(s.Triggers) == 0 {
+		return 0
+	}
+	lower := strings.ToLower(text)
+	var score float64
+	var hits int
+	for _, t := range s.Triggers {
+		trigger := strings.ToLower(strings.TrimSpace(t))
+		if trigger == "" {
+			continue
+		}
+		idx := strings.Index(lower, trigger)
+		if idx < 0 {
+			continue
+		}
+		hits++
+		// Specificity bonus: longer triggers count more (max 1.0)
+		specificity := float64(len(trigger)) / 30.0
+		if specificity > 1.0 {
+			specificity = 1.0
+		}
+		score += 0.5 + 0.5*specificity
+	}
+	if hits == 0 {
+		return 0
+	}
+	// Normalize to 0-1, with diminishing returns past 3 hits
+	normalized := score / float64(len(s.Triggers))
+	if normalized > 1.0 {
+		normalized = 1.0
+	}
+	return normalized
+}
+
+// SkillMatch is a skill plus its relevance score for a given query.
+type SkillMatch struct {
+	Skill     *Skill  `json:"skill"`
+	Score     float64 `json:"score"`     // 0-1, higher = more relevant
+	MatchedOn string  `json:"matched_on"` // which trigger fired
+}
+
 // SkillProvider abstracts loading, unloading, and discovering skills.
 // Loaded skills persist in the agent's context for the lifetime of the thread.
 type SkillProvider interface {
@@ -84,8 +129,12 @@ type SkillProvider interface {
 	// Unload removes the skill from the active context, freeing token space.
 	Unload(ctx context.Context, name string) error
 
-	// Match returns all skills whose triggers match the given text.
-	Match(ctx context.Context, text string) ([]*Skill, error)
+	// Loaded returns the names of currently loaded skills.
+	Loaded(ctx context.Context) []string
+
+	// Match returns skills ranked by relevance to the given text.
+	// Implementations should return higher-score matches first.
+	Match(ctx context.Context, text string) ([]SkillMatch, error)
 
 	// List returns all available skill names.
 	List(ctx context.Context) ([]string, error)

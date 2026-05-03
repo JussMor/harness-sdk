@@ -9,7 +9,6 @@ func WithToolRegistry(r *ToolRegistry) Option  { return func(e *Engine) { e.Tool
 func WithSkills(s SkillProvider) Option        { return func(e *Engine) { e.Skills = s } }
 func WithThreads(t ThreadProvider) Option      { return func(e *Engine) { e.Threads = t } }
 func WithCheckpoints(c CheckpointProvider) Option { return func(e *Engine) { e.Checkpoints = c } }
-func WithTasks(t TaskProvider) Option          { return func(e *Engine) { e.Tasks = t } }
 func WithModes(m ModeProvider) Option          { return func(e *Engine) { e.Modes = m } }
 func WithEventBus(b EventBus) Option           { return func(e *Engine) { e.Events = b } }
 func WithLLM(l LLMProvider) Option             { return func(e *Engine) { e.LLM = l } }

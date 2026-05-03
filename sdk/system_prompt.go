@@ -82,6 +82,16 @@ func NewSystemPromptBuilder() *SystemPromptBuilder {
 	}
 }
 
+// Get returns the content for a layer. Empty if not set.
+func (b *SystemPromptBuilder) Get(layer SystemPromptLayer) string {
+	return b.layers[layer]
+}
+
+// Has returns true if a layer has any non-empty content.
+func (b *SystemPromptBuilder) Has(layer SystemPromptLayer) bool {
+	return strings.TrimSpace(b.layers[layer]) != ""
+}
+
 // Set writes content for the given layer.
 // Calling Set on an existing layer replaces it.
 func (b *SystemPromptBuilder) Set(layer SystemPromptLayer, content string) {
