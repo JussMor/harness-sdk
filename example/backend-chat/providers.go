@@ -59,6 +59,13 @@ CREATE TABLE IF NOT EXISTS messages (
   created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
   FOREIGN KEY(chat_id) REFERENCES chats(id) ON DELETE CASCADE
 );
+
+CREATE TABLE IF NOT EXISTS chat_sandbox_bindings (
+	chat_id INTEGER PRIMARY KEY,
+	sandbox_id TEXT NOT NULL,
+	updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+	FOREIGN KEY(chat_id) REFERENCES chats(id) ON DELETE CASCADE
+);
 CREATE INDEX IF NOT EXISTS idx_messages_chat_id ON messages(chat_id, id);
 `
 	_, err := db.ExecContext(ctx, schema)
@@ -153,6 +160,35 @@ func getMessage(ctx context.Context, db *sql.DB, id int64) (Message, error) {
 		Scan(&m.ID, &m.ChatID, &m.Role, &m.Content, &m.Model, &metaRaw, &m.CreatedAt)
 	_ = json.Unmarshal([]byte(metaRaw), &m.Metadata)
 	return m, err
+}
+
+func GetChatSandboxBinding(ctx context.Context, db *sql.DB, chatID int64) (string, error) {
+	var sandboxID string
+	err := db.QueryRowContext(ctx, `SELECT sandbox_id FROM chat_sandbox_bindings WHERE chat_id = ?`, chatID).Scan(&sandboxID)
+	if err != nil {
+		if err == sql.ErrNoRows {
+			return "", nil
+		}
+		return "", err
+	}
+	return sandboxID, nil
+}
+
+func UpsertChatSandboxBinding(ctx context.Context, db *sql.DB, chatID int64, sandboxID string) error {
+	if _, err := db.ExecContext(ctx, `
+		INSERT INTO chat_sandbox_bindings(chat_id, sandbox_id, updated_at)
+		VALUES(?, ?, CURRENT_TIMESTAMP)
+		ON CONFLICT(chat_id)
+		DO UPDATE SET sandbox_id = excluded.sandbox_id, updated_at = CURRENT_TIMESTAMP
+	`, chatID, sandboxID); err != nil {
+		return err
+	}
+	return nil
+}
+
+func DeleteChatSandboxBinding(ctx context.Context, db *sql.DB, chatID int64) error {
+	_, err := db.ExecContext(ctx, `DELETE FROM chat_sandbox_bindings WHERE chat_id = ?`, chatID)
+	return err
 }
 
 type CentrifugoClient struct {

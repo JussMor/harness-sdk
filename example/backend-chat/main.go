@@ -430,6 +430,9 @@ func (a *BackendChatApp) handleStream(w http.ResponseWriter, r *http.Request, ch
 	ctx := r.Context()
 	tracer := ab.NewTracer()
 	ctx = ab.WithTracer(ctx, tracer)
+	if isSandboxAvailable() {
+		getSandboxManager().setDB(a.db)
+	}
 
 	sseWrite := func(event, data string) {
 		if ctx.Err() != nil {

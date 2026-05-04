@@ -2,9 +2,11 @@ package main
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"fmt"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -18,7 +20,9 @@ import (
 // Sandboxes are created lazily on first use and destroyed when the chat ends.
 type sandboxManager struct {
 	driver   *sbprovider.OpenSandboxDriver
+	db       *sql.DB
 	mu       sync.Mutex
+	keepAlive time.Duration
 	chatSandboxes map[int64]string // chatID → sandboxID
 }
 
@@ -28,24 +32,38 @@ var sandboxManagerOnce sync.Once
 // getSandboxManager returns the global sandbox manager, initializing it once.
 func getSandboxManager() *sandboxManager {
 	sandboxManagerOnce.Do(func() {
-		cfg := sbprovider.OpenSandboxConfig{
-			Domain:   getenv("OPEN_SANDBOX_DOMAIN", ""),
-			Protocol: getenv("OPEN_SANDBOX_PROTOCOL", "https"),
-			APIKey:   os.Getenv("OPEN_SANDBOX_API_KEY"),
+		ttlSeconds := getIntEnv("OPEN_SANDBOX_TTL_SECONDS", 21600)
+		if ttlSeconds < 300 {
+			ttlSeconds = 300
 		}
+		cfg := sbprovider.OpenSandboxConfig{
+			Domain:            getenv("OPEN_SANDBOX_DOMAIN", ""),
+			Protocol:          getenv("OPEN_SANDBOX_PROTOCOL", "https"),
+			APIKey:            os.Getenv("OPEN_SANDBOX_API_KEY"),
+			DefaultTTLSeconds: ttlSeconds,
+		}
+		keepAlive := time.Duration(ttlSeconds) * time.Second
 		driver, err := sbprovider.NewOpenSandbox(cfg)
 		if err != nil {
 			globalSandboxManager = &sandboxManager{
+				keepAlive:    keepAlive,
 				chatSandboxes: make(map[int64]string),
 			}
 			return
 		}
 		globalSandboxManager = &sandboxManager{
-			driver:        driver,
+			driver:       driver,
+			keepAlive:   keepAlive,
 			chatSandboxes: make(map[int64]string),
 		}
 	})
 	return globalSandboxManager
+}
+
+func (m *sandboxManager) setDB(db *sql.DB) {
+	m.mu.Lock()
+	m.db = db
+	m.mu.Unlock()
 }
 
 // isSandboxAvailable returns true when OPEN_SANDBOX_API_KEY is set.
@@ -56,11 +74,36 @@ func isSandboxAvailable() bool {
 
 // getOrCreateSandbox returns the sandbox ID for a chat, creating one if needed.
 func (m *sandboxManager) getOrCreateSandbox(ctx context.Context, chatID int64) (string, error) {
+	if m.driver == nil {
+		return "", fmt.Errorf("sandbox driver unavailable")
+	}
+
 	m.mu.Lock()
 	id, ok := m.chatSandboxes[chatID]
+	db := m.db
 	m.mu.Unlock()
 	if ok {
-		return id, nil
+		if isSandboxUsable(ctx, m.driver, id) {
+			m.touchSandbox(ctx, id)
+			return id, nil
+		}
+		m.mu.Lock()
+		delete(m.chatSandboxes, chatID)
+		m.mu.Unlock()
+	}
+
+	if db != nil {
+		persistedID, err := GetChatSandboxBinding(ctx, db, chatID)
+		if err != nil {
+			return "", fmt.Errorf("load sandbox binding for chat %d: %w", chatID, err)
+		}
+		if persistedID != "" && isSandboxUsable(ctx, m.driver, persistedID) {
+			m.mu.Lock()
+			m.chatSandboxes[chatID] = persistedID
+			m.mu.Unlock()
+			m.touchSandbox(ctx, persistedID)
+			return persistedID, nil
+		}
 	}
 
 	newID, err := m.driver.Create(ctx, ab.SandboxConfig{
@@ -75,7 +118,15 @@ func (m *sandboxManager) getOrCreateSandbox(ctx context.Context, chatID int64) (
 
 	m.mu.Lock()
 	m.chatSandboxes[chatID] = newID
+	db = m.db
 	m.mu.Unlock()
+
+	if db != nil {
+		if err := UpsertChatSandboxBinding(ctx, db, chatID, newID); err != nil {
+			return "", fmt.Errorf("persist sandbox binding for chat %d: %w", chatID, err)
+		}
+	}
+	m.touchSandbox(ctx, newID)
 	return newID, nil
 }
 
@@ -90,7 +141,45 @@ func (m *sandboxManager) destroySandbox(ctx context.Context, chatID int64) {
 
 	if ok {
 		_ = m.driver.Destroy(ctx, id)
+		m.mu.Lock()
+		db := m.db
+		m.mu.Unlock()
+		if db != nil {
+			_ = DeleteChatSandboxBinding(ctx, db, chatID)
+		}
 	}
+}
+
+func isSandboxUsable(ctx context.Context, driver *sbprovider.OpenSandboxDriver, sandboxID string) bool {
+	statusCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+
+	status, err := driver.Status(statusCtx, sandboxID)
+	if err != nil {
+		return false
+	}
+	return status == ab.SandboxStatusRunning || status == ab.SandboxStatusCreating
+}
+
+func (m *sandboxManager) touchSandbox(ctx context.Context, sandboxID string) {
+	if m.driver == nil || sandboxID == "" || m.keepAlive <= 0 {
+		return
+	}
+	renewCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	_ = m.driver.RenewExpiration(renewCtx, sandboxID, time.Now().Add(m.keepAlive))
+}
+
+func getIntEnv(key string, fallback int) int {
+	raw := strings.TrimSpace(os.Getenv(key))
+	if raw == "" {
+		return fallback
+	}
+	v, err := strconv.Atoi(raw)
+	if err != nil {
+		return fallback
+	}
+	return v
 }
 
 // ── Tool builders ─────────────────────────────────────────────────────────────
