@@ -32,10 +32,10 @@ func (e *EchoLLM) Chat(_ context.Context, req ab.ChatRequest) (*ab.ChatResponse,
 
 // AssistantRunResult is what handleRun returns to the frontend.
 type AssistantRunResult struct {
-	Content   string          `json:"content"`
-	Reasoning string          `json:"reasoning,omitempty"`
-	Runners   []RunnerSummary `json:"runners,omitempty"`
-	Trace     []TraceStep     `json:"trace,omitempty"`
+	Content   string              `json:"content"`
+	Reasoning string              `json:"reasoning,omitempty"`
+	Runners   []ab.SubagentResult `json:"runners,omitempty"`
+	Trace     []TraceStep         `json:"trace,omitempty"`
 }
 
 // RuntimeLogContext carries identifiers for structured logging.
@@ -113,10 +113,9 @@ func runWithMode(
 		return AssistantRunResult{}, err
 	}
 
-	var planRunners []RunnerSummary
-	var planSummary string
+	var planRunners []ab.SubagentResult
 	if rr.PlanProposed != nil {
-		planRunners, planSummary, err = executeFormalPlanFromProposedPlan(ctx, agentRT.execCtx, agentRT, rr.PlanProposed, model)
+		planRunners, err = executeFormalPlanFromProposedPlan(ctx, agentRT, rr.PlanProposed)
 		if err != nil {
 			return AssistantRunResult{}, err
 		}
@@ -124,7 +123,7 @@ func runWithMode(
 
 	content := strings.TrimSpace(rr.Response)
 	if len(planRunners) > 0 {
-		formalContent := buildFormalPlanResponse(planSummary, planRunners)
+		formalContent := buildFormalPlanResponse(planRunners)
 		if content == "" {
 			content = formalContent
 		} else {
@@ -135,22 +134,23 @@ func runWithMode(
 	return AssistantRunResult{Content: content, Runners: planRunners}, nil
 }
 
-func buildFormalPlanResponse(planSummary string, runners []RunnerSummary) string {
+func buildFormalPlanResponse(runners []ab.SubagentResult) string {
 	var parts []string
-	if t := strings.TrimSpace(planSummary); t != "" {
-		parts = append(parts, t)
-	}
 	parts = append(parts, fmt.Sprintf("Runners ejecutados: %d", len(runners)))
 	for i, r := range runners {
 		task := strings.TrimSpace(r.Task)
 		if task == "" {
 			task = fmt.Sprintf("runner_%d", i+1)
 		}
-		status := r.Status
-		if status == "" {
+		status := "success"
+		result := r.Output
+		if r.Error != nil {
+			status = "failure"
+			result = r.Error.Error()
+		}
+		if strings.TrimSpace(result) == "" {
 			status = "unknown"
 		}
-		result := r.Result
 		if result == "" {
 			result = "Sin resultado textual."
 		}

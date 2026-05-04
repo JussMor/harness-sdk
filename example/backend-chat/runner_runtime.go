@@ -11,22 +11,8 @@ import (
 	ab "github.com/everfaz/autobuild-sdk"
 )
 
-// RunnerSummary is the result of a spawned subagent, surfaced to the frontend.
-type RunnerSummary struct {
-	ID     string `json:"id"`
-	Tier   string `json:"tier,omitempty"`
-	Task   string `json:"task"`
-	Status string `json:"status"`
-	Result string `json:"result,omitempty"`
-	Model  string `json:"model,omitempty"`
-}
-
 // agentRuntime wires the SDK Engine + Runtime for a single request.
 type agentRuntime struct {
-	provider   ab.LLMProvider
-	model      string
-	logContext RuntimeLogContext
-
 	tools          *ab.ToolRegistry
 	engine         *ab.Engine
 	runtime        *ab.Runtime
@@ -340,4 +326,3 @@ func previewText(value string, limit int) string {
 	}
 	return trimmed[:limit-3] + "..."
 }
-
