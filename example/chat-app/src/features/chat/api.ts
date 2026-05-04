@@ -1,11 +1,11 @@
 import type {
-  BackendChat,
-  BackendMessage,
-  ChatMode,
-  ProvidersResponse,
-  StreamCallbacks,
-  StreamEvent,
-  StreamRequest,
+    BackendChat,
+    BackendMessage,
+    ChatMode,
+    ProvidersResponse,
+    StreamCallbacks,
+    StreamEvent,
+    StreamRequest,
 } from "@/features/chat/types"
 
 function trimTrailingSlash(value: string): string {
@@ -160,6 +160,11 @@ function parseChunk(chunk: string): StreamEvent | null {
       return {
         type: "tool_result",
         data: parsed as { name?: string; content?: string; error?: boolean },
+      }
+    case "sandbox_output":
+      return {
+        type: "sandbox_output",
+        data: parsed as Record<string, unknown>,
       }
     case "done":
       return {

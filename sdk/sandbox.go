@@ -38,8 +38,41 @@ type SandboxConfig struct {
 	// Env is a map of environment variables injected into the sandbox.
 	Env map[string]string `json:"env,omitempty"`
 
-	// Labels are arbitrary key/value metadata.
+	// Labels are metadata key-value pairs for filtering and tagging sandboxes.
 	Labels map[string]string `json:"labels,omitempty"`
+
+	// Volumes are persistent storage mounts (Docker named volumes or PVCs).
+	// In Docker runtime, PVC.ClaimName maps to a named volume.
+	// In Kubernetes runtime, it maps to a PersistentVolumeClaim.
+	Volumes []Volume `json:"volumes,omitempty"`
+}
+
+// Volume represents a persistent storage mount in a sandbox.
+// Supports Docker named volumes (pvc backend) or host paths (host backend).
+type Volume struct {
+	// Name is the unique identifier for this volume within the sandbox.
+	Name string `json:"name"`
+
+	// MountPath is the path inside the sandbox where the volume is mounted (e.g. /mnt/data).
+	MountPath string `json:"mount_path"`
+
+	// ReadOnly indicates whether the mount is read-only. Default is false (read-write).
+	ReadOnly bool `json:"read_only,omitempty"`
+
+	// PVC (PersistentVolumeClaim) backend: used for Docker named volumes and Kubernetes PVCs.
+	// In Docker runtime, ClaimName maps to a Docker named volume.
+	// In Kubernetes, it maps to a PersistentVolumeClaim name.
+	PVC *PVCVolumeSource `json:"pvc,omitempty"`
+
+	// SubPath mounts only a subdirectory within the volume (consistent with Kubernetes subPath).
+	// Useful for mounting only a portion of a shared volume (e.g., datasets/train from a larger volume).
+	SubPath string `json:"sub_path,omitempty"`
+}
+
+// PVCVolumeSource references a PersistentVolumeClaim or Docker named volume.
+type PVCVolumeSource struct {
+	// ClaimName is the name of the PVC (Kubernetes) or Docker named volume.
+	ClaimName string `json:"claim_name"`
 }
 
 // ExecResult is the output of a command executed inside a sandbox.

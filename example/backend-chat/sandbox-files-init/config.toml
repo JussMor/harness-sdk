@@ -1,0 +1,40 @@
+# OpenSandbox server config for backend-chat (Docker backend)
+# Place this file at a known path and reference it with SANDBOX_CONFIG_PATH
+# or pass --config <path> when starting the server.
+#
+# Start: opensandbox-server --config sandbox-files-init/config.toml
+
+[server]
+host = "127.0.0.1"
+port = 8080
+max_sandbox_timeout_seconds = 86400
+
+# API key — must match OPEN_SANDBOX_API_KEY in backend-chat .env
+api_key = "dev-test-key"
+
+[log]
+level = "INFO"
+
+[runtime]
+type   = "docker"
+execd_image = "opensandbox/execd:v1.0.13"
+
+[storage]
+allowed_host_paths = []
+volume_default_size = "1Gi"
+
+[docker]
+network_mode    = "bridge"
+no_new_privileges = true
+pids_limit      = 4096
+drop_capabilities = [
+  "AUDIT_WRITE", "MKNOD", "NET_ADMIN", "NET_RAW",
+  "SYS_ADMIN", "SYS_MODULE", "SYS_PTRACE", "SYS_TIME", "SYS_TTY_CONFIG"
+]
+
+[ingress]
+mode = "direct"
+
+[egress]
+image = "opensandbox/egress:v1.0.8"
+mode  = "dns"

@@ -88,7 +88,7 @@ Este documento lista funcionalidades implementadas en el frontend actual y su ma
 13. URL backend configurable
 
 - variable: `VITE_BACKEND_URL`
-- fallback: `http://localhost:8080`
+- fallback: `http://localhost:9090`
 
 14. Cliente API dedicado
 

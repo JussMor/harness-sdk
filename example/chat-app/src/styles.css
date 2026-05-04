@@ -191,7 +191,21 @@
   }
 
   .chat-main-root {
-    @apply flex h-full flex-col gap-4 p-5;
+    @apply flex h-full min-h-0 flex-col gap-4 p-5;
+  }
+
+  .chat-main-panel {
+    @apply flex h-full min-h-0 flex-col gap-4 p-5;
+  }
+
+  .chat-main-root--with-canvas {
+    @apply grid h-full gap-0 p-0;
+    grid-template-columns: 1fr 1fr;
+    grid-template-rows: 1fr;
+  }
+
+  .chat-main-root--with-canvas > .chat-main-panel {
+    @apply flex flex-col gap-4 overflow-auto p-5;
   }
 
   .chat-main-greeting {
@@ -223,11 +237,11 @@
   }
 
   .chat-main-grid {
-    @apply grid min-h-0 flex-1 grid-cols-1 gap-4 lg:grid-cols-[1fr_320px];
+    @apply grid min-h-0 flex-1 grid-cols-1 gap-4 overflow-hidden lg:grid-cols-[1fr_320px];
   }
 
   .chat-main-feed {
-    @apply min-h-0 space-y-3 overflow-auto rounded-2xl border border-white/60 bg-white/65 p-4 backdrop-blur-xl;
+    @apply min-h-0 flex-1 space-y-3 overflow-auto rounded-2xl border border-white/60 bg-white/65 p-4 backdrop-blur-xl;
   }
 
   .chat-bubble {
@@ -362,8 +376,36 @@
     @apply bg-rose-800/80 text-rose-100;
   }
 
+  .chat-artifacts-list {
+    @apply mt-4 border-t border-zinc-700 pt-3;
+  }
+
+  .chat-artifacts-list__title {
+    @apply mb-2 text-xs font-semibold tracking-wide text-zinc-400 uppercase;
+  }
+
+  .chat-artifact-item {
+    @apply flex w-full items-center gap-2 rounded-lg px-2 py-2 text-left text-xs transition hover:bg-zinc-800;
+    cursor: pointer;
+    border: none;
+    background: transparent;
+    color: var(--foreground, #fff);
+  }
+
+  .chat-artifact-item--active {
+    @apply bg-zinc-800 ring-1 ring-cyan-500;
+  }
+
+  .chat-artifact-item__lang {
+    @apply shrink-0 rounded bg-zinc-700 px-1.5 py-0.5 text-[10px] font-semibold text-zinc-300 uppercase;
+  }
+
+  .chat-artifact-item__name {
+    @apply truncate text-zinc-200;
+  }
+
   .chat-main-input-wrap {
-    @apply rounded-2xl border border-white/60 bg-white/65 p-3 backdrop-blur-xl;
+    @apply shrink-0 rounded-2xl border border-white/60 bg-white/65 p-3 backdrop-blur-xl;
   }
 
   .chat-main-textarea {
@@ -409,4 +451,193 @@
   to {
     transform: rotate(360deg);
   }
+}
+
+/* ── Artifact Canvas ───────────────────────────────────────────────────────── */
+
+.chat-app-shell--with-canvas {
+  grid-template-columns: 260px 1fr 1fr;
+}
+
+.artifact-canvas {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  border-left: 1px solid var(--border);
+  background: var(--background);
+  overflow: hidden;
+}
+
+.artifact-canvas--fullscreen {
+  position: fixed;
+  inset: 0;
+  z-index: 50;
+  border-left: none;
+}
+
+.artifact-canvas__header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 0.75rem 1rem;
+  border-bottom: 1px solid var(--border);
+  background: var(--card);
+  gap: 0.5rem;
+}
+
+.artifact-canvas__title {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  font-size: 0.85rem;
+  font-weight: 500;
+  color: var(--foreground);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.artifact-canvas__streaming-badge {
+  font-size: 0.7rem;
+  color: var(--primary);
+  background: oklch(0.9 0.02 240);
+  padding: 0.1rem 0.4rem;
+  border-radius: var(--radius-sm);
+  animation: pulse 1.5s ease-in-out infinite;
+}
+
+.artifact-canvas__complete-badge {
+  font-size: 0.7rem;
+  color: var(--muted-foreground);
+  background: var(--muted);
+  padding: 0.1rem 0.4rem;
+  border-radius: var(--radius-sm);
+}
+
+.artifact-canvas__actions {
+  display: flex;
+  align-items: center;
+  gap: 0.25rem;
+}
+
+.artifact-canvas__btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0.3rem 0.5rem;
+  border: none;
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--muted-foreground);
+  font-size: 0.75rem;
+  cursor: pointer;
+  transition: background 0.15s, color 0.15s;
+}
+
+.artifact-canvas__btn:hover {
+  background: var(--muted);
+  color: var(--foreground);
+}
+
+.artifact-canvas__btn--save {
+  background: var(--primary);
+  color: var(--primary-foreground);
+}
+
+.artifact-canvas__btn--save:hover {
+  opacity: 0.9;
+}
+
+.artifact-canvas__lang-bar {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  padding: 0.35rem 1rem;
+  border-bottom: 1px solid var(--border);
+  background: var(--muted);
+}
+
+.artifact-canvas__lang-badge {
+  font-size: 0.7rem;
+  font-weight: 500;
+  color: var(--muted-foreground);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.artifact-canvas__size {
+  font-size: 0.65rem;
+  color: var(--muted-foreground);
+  margin-left: auto;
+}
+
+.artifact-canvas__content {
+  flex: 1;
+  overflow: auto;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+}
+
+.artifact-canvas__pre {
+  margin: 0;
+  padding: 0;
+  font-family: "JetBrains Mono", "Fira Code", monospace;
+  font-size: 0.82rem;
+  line-height: 1.6;
+  white-space: pre-wrap;
+  word-break: break-word;
+  color: var(--foreground);
+}
+
+.artifact-canvas__cursor {
+  color: var(--primary);
+  animation: blink 0.8s step-end infinite;
+}
+
+@keyframes blink {
+  0% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0;
+  }
+  100% {
+    opacity: 1;
+  }
+}
+
+@keyframes pulse {
+  0% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.5;
+  }
+  100% {
+    opacity: 1;
+  }
+}
+
+.artifact-canvas__editor {
+  width: 100%;
+  height: 100%;
+  resize: none;
+  border: none;
+  outline: none;
+  padding: 0;
+  font-family: "JetBrains Mono", "Fira Code", monospace;
+  font-size: 0.82rem;
+  line-height: 1.6;
+  color: var(--foreground);
+  background: transparent;
+}
+
+.artifact-canvas__iframe {
+  width: 100%;
+  flex: 1;
+  min-height: 0;
+  border: none;
+  background: white;
 }

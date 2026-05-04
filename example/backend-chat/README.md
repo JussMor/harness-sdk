@@ -23,7 +23,12 @@ cp .env.example .env
 go run .
 ```
 
-By default the backend listens on `:8080`.
+By default the backend listens on `:9090`.
+
+Recommended local ports to avoid conflicts:
+
+- OpenSandbox server: `:8080`
+- backend-chat API: `:9090`
 
 ## API
 

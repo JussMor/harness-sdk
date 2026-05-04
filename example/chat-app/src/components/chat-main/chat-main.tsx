@@ -1,4 +1,11 @@
+import { ArtifactCanvas } from "@/components/artifact-canvas"
 import { ChatAPI } from "@/features/chat/api"
+import type { Artifact } from "@/features/chat/artifact-detector"
+import {
+  createDetectorState,
+  finalizeStream,
+  processStreamDelta,
+} from "@/features/chat/artifact-detector"
 import type {
   BackendMessage,
   ChatMode,
@@ -52,7 +59,7 @@ const fallbackModes: Array<ChatMode> = [
 export function ChatMain({
   userName = "Operator",
   showGreeting = true,
-  backendBaseURL = "http://localhost:8080",
+  backendBaseURL = "http://localhost:9090",
   activeChatID,
   onChatCreated,
   onChatsChanged,
@@ -73,6 +80,12 @@ export function ChatMain({
 
   const streamControllerRef = useRef<AbortController | null>(null)
   const listEndRef = useRef<HTMLDivElement>(null)
+
+  // ── Artifact Canvas state ────────────────────────────────────────────────
+  const [activeArtifact, setActiveArtifact] = useState<Artifact | null>(null)
+  const [allArtifacts, setAllArtifacts] = useState<Array<Artifact>>([])
+  const [isArtifactStreaming, setIsArtifactStreaming] = useState(false)
+  const detectorRef = useRef(createDetectorState())
 
   useEffect(() => {
     listEndRef.current?.scrollIntoView({ behavior: "smooth", block: "end" })
@@ -102,6 +115,23 @@ export function ChatMain({
         )
         .map(toChatMessage)
       setMessages(next)
+
+      // Reconstruct artifacts from persisted metadata
+      const restored: Array<Artifact> = []
+      for (const msg of payload) {
+        if (msg.metadata?.artifacts) {
+          for (const a of msg.metadata.artifacts) {
+            restored.push({
+              id: `restored-${msg.id}-${restored.length}`,
+              language: a.language,
+              content: a.content,
+              complete: true,
+              title: a.path.split("/").pop() || a.path,
+            })
+          }
+        }
+      }
+      setAllArtifacts(restored)
     },
     [api]
   )
@@ -195,17 +225,38 @@ export function ChatMain({
         if (!delta) {
           return
         }
+
+        // Run artifact detection on the delta
+        const prevState = detectorRef.current
+        const nextState = processStreamDelta(prevState, delta)
+        detectorRef.current = nextState
+
+        // Update chat content (text outside artifacts)
         setMessages((prev) =>
           prev.map((message) =>
             message.id === pendingAssistantId
               ? {
                   ...message,
-                  content: message.content + delta,
+                  content: nextState.chatContent,
                   pending: true,
                 }
               : message
           )
         )
+
+        // If an artifact is open/streaming, show it in canvas
+        if (nextState.activeIndex >= 0) {
+          const art = nextState.artifacts[nextState.activeIndex]
+          setActiveArtifact(art)
+          setIsArtifactStreaming(true)
+        } else if (prevState.activeIndex >= 0 && nextState.activeIndex < 0) {
+          // Artifact just closed
+          const closedArt = nextState.artifacts[prevState.activeIndex]
+          setActiveArtifact(closedArt)
+          setIsArtifactStreaming(false)
+        }
+
+        setAllArtifacts(nextState.artifacts)
         return
       }
 
@@ -229,6 +280,26 @@ export function ChatMain({
           )
         )
         pushTimeline(`Tool call: ${toolName}`, "info")
+
+        // When file_write is called, show the content in the canvas immediately
+        if (toolName === "file_write" && event.data.args) {
+          const args = event.data.args
+          const content = (args.content as string) || ""
+          const filePath = (args.path as string) || "file"
+          if (content) {
+            const lang = inferLanguageFromPath(filePath)
+            const fileArtifact: Artifact = {
+              id: `file-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+              language: lang,
+              content,
+              complete: true,
+              title: filePath.split("/").pop() || filePath,
+            }
+            setActiveArtifact(fileArtifact)
+            setAllArtifacts((prev) => [...prev, fileArtifact])
+            setIsArtifactStreaming(false)
+          }
+        }
         return
       }
 
@@ -269,6 +340,36 @@ export function ChatMain({
         return
       }
 
+      if (event.type === "sandbox_output") {
+        // Rich sandbox output (HTML, image, etc.) — show in canvas
+        const data = event.data
+        if (data.has_rich_output && data.text) {
+          pushTimeline("Rich sandbox output received", "success")
+        }
+        // If there are HTML results from code_interpreter, create an artifact
+        const results = (data as Record<string, unknown>).results as
+          | Array<Record<string, string>>
+          | undefined
+        if (results) {
+          for (const res of results) {
+            if (res["text/html"]) {
+              const htmlArtifact: Artifact = {
+                id: `sandbox-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+                language: "html",
+                content: res["text/html"],
+                complete: true,
+                title: "Sandbox Output",
+              }
+              setActiveArtifact(htmlArtifact)
+              setAllArtifacts((prev) => [...prev, htmlArtifact])
+              setIsArtifactStreaming(false)
+              break
+            }
+          }
+        }
+        return
+      }
+
       if (event.type === "error") {
         const errorMessage = event.data.error || "Unknown stream error"
         pushTimeline(`Stream error: ${errorMessage}`, "error")
@@ -298,6 +399,10 @@ export function ChatMain({
     setInput("")
     setStatusText("Streaming response...")
     setIsStreaming(true)
+
+    // Reset artifact detector for the new response
+    detectorRef.current = createDetectorState()
+    setIsArtifactStreaming(false)
 
     const runID = `run-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`
     const userMessageID = `local-user-${runID}`
@@ -339,6 +444,16 @@ export function ChatMain({
       onChatsChanged?.()
       setStatusText("Completed")
       pushTimeline("Stream finished", "success")
+
+      // Finalize any open artifact
+      const finalState = finalizeStream(detectorRef.current)
+      detectorRef.current = finalState
+      if (finalState.artifacts.length > 0) {
+        const lastArt = finalState.artifacts[finalState.artifacts.length - 1]
+        setActiveArtifact(lastArt)
+        setAllArtifacts(finalState.artifacts)
+      }
+      setIsArtifactStreaming(false)
     } catch (error) {
       const aborted =
         error instanceof DOMException && error.name === "AbortError"
@@ -384,154 +499,214 @@ export function ChatMain({
   ])
 
   return (
-    <section className="chat-main-root">
-      {showGreeting && messages.length === 0 && (
-        <header className="chat-main-greeting">
-          <p className="chat-main-badge">
-            <Sparkles size={14} />
-            Stream Runtime Ready
-          </p>
-          <h1>Hola {userName}, el backend ya esta conectado con SSE real.</h1>
-          <p>
-            Crea un chat, elige provider y modo, y mira deltas + eventos de
-            tools en tiempo real.
-          </p>
-        </header>
-      )}
-
-      <div className="chat-main-toolbar">
-        <select
-          value={selectedMode}
-          onChange={(event) => setSelectedMode(event.target.value)}
-          disabled={isStreaming}
-          className="chat-main-select"
-        >
-          {modes.map((mode) => (
-            <option key={mode.id} value={mode.id}>
-              {mode.name}
-            </option>
-          ))}
-        </select>
-
-        <select
-          value={selectedProvider}
-          onChange={(event) => setSelectedProvider(event.target.value)}
-          disabled={isStreaming || providers.length === 0}
-          className="chat-main-select"
-        >
-          {providers.length === 0 ? (
-            <option value="">No provider</option>
-          ) : (
-            providers.map((provider) => (
-              <option key={provider} value={provider}>
-                {provider}
-              </option>
-            ))
-          )}
-        </select>
-
-        <div className="chat-main-status">
-          {isStreaming ? (
-            <LoaderCircle className="spin" size={14} />
-          ) : (
-            <Sparkles size={14} />
-          )}
-          <span>{statusText}</span>
-        </div>
-      </div>
-
-      <div className="chat-main-grid">
-        <div className="chat-main-feed">
-          {messages.map((message) => (
-            <article
-              key={message.id}
-              className={`chat-bubble ${
-                message.role === "assistant"
-                  ? "chat-bubble-assistant"
-                  : "chat-bubble-user"
-              }`}
-            >
-              <div className="chat-bubble-meta">
-                {message.role === "assistant" ? (
-                  <Bot size={14} />
-                ) : (
-                  <User size={14} />
-                )}
-                <span>
-                  {message.role === "assistant"
-                    ? message.model || "assistant"
-                    : "you"}
-                </span>
-                {message.pending && <LoaderCircle className="spin" size={13} />}
-              </div>
-              {message.traces && message.traces.length > 0 && (
-                <div className="chat-bubble-traces">
-                  {message.traces.map((trace) => (
-                    <ToolTraceCard key={trace.id} trace={trace} />
-                  ))}
-                </div>
-              )}
-              <p>{message.content || (message.pending ? "..." : "")}</p>
-            </article>
-          ))}
-          <div ref={listEndRef} />
-        </div>
-
-        <aside className="chat-main-events">
-          <h2>Live Events</h2>
-          {timeline.length === 0 ? (
-            <p className="chat-empty-events">
-              Tool calls and stream milestones appear here.
+    <section
+      className={`chat-main-root ${activeArtifact ? "chat-main-root--with-canvas" : ""}`}
+    >
+      <div className="chat-main-panel">
+        {showGreeting && messages.length === 0 && (
+          <header className="chat-main-greeting">
+            <p className="chat-main-badge">
+              <Sparkles size={14} />
+              Stream Runtime Ready
             </p>
-          ) : (
-            timeline.map((event) => (
-              <p
-                key={event.id}
-                className={`chat-event chat-event-${event.level}`}
+            <h1>Hola {userName}, el backend ya esta conectado con SSE real.</h1>
+            <p>
+              Crea un chat, elige provider y modo, y mira deltas + eventos de
+              tools en tiempo real.
+            </p>
+          </header>
+        )}
+
+        <div className="chat-main-toolbar">
+          <select
+            value={selectedMode}
+            onChange={(event) => setSelectedMode(event.target.value)}
+            disabled={isStreaming}
+            className="chat-main-select"
+          >
+            {modes.map((mode) => (
+              <option key={mode.id} value={mode.id}>
+                {mode.name}
+              </option>
+            ))}
+          </select>
+
+          <select
+            value={selectedProvider}
+            onChange={(event) => setSelectedProvider(event.target.value)}
+            disabled={isStreaming || providers.length === 0}
+            className="chat-main-select"
+          >
+            {providers.length === 0 ? (
+              <option value="">No provider</option>
+            ) : (
+              providers.map((provider) => (
+                <option key={provider} value={provider}>
+                  {provider}
+                </option>
+              ))
+            )}
+          </select>
+
+          <div className="chat-main-status">
+            {isStreaming ? (
+              <LoaderCircle className="spin" size={14} />
+            ) : (
+              <Sparkles size={14} />
+            )}
+            <span>{statusText}</span>
+            {allArtifacts.length > 0 && (
+              <span className="chat-main-artifact-count">
+                {allArtifacts.length} artifact
+                {allArtifacts.length > 1 ? "s" : ""}
+              </span>
+            )}
+          </div>
+        </div>
+
+        <div className="chat-main-grid">
+          <div className="chat-main-feed">
+            {messages.map((message) => (
+              <article
+                key={message.id}
+                className={`chat-bubble ${
+                  message.role === "assistant"
+                    ? "chat-bubble-assistant"
+                    : "chat-bubble-user"
+                }`}
               >
-                {event.text}
+                <div className="chat-bubble-meta">
+                  {message.role === "assistant" ? (
+                    <Bot size={14} />
+                  ) : (
+                    <User size={14} />
+                  )}
+                  <span>
+                    {message.role === "assistant"
+                      ? message.model || "assistant"
+                      : "you"}
+                  </span>
+                  {message.pending && (
+                    <LoaderCircle className="spin" size={13} />
+                  )}
+                </div>
+                {message.traces && message.traces.length > 0 && (
+                  <div className="chat-bubble-traces">
+                    {message.traces.map((trace) => (
+                      <ToolTraceCard key={trace.id} trace={trace} />
+                    ))}
+                  </div>
+                )}
+                <p>{message.content || (message.pending ? "..." : "")}</p>
+              </article>
+            ))}
+            <div ref={listEndRef} />
+          </div>
+
+          <aside className="chat-main-events">
+            <h2>Live Events</h2>
+            {timeline.length === 0 && allArtifacts.length === 0 ? (
+              <p className="chat-empty-events">
+                Tool calls and stream milestones appear here.
               </p>
-            ))
-          )}
-        </aside>
+            ) : (
+              timeline.map((event) => (
+                <p
+                  key={event.id}
+                  className={`chat-event chat-event-${event.level}`}
+                >
+                  {event.text}
+                </p>
+              ))
+            )}
+
+            {allArtifacts.length > 0 && (
+              <div className="chat-artifacts-list">
+                <h3 className="chat-artifacts-list__title">Artifacts</h3>
+                {allArtifacts.map((artifact) => (
+                  <button
+                    key={artifact.id}
+                    type="button"
+                    className={`chat-artifact-item ${activeArtifact?.id === artifact.id ? "chat-artifact-item--active" : ""}`}
+                    onClick={() => {
+                      setActiveArtifact(artifact)
+                      setIsArtifactStreaming(false)
+                    }}
+                  >
+                    <span className="chat-artifact-item__lang">
+                      {artifact.language}
+                    </span>
+                    <span className="chat-artifact-item__name">
+                      {artifact.title || `${artifact.language} artifact`}
+                    </span>
+                  </button>
+                ))}
+              </div>
+            )}
+          </aside>
+        </div>
+
+        <footer className="chat-main-input-wrap">
+          <textarea
+            value={input}
+            onChange={(event) => setInput(event.target.value)}
+            onKeyDown={(event) => {
+              if (event.key === "Enter" && !event.shiftKey) {
+                event.preventDefault()
+                void sendPrompt()
+              }
+            }}
+            className="chat-main-textarea"
+            placeholder="Escribe tu prompt. Enter para enviar, Shift+Enter para nueva linea"
+            disabled={isStreaming}
+          />
+
+          <div className="chat-main-actions">
+            <button
+              type="button"
+              className="chat-btn chat-btn-primary"
+              onClick={() => void sendPrompt()}
+              disabled={!input.trim() || isStreaming}
+            >
+              <SendHorizontal size={15} />
+              Send
+            </button>
+            <button
+              type="button"
+              className="chat-btn chat-btn-muted"
+              onClick={stopStream}
+              disabled={!isStreaming}
+            >
+              <Square size={13} />
+              Stop
+            </button>
+          </div>
+        </footer>
       </div>
 
-      <footer className="chat-main-input-wrap">
-        <textarea
-          value={input}
-          onChange={(event) => setInput(event.target.value)}
-          onKeyDown={(event) => {
-            if (event.key === "Enter" && !event.shiftKey) {
-              event.preventDefault()
-              void sendPrompt()
-            }
+      {/* Artifact Canvas — rendered alongside the chat when an artifact is active */}
+      {activeArtifact && (
+        <ArtifactCanvas
+          artifact={activeArtifact}
+          isStreaming={isArtifactStreaming}
+          onClose={() => {
+            setActiveArtifact(null)
+            setIsArtifactStreaming(false)
           }}
-          className="chat-main-textarea"
-          placeholder="Escribe tu prompt. Enter para enviar, Shift+Enter para nueva linea"
-          disabled={isStreaming}
+          onContentChange={(artifactId, newContent) => {
+            setAllArtifacts((prev) =>
+              prev.map((a) =>
+                a.id === artifactId ? { ...a, content: newContent } : a
+              )
+            )
+            setActiveArtifact((prev) =>
+              prev && prev.id === artifactId
+                ? { ...prev, content: newContent }
+                : prev
+            )
+          }}
         />
-
-        <div className="chat-main-actions">
-          <button
-            type="button"
-            className="chat-btn chat-btn-primary"
-            onClick={() => void sendPrompt()}
-            disabled={!input.trim() || isStreaming}
-          >
-            <SendHorizontal size={15} />
-            Send
-          </button>
-          <button
-            type="button"
-            className="chat-btn chat-btn-muted"
-            onClick={stopStream}
-            disabled={!isStreaming}
-          >
-            <Square size={13} />
-            Stop
-          </button>
-        </div>
-      </footer>
+      )}
     </section>
   )
 }
@@ -569,4 +744,35 @@ function parseSubagentResult(
     // ignore — tool may have returned a free-form error string
   }
   return undefined
+}
+
+/**
+ * Infer the artifact language from a file path extension.
+ */
+function inferLanguageFromPath(filePath: string): string {
+  const ext = filePath.split(".").pop()?.toLowerCase() || ""
+  const map: Record<string, string> = {
+    html: "html",
+    htm: "html",
+    md: "markdown",
+    markdown: "markdown",
+    css: "css",
+    js: "javascript",
+    ts: "typescript",
+    jsx: "jsx",
+    tsx: "tsx",
+    py: "python",
+    json: "json",
+    yaml: "yaml",
+    yml: "yaml",
+    svg: "svg",
+    xml: "xml",
+    sql: "sql",
+    sh: "bash",
+    bash: "bash",
+    go: "go",
+    rs: "rust",
+    toml: "toml",
+  }
+  return map[ext] || "text"
 }
