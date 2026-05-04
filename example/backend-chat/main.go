@@ -224,8 +224,6 @@ func (a *BackendChatApp) handleChatRoutes(w http.ResponseWriter, r *http.Request
 		a.handleMessages(w, r, chatID)
 	case "events":
 		a.handleRunnerEvents(w, r, chatID)
-	case "run":
-		a.handleRun(w, r, chatID)
 	case "stream":
 		a.handleStream(w, r, chatID)
 	default:
@@ -301,171 +299,6 @@ func (a *BackendChatApp) handleMessages(w http.ResponseWriter, r *http.Request, 
 	default:
 		w.WriteHeader(http.StatusMethodNotAllowed)
 	}
-}
-
-func (a *BackendChatApp) handleRun(w http.ResponseWriter, r *http.Request, chatID int64) {
-	if r.Method != http.MethodPost {
-		w.WriteHeader(http.StatusMethodNotAllowed)
-		return
-	}
-
-	var req struct {
-		Prompt      string `json:"prompt"`
-		Mode        string `json:"mode"`
-		Provider    string `json:"provider"`
-		Model       string `json:"model"`
-		ClientRunID string `json:"clientRunId"`
-	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeErr(w, http.StatusBadRequest, err)
-		return
-	}
-
-	effectiveModel := strings.TrimSpace(req.Model)
-	if effectiveModel == "" {
-		effectiveModel = a.modelName
-	}
-
-	requestedProvider := strings.ToLower(strings.TrimSpace(req.Provider))
-	if requestedProvider != "" {
-		if a.multi != nil && !a.multi.HasProvider(requestedProvider) {
-			writeErr(w, http.StatusBadRequest, fmt.Errorf("provider %q not configured", requestedProvider))
-			return
-		}
-		_, modelOnly := ab.ParseModelRef(effectiveModel)
-		if modelOnly == "" {
-			modelOnly = effectiveModel
-		}
-		effectiveModel = requestedProvider + "/" + modelOnly
-	}
-
-	// Detach from the HTTP request context so LLM and DB operations finish
-	// even if the browser closes the connection early (context canceled).
-	ctx := context.WithoutCancel(r.Context())
-
-	userMsg, err := InsertMessage(ctx, a.db, chatID, "user", req.Prompt, effectiveModel)
-	if err != nil {
-		writeErr(w, http.StatusInternalServerError, err)
-		return
-	}
-	_ = a.pub.PublishChatMessage(ctx, chatID, userMsg)
-
-	history, err := ListMessages(ctx, a.db, chatID)
-	if err != nil {
-		writeErr(w, http.StatusInternalServerError, err)
-		return
-	}
-
-	runID := strings.TrimSpace(req.ClientRunID)
-	if runID == "" {
-		runID = newRunID()
-	}
-	logContext := RuntimeLogContext{ChatID: chatID, RunID: runID, Mode: strings.TrimSpace(req.Mode)}
-	log.Printf("run.start chat_id=%d run_id=%s mode=%s model=%s history_messages=%d prompt=%q", chatID, runID, firstNonEmpty(logContext.Mode, "balanced"), effectiveModel, len(history), previewText(req.Prompt, 160))
-
-	// Attach tracer to context for structured span tracking
-	tracer := ab.NewTracer()
-	ctx = ab.WithTracer(ctx, tracer)
-
-	publishRunner := func(summary RunnerSummary) {
-		a.runnerHub.Publish(RunnerEvent{
-			Type:      "runner.update",
-			RunID:     runID,
-			ChatID:    chatID,
-			Runner:    &summary,
-			Timestamp: time.Now().UTC(),
-		})
-	}
-
-	publishTrace := func(step TraceStep) {
-		a.runnerHub.Publish(RunnerEvent{
-			Type:      "trace.update",
-			RunID:     runID,
-			ChatID:    chatID,
-			Trace:     &step,
-			Timestamp: time.Now().UTC(),
-		})
-	}
-
-	emitRunnerEvent := func(event ab.Event) {
-		threadID := strings.TrimSpace(event.Source)
-		summary := RunnerSummary{Model: effectiveModel, Status: "running"}
-
-		if payloadThreadID := payloadString(event.Payload, "thread_id"); payloadThreadID != "" {
-			threadID = payloadThreadID
-		}
-		if threadID != "" {
-			summary.ID = threadID
-		}
-		if task := payloadString(event.Payload, "task"); task != "" {
-			summary.Task = task
-		}
-		if tier := payloadString(event.Payload, "tier"); tier != "" {
-			summary.Tier = tier
-		}
-		if model := payloadString(event.Payload, "model"); model != "" {
-			summary.Model = model
-		}
-
-		switch event.Type {
-		case ab.EventExecutableUpdated:
-			status := payloadString(event.Payload, "status")
-			if status != "" {
-				summary.Status = status
-			}
-			summary.Result = payloadString(event.Payload, "result")
-		case ab.EventSubagentCompleted:
-			summary.Status = "success"
-			summary.Result = asString(event.Payload["output"])
-		case ab.EventSubagentStarted:
-			summary.Status = "running"
-		default:
-			return
-		}
-		if strings.TrimSpace(summary.ID) == "" {
-			return
-		}
-		log.Printf("run.event chat_id=%d run_id=%s mode=%s event=%s thread_id=%s status=%s", chatID, runID, firstNonEmpty(logContext.Mode, "balanced"), event.Type, threadID, summary.Status)
-
-		publishRunner(summary)
-	}
-
-	assistant := GenerateAssistantReply(ctx, a.llm, toAgentMessages(history), req.Mode, effectiveModel, logContext, emitRunnerEvent, publishTrace, a.db)
-	for _, summary := range assistant.Runners {
-		publishRunner(summary)
-	}
-	assistantMsg, err := InsertMessage(ctx, a.db, chatID, "assistant", assistant.Content, effectiveModel)
-	if err != nil {
-		writeErr(w, http.StatusInternalServerError, err)
-		return
-	}
-	_ = a.pub.PublishChatMessage(ctx, chatID, assistantMsg)
-
-	assistantPayload := map[string]any{
-		"id":        assistantMsg.ID,
-		"chatId":    assistantMsg.ChatID,
-		"runId":     runID,
-		"traceId":   string(tracer.TraceID()),
-		"role":      assistantMsg.Role,
-		"content":   assistantMsg.Content,
-		"model":     assistantMsg.Model,
-		"createdAt": assistantMsg.CreatedAt,
-	}
-	if strings.TrimSpace(assistant.Reasoning) != "" {
-		assistantPayload["reasoning"] = assistant.Reasoning
-	}
-	if len(assistant.Runners) > 0 {
-		assistantPayload["runners"] = assistant.Runners
-	}
-	if len(assistant.Trace) > 0 {
-		assistantPayload["trace"] = assistant.Trace
-	}
-	log.Printf("run.completed chat_id=%d run_id=%s mode=%s model=%s runners=%d assistant_message_id=%d", chatID, runID, firstNonEmpty(logContext.Mode, "balanced"), effectiveModel, len(assistant.Runners), assistantMsg.ID)
-
-	writeJSON(w, http.StatusOK, map[string]any{
-		"user":      userMsg,
-		"assistant": assistantPayload,
-	})
 }
 
 func payloadString(payload map[string]any, key string) string {
@@ -607,8 +440,21 @@ func (a *BackendChatApp) handleStream(w http.ResponseWriter, r *http.Request, ch
 
 		case ab.StreamEventToolCall:
 			if ev.ToolCall != nil {
-				d, _ := json.Marshal(map[string]any{"name": ev.ToolCall.Name, "args": ev.ToolCall.Arguments})
-				sseWrite("tool", string(d))
+				d, _ := json.Marshal(map[string]any{
+					"name": ev.ToolCall.Name,
+					"args": ev.ToolCall.Arguments,
+				})
+				sseWrite("tool_call", string(d))
+			}
+
+		case ab.StreamEventToolResult:
+			if ev.ToolResult != nil {
+				d, _ := json.Marshal(map[string]any{
+					"name":    ev.ToolResult.Name,
+					"content": ev.ToolResult.Content,
+					"error":   ev.ToolResult.Error != nil,
+				})
+				sseWrite("tool_result", string(d))
 			}
 
 		case ab.StreamEventDone:
