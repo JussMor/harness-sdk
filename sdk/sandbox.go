@@ -40,9 +40,6 @@ type SandboxConfig struct {
 
 	// Labels are metadata key-value pairs for filtering and tagging sandboxes.
 	Labels map[string]string `json:"labels,omitempty"`
-
-	// Labels are arbitrary key/value metadata.
-	Labels map[string]string `json:"labels,omitempty"`
 }
 
 // ExecResult is the output of a command executed inside a sandbox.
