@@ -337,14 +337,20 @@ func (a *BackendChatApp) handleStream(w http.ResponseWriter, r *http.Request, ch
 	w.Header().Set("Connection", "keep-alive")
 	w.Header().Set("X-Accel-Buffering", "no")
 
-	sseWrite := func(event, data string) {
-		fmt.Fprintf(w, "event: %s\ndata: %s\n\n", event, data)
-		flusher.Flush()
-	}
-
-	ctx := context.WithoutCancel(r.Context())
+	ctx := r.Context()
 	tracer := ab.NewTracer()
 	ctx = ab.WithTracer(ctx, tracer)
+
+	sseWrite := func(event, data string) {
+		if ctx.Err() != nil {
+			return
+		}
+		if _, err := fmt.Fprintf(w, "event: %s\ndata: %s\n\n", event, data); err != nil {
+			log.Printf("stream.write_failed chat_id=%d run_id=%s error=%v", chatID, strings.TrimSpace(req.ClientRunID), err)
+			return
+		}
+		flusher.Flush()
+	}
 
 	// Insert user message
 	userMsg, err := InsertMessage(ctx, a.db, chatID, "user", req.Prompt, effectiveModel)
@@ -391,7 +397,15 @@ func (a *BackendChatApp) handleStream(w http.ResponseWriter, r *http.Request, ch
 	}
 
 	var fullResponse strings.Builder
-	for ev := range events {
+	for {
+		select {
+		case <-ctx.Done():
+			log.Printf("stream.canceled chat_id=%d run_id=%s", chatID, runID)
+			return
+		case ev, ok := <-events:
+			if !ok {
+				return
+			}
 		switch ev.Type {
 		case ab.StreamEventDelta:
 			fullResponse.WriteString(ev.Delta)
@@ -433,6 +447,7 @@ func (a *BackendChatApp) handleStream(w http.ResponseWriter, r *http.Request, ch
 			d, _ := json.Marshal(map[string]string{"error": msg})
 			sseWrite("error", string(d))
 			log.Printf("stream.error chat_id=%d run_id=%s error=%s", chatID, runID, msg)
+		}
 		}
 	}
 }

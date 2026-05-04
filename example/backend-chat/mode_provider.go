@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"path/filepath"
+	"strings"
 
 	ab "github.com/everfaz/autobuild-sdk"
 )
@@ -52,7 +53,9 @@ func newModeEngineWithDB(provider ab.LLMProvider, model string, logContext Runti
 	engine.Memory = memory
 	engine.Execution = execCtx
 	engine.Tools = rt.tools
-	engine.Checkpoints = checkpointProv
+	if checkpointsEnabledForMode(logContext.Mode) {
+		engine.Checkpoints = checkpointProv
+	}
 	rt.engine = engine
 
 	// Modes
@@ -190,6 +193,15 @@ func loadBackendModes() (ab.ModeProvider, error) {
 		filepath.Join("example", "backend-chat", "modes"),
 		filepath.Join("..", "backend-chat", "modes"),
 	)
+}
+
+func checkpointsEnabledForMode(mode string) bool {
+	switch strings.ToLower(strings.TrimSpace(mode)) {
+	case "analyst", "code-reviewer":
+		return false
+	default:
+		return true
+	}
 }
 
 // buildCorePrompt defines who this agent is — its stable identity and
