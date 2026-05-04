@@ -1,2 +1,4 @@
+github.com/alibaba/OpenSandbox/sdks/sandbox/go v1.0.0 h1:oqsi+3TwN7qQX1XHgk/io+fIr4KUKC6izLjah+D40q4=
+github.com/alibaba/OpenSandbox/sdks/sandbox/go v1.0.0/go.mod h1:RUNXUZnKDUAN/gIkfWcZZ1HNRJ0G6NIjGca0uMDex6I=
 github.com/mattn/go-sqlite3 v1.14.24 h1:tpSp2G2KyMnnQu99ngJ47EIkWVmliIizyZBfPrBWDRM=
 github.com/mattn/go-sqlite3 v1.14.24/go.mod h1:Uh1q+B4BYcTPb+yiD3kU8Ct7aC0hY9fxUwlHK0RXw+Y=
