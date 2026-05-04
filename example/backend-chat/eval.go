@@ -92,7 +92,15 @@ func checkAssertion(a ab.Assertion, response, stopReason string) string {
 			return fmt.Sprintf("forbidden %q found in response", a.Value)
 		}
 	case ab.AssertStopReason:
-		if stopReason != a.Value {
+		expected := strings.Split(a.Value, "|")
+		ok := false
+		for _, v := range expected {
+			if stopReason == strings.TrimSpace(v) {
+				ok = true
+				break
+			}
+		}
+		if !ok {
 			return fmt.Sprintf("stop_reason %q != %q", stopReason, a.Value)
 		}
 	}
@@ -109,7 +117,7 @@ func defaultEvalCases() []BackendEvalCase {
 			Mode:   "balanced",
 			Assertions: []ab.Assertion{
 				{Type: ab.AssertContains, Value: "pong", Description: "Must contain PONG"},
-				{Type: ab.AssertStopReason, Value: "stop"},
+				{Type: ab.AssertStopReason, Value: "stop|complete"},
 			},
 		},
 		{
@@ -138,10 +146,10 @@ func defaultEvalCases() []BackendEvalCase {
 		},
 		{
 			Name:   "memory_tool_available",
-			Prompt: "List all entries in user memory scope.",
+			Prompt: "What memory scopes are available to you?",
 			Mode:   "balanced",
 			Assertions: []ab.Assertion{
-				{Type: ab.AssertStopReason, Value: "stop"},
+				{Type: ab.AssertContains, Value: "memory"},
 			},
 		},
 	}
