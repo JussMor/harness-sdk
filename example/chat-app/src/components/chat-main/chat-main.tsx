@@ -14,6 +14,8 @@ import {
   User,
 } from "lucide-react"
 import { useCallback, useEffect, useMemo, useRef, useState } from "react"
+import type { SubagentTrace, ToolTrace } from "./tool-trace"
+import { ToolTraceCard } from "./tool-trace"
 
 export interface ChatMessage {
   id: string
@@ -21,6 +23,7 @@ export interface ChatMessage {
   role: "user" | "assistant"
   model?: string
   pending?: boolean
+  traces?: Array<ToolTrace>
 }
 
 export interface ChatMainProps {
@@ -208,6 +211,23 @@ export function ChatMain({
 
       if (event.type === "tool_call") {
         const toolName = event.data.name || "unknown_tool"
+        const traceId = `trace-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`
+        const newTrace: ToolTrace = {
+          id: traceId,
+          name: toolName,
+          args: event.data.args,
+          status: "running",
+        }
+        setMessages((prev) =>
+          prev.map((message) =>
+            message.id === pendingAssistantId
+              ? {
+                  ...message,
+                  traces: [...(message.traces ?? []), newTrace],
+                }
+              : message
+          )
+        )
         pushTimeline(`Tool call: ${toolName}`, "info")
         return
       }
@@ -218,6 +238,34 @@ export function ChatMain({
           ? "error"
           : "success"
         pushTimeline(`Tool result: ${toolName}`, level)
+
+        const subagents = parseSubagentResult(toolName, event.data.content)
+
+        setMessages((prev) =>
+          prev.map((message) => {
+            if (message.id !== pendingAssistantId || !message.traces) {
+              return message
+            }
+            // Update the most recent running trace with this name (LIFO).
+            const traces = [...message.traces]
+            for (let i = traces.length - 1; i >= 0; i--) {
+              if (
+                traces[i].name === toolName &&
+                traces[i].status === "running"
+              ) {
+                traces[i] = {
+                  ...traces[i],
+                  status: event.data.error ? "error" : "success",
+                  result: event.data.content,
+                  error: event.data.error,
+                  subagents,
+                }
+                break
+              }
+            }
+            return { ...message, traces }
+          })
+        )
         return
       }
 
@@ -416,7 +464,14 @@ export function ChatMain({
                 </span>
                 {message.pending && <LoaderCircle className="spin" size={13} />}
               </div>
-              <p>{message.content || "..."}</p>
+              {message.traces && message.traces.length > 0 && (
+                <div className="chat-bubble-traces">
+                  {message.traces.map((trace) => (
+                    <ToolTraceCard key={trace.id} trace={trace} />
+                  ))}
+                </div>
+              )}
+              <p>{message.content || (message.pending ? "..." : "")}</p>
             </article>
           ))}
           <div ref={listEndRef} />
@@ -489,4 +544,29 @@ function toChatMessage(message: BackendMessage): ChatMessage {
     model: message.model,
     pending: false,
   }
+}
+
+/**
+ * Parse the JSON payload returned by the `dispatch-subagents` tool into a
+ * list of SubagentTrace items. Returns undefined when the tool name does not
+ * match or the payload cannot be parsed.
+ */
+function parseSubagentResult(
+  toolName: string,
+  content?: string
+): Array<SubagentTrace> | undefined {
+  if (toolName !== "dispatch-subagents" || !content) {
+    return undefined
+  }
+  try {
+    const parsed = JSON.parse(content) as {
+      results?: Array<SubagentTrace>
+    }
+    if (Array.isArray(parsed.results)) {
+      return parsed.results
+    }
+  } catch {
+    // ignore — tool may have returned a free-form error string
+  }
+  return undefined
 }

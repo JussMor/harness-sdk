@@ -247,6 +247,92 @@
     @apply mb-1 flex items-center gap-2 text-xs text-zinc-500;
   }
 
+  .chat-bubble-traces {
+    @apply my-2 flex flex-col gap-1.5;
+  }
+
+  .tool-trace {
+    @apply rounded-lg border bg-zinc-50 text-xs;
+  }
+
+  .tool-trace-running {
+    @apply border-blue-200 bg-blue-50;
+  }
+
+  .tool-trace-success {
+    @apply border-emerald-200 bg-emerald-50;
+  }
+
+  .tool-trace-error {
+    @apply border-rose-200 bg-rose-50;
+  }
+
+  .tool-trace-header {
+    @apply flex w-full items-center gap-1.5 rounded-lg px-2 py-1.5 text-left text-zinc-700 transition hover:bg-black/5;
+  }
+
+  .tool-trace-name {
+    @apply font-medium;
+  }
+
+  .tool-trace-summary {
+    @apply ml-auto text-zinc-500;
+  }
+
+  .tool-trace-body {
+    @apply space-y-2 border-t border-black/5 px-2 py-2;
+  }
+
+  .tool-trace-args summary,
+  .tool-trace-result summary {
+    @apply cursor-pointer text-zinc-500 select-none;
+  }
+
+  .tool-trace-args pre,
+  .tool-trace-result pre {
+    @apply mt-1 max-h-64 overflow-auto rounded-md bg-zinc-900 p-2 text-[11px] leading-relaxed text-zinc-100;
+  }
+
+  .tool-trace-subagents {
+    @apply flex flex-col gap-1.5;
+  }
+
+  .subagent-card {
+    @apply rounded-md border border-zinc-200 bg-white;
+  }
+
+  .subagent-card-error {
+    @apply border-rose-300 bg-rose-50;
+  }
+
+  .subagent-card-header {
+    @apply flex w-full items-center gap-1.5 rounded-md px-2 py-1.5 text-left text-zinc-700 transition hover:bg-black/5;
+  }
+
+  .subagent-card-id {
+    @apply font-mono text-[11px] font-medium;
+  }
+
+  .subagent-card-meta {
+    @apply ml-auto text-[11px] text-zinc-500;
+  }
+
+  .subagent-card-body {
+    @apply space-y-1 border-t border-black/5 px-2 py-2;
+  }
+
+  .subagent-card-task {
+    @apply text-zinc-600;
+  }
+
+  .subagent-card-output {
+    @apply max-h-64 overflow-auto rounded-md bg-zinc-900 p-2 text-[11px] leading-relaxed whitespace-pre-wrap text-zinc-100;
+  }
+
+  .subagent-card-err {
+    @apply text-rose-600;
+  }
+
   .chat-main-events {
     @apply min-h-0 overflow-auto rounded-2xl border border-white/60 bg-zinc-950 p-4 text-zinc-100;
   }
