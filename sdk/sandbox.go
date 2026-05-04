@@ -38,6 +38,9 @@ type SandboxConfig struct {
 	// Env is a map of environment variables injected into the sandbox.
 	Env map[string]string `json:"env,omitempty"`
 
+	// Labels are metadata key-value pairs for filtering and tagging sandboxes.
+	Labels map[string]string `json:"labels,omitempty"`
+
 	// Labels are arbitrary key/value metadata.
 	Labels map[string]string `json:"labels,omitempty"`
 }

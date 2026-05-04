@@ -117,6 +117,31 @@ func (a *BackendChatApp) handleEval(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// isSandboxOutput returns true for tools that produce rich sandbox outputs.
+func isSandboxOutput(toolName string) bool {
+	switch toolName {
+	case "bash", "code_interpreter", "file_write", "file_read":
+		return true
+	}
+	return false
+}
+
+// parseSandboxOutput attempts to parse the tool result as a structured
+// sandbox output event for the frontend canvas.
+// Returns nil if the content is plain text (no special rendering needed).
+func parseSandboxOutput(content string) map[string]any {
+	// Look for markers the formatCodeExecution helper emits
+	if strings.Contains(content, "[html_output available") ||
+		strings.Contains(content, "[image output available") ||
+		strings.Contains(content, "[svg output available") {
+		return map[string]any{
+			"has_rich_output": true,
+			"text":            content,
+		}
+	}
+	return nil
+}
+
 func (a *BackendChatApp) handleProviders(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		w.WriteHeader(http.StatusMethodNotAllowed)
@@ -434,6 +459,16 @@ func (a *BackendChatApp) handleStream(w http.ResponseWriter, r *http.Request, ch
 					"error":   ev.ToolResult.Error != nil,
 				})
 				sseWrite("tool_result", string(d))
+
+				// For sandbox tools, emit structured sandbox_output event
+				// so the frontend can render rich outputs (charts, images, HTML)
+				// in the artifact canvas rather than raw text.
+				if isSandboxOutput(ev.ToolResult.Name) {
+					if sbData := parseSandboxOutput(ev.ToolResult.Content); sbData != nil {
+						sbJSON, _ := json.Marshal(sbData)
+						sseWrite("sandbox_output", string(sbJSON))
+					}
+				}
 			}
 
 		case ab.StreamEventDone:

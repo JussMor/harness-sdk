@@ -1,5 +1,17 @@
-// Package sandbox provides production SandboxDriver implementations
-// for the autobuild SDK. Each file is one provider.
+// Package sandbox provides SandboxDriver implementations backed by real
+// execution environments. opensandbox.go uses OpenSandbox
+// (https://open-sandbox.ai) for isolated container execution.
+//
+// Usage:
+//
+//	import sbprov "github.com/everfaz/autobuild-sdk/providers/sandbox"
+//
+//	driver, err := sbprov.NewOpenSandbox(sbprov.OpenSandboxConfig{
+//	    Domain:   os.Getenv("OPEN_SANDBOX_DOMAIN"),
+//	    APIKey:   os.Getenv("OPEN_SANDBOX_API_KEY"),
+//	    Protocol: "https",
+//	})
+//	engine.Sandbox = driver
 package sandbox
 
 import (
@@ -7,303 +19,290 @@ import (
 	"fmt"
 	"io"
 	"strings"
-	"sync"
 	"time"
 
 	opensandbox "github.com/alibaba/OpenSandbox/sdks/sandbox/go"
-
 	autobuild "github.com/everfaz/autobuild-sdk"
 )
 
-// OpenSandboxDriver implements autobuild.SandboxDriver backed by
-// OpenSandbox (https://open-sandbox.ai). Each autobuild sandbox ID maps
-// to one OpenSandbox sandbox. Sandboxes are created on demand and cached
-// for the lifetime of the driver.
-//
-// Wire it into an Engine:
-//
-//	engine.Sandbox = sandbox.NewOpenSandbox(sandbox.OpenSandboxConfig{
-//	    Domain:  "api.open-sandbox.ai",
-//	    APIKey:  os.Getenv("OPEN_SANDBOX_API_KEY"),
-//	    Protocol: "https",
-//	})
-//
-// Each sandbox uses the code-interpreter image by default, which supports
-// multi-language execution (Python, JavaScript, Bash) with persistent state
-// across turns of the same conversation.
-type OpenSandboxDriver struct {
-	config opensandbox.ConnectionConfig
-	image  string
-
-	mu       sync.Mutex
-	sandboxes map[string]*opensandbox.CodeInterpreter // autobuild id → interpreter
-}
-
-// OpenSandboxConfig configures the OpenSandbox connection.
+// OpenSandboxConfig holds connection settings for the OpenSandbox server.
 type OpenSandboxConfig struct {
-	// Domain is the OpenSandbox server (e.g. "api.open-sandbox.ai" or "localhost:8080").
+	// Domain is the server address, e.g. "api.open-sandbox.ai" or "localhost:8080".
 	// Falls back to OPEN_SANDBOX_DOMAIN env var.
 	Domain string
 
 	// Protocol is "https" or "http". Falls back to OPEN_SANDBOX_PROTOCOL env var.
 	Protocol string
 
-	// APIKey for authentication. Falls back to OPEN_SANDBOX_API_KEY env var.
+	// APIKey is the authentication token. Falls back to OPEN_SANDBOX_API_KEY env var.
 	APIKey string
 
-	// Image overrides the default code-interpreter image.
-	// Default: opensandbox/code-interpreter:latest
-	Image string
+	// DefaultImage overrides the code-interpreter image.
+	// Defaults to opensandbox/code-interpreter:latest.
+	DefaultImage string
 
-	// TimeoutSeconds is the sandbox TTL. Default: 900 (15 min).
-	TimeoutSeconds *int
+	// DefaultTTLSeconds is the sandbox time-to-live. Defaults to 900 (15 min).
+	DefaultTTLSeconds int
 
-	// ReadyTimeout is how long to wait for the sandbox to become ready.
-	// Default: 60s.
+	// ReadyTimeout is how long to wait for a new sandbox to become ready.
+	// Defaults to 60 seconds.
 	ReadyTimeout time.Duration
 }
 
-// NewOpenSandbox creates a driver using the given config.
-// Each Create() call spawns a new OpenSandbox CodeInterpreter.
-func NewOpenSandbox(cfg OpenSandboxConfig) *OpenSandboxDriver {
-	image := cfg.Image
-	if image == "" {
-		image = opensandbox.CodeInterpreterImage
-	}
-	return &OpenSandboxDriver{
-		config: opensandbox.ConnectionConfig{
-			Domain:   cfg.Domain,
-			Protocol: cfg.Protocol,
-			APIKey:   cfg.APIKey,
-		},
-		image:     image,
-		sandboxes: make(map[string]*opensandbox.CodeInterpreter),
-	}
+// OpenSandboxDriver implements autobuild.SandboxDriver using OpenSandbox.
+// Each autobuild sandbox ID maps to one OpenSandbox CodeInterpreter instance.
+// Instances are lazily created on first use and cached for the driver lifetime.
+type OpenSandboxDriver struct {
+	config    OpenSandboxConfig
+	conn      opensandbox.ConnectionConfig
+	instances map[string]*opensandbox.CodeInterpreter
 }
 
-// Create provisions a new OpenSandbox CodeInterpreter and returns its ID.
-// The sandbox is cached by ID for subsequent operations.
+// NewOpenSandbox creates a driver. Sandboxes are created lazily — no network
+// call happens until Create() or the first Exec/WriteFile.
+func NewOpenSandbox(cfg OpenSandboxConfig) (*OpenSandboxDriver, error) {
+	conn := opensandbox.ConnectionConfig{
+		Domain:   cfg.Domain,
+		Protocol: cfg.Protocol,
+		APIKey:   cfg.APIKey,
+	}
+	return &OpenSandboxDriver{
+		config:    cfg,
+		conn:      conn,
+		instances: make(map[string]*opensandbox.CodeInterpreter),
+	}, nil
+}
+
+// ── autobuild.SandboxDriver ──────────────────────────────────────────────────
+
+// Create provisions a new CodeInterpreter sandbox and returns its ID.
 func (d *OpenSandboxDriver) Create(ctx context.Context, cfg autobuild.SandboxConfig) (string, error) {
-	readyTimeout := 60 * time.Second
+	ttl := d.config.DefaultTTLSeconds
+	if ttl <= 0 {
+		ttl = 900
+	}
+	readyTimeout := d.config.ReadyTimeout
+	if readyTimeout <= 0 {
+		readyTimeout = 60 * time.Second
+	}
 
 	opts := opensandbox.CodeInterpreterCreateOptions{
-		TimeoutSeconds:  d.timeoutPtr(),
-		ReadyTimeout:    readyTimeout,
-		Env:             cfg.Env,
-		Metadata:        cfg.Labels,
+		ReadyTimeout: readyTimeout,
+		Metadata: map[string]string{
+			"created_by": "autobuild-sdk",
+		},
+	}
+	// Merge caller-supplied labels into metadata
+	for k, v := range cfg.Labels {
+		opts.Metadata[k] = v
+	}
+	ttlCopy := ttl
+	opts.TimeoutSeconds = &ttlCopy
+
+	if img := d.config.DefaultImage; img != "" {
+		opts.Image = img
 	}
 	if cfg.Image != "" {
 		opts.Image = cfg.Image
 	}
 
-	ci, err := opensandbox.CreateCodeInterpreter(ctx, d.config, opts)
+	ci, err := opensandbox.CreateCodeInterpreter(ctx, d.conn, opts)
 	if err != nil {
-		return "", fmt.Errorf("opensandbox: create: %w", err)
+		return "", fmt.Errorf("opensandbox create: %w", err)
 	}
-
 	id := ci.Sandbox.ID()
-	d.mu.Lock()
-	d.sandboxes[id] = ci
-	d.mu.Unlock()
-
+	d.instances[id] = ci
 	return id, nil
 }
 
-// Exec runs a shell command inside the sandbox. Returns combined stdout/stderr
-// and exit code. Streaming output is accumulated — for real-time output use
-// ExecStreaming.
-func (d *OpenSandboxDriver) Exec(ctx context.Context, id string, command string) (autobuild.ExecResult, error) {
-	ci, err := d.get(ctx, id)
+// Exec runs a shell command inside the sandbox.
+func (d *OpenSandboxDriver) Exec(ctx context.Context, sandboxID, command string) (autobuild.ExecResult, error) {
+	ci, err := d.resolve(ctx, sandboxID)
 	if err != nil {
 		return autobuild.ExecResult{}, err
 	}
-
 	exec, err := ci.Sandbox.RunCommand(ctx, command, nil)
 	if err != nil {
-		return autobuild.ExecResult{}, fmt.Errorf("opensandbox: exec: %w", err)
+		return autobuild.ExecResult{}, fmt.Errorf("opensandbox exec: %w", err)
+	}
+	return toExecResult(exec), nil
+}
+
+// ExecCode runs code in the given language using the CodeInterpreter.
+// Language examples: "python", "javascript", "bash".
+// State persists across calls within the same sandboxID (Python vars, imports, etc.)
+func (d *OpenSandboxDriver) ExecCode(ctx context.Context, sandboxID, language, code string) (autobuild.ExecResult, error) {
+	ci, err := d.resolve(ctx, sandboxID)
+	if err != nil {
+		return autobuild.ExecResult{}, err
+	}
+	exec, err := ci.Execute(ctx, language, code, nil)
+	if err != nil {
+		return autobuild.ExecResult{}, fmt.Errorf("opensandbox exec code: %w", err)
 	}
 
-	result := autobuild.ExecResult{
-		Stdout: exec.Text(),
+	var stdout strings.Builder
+	stdout.WriteString(exec.Text())
+	for _, res := range exec.Results {
+		if t := res.Text(); t != "" {
+			if stdout.Len() > 0 {
+				stdout.WriteByte('\n')
+			}
+			stdout.WriteString(t)
+		}
 	}
-	var stderr strings.Builder
-	for _, m := range exec.Stderr {
-		stderr.WriteString(m.Text)
-		stderr.WriteByte('\n')
-	}
-	result.Stderr = strings.TrimRight(stderr.String(), "\n")
 
+	result := autobuild.ExecResult{Stdout: stdout.String()}
+	if exec.Error != nil {
+		result.Stderr = exec.Error.Name + ": " + exec.Error.Value
+		result.ExitCode = 1
+	}
 	if exec.ExitCode != nil {
 		result.ExitCode = *exec.ExitCode
-	} else if exec.Error != nil {
-		result.ExitCode = 1
-		if result.Stderr == "" {
-			result.Stderr = exec.Error.Value
-		}
 	}
 	return result, nil
 }
 
-// ExecCode runs code in a specific language using the code interpreter.
-// Language can be "python", "javascript", "bash", etc.
-// Returns structured execution results including text/plain and text/html outputs.
-func (d *OpenSandboxDriver) ExecCode(ctx context.Context, id, language, code string) (*opensandbox.Execution, error) {
-	ci, err := d.get(ctx, id)
-	if err != nil {
-		return nil, err
-	}
-	exec, err := ci.Execute(ctx, language, code, nil)
-	if err != nil {
-		return nil, fmt.Errorf("opensandbox: exec code (%s): %w", language, err)
-	}
-	return exec, nil
-}
-
-// ExecCodeStreaming runs code with live output callbacks.
-// Useful for long-running code where you want to stream stdout to the user.
-func (d *OpenSandboxDriver) ExecCodeStreaming(ctx context.Context, id, language, code string, handlers *opensandbox.ExecutionHandlers) (*opensandbox.Execution, error) {
-	ci, err := d.get(ctx, id)
-	if err != nil {
-		return nil, err
-	}
-	exec, err := ci.Execute(ctx, language, code, handlers)
-	if err != nil {
-		return nil, fmt.Errorf("opensandbox: exec streaming (%s): %w", language, err)
-	}
-	return exec, nil
-}
-
 // WriteFile uploads content to a path inside the sandbox.
-func (d *OpenSandboxDriver) WriteFile(ctx context.Context, id string, path string, content string) error {
-	ci, err := d.get(ctx, id)
+// Uploads to a temp name then moves to the target path via mv.
+func (d *OpenSandboxDriver) WriteFile(ctx context.Context, sandboxID, path, content string) error {
+	ci, err := d.resolve(ctx, sandboxID)
 	if err != nil {
 		return err
 	}
-	reader := strings.NewReader(content)
-	return ci.Sandbox.UploadFile(ctx, reader, opensandbox.UploadFileOptions{
-		Metadata: opensandbox.FileMetadata{Path: path},
+	// UploadFile uploads to the sandbox's upload directory.
+	// We use the filename from path, then move it to the correct location.
+	parts := strings.Split(strings.TrimRight(path, "/"), "/")
+	filename := parts[len(parts)-1]
+
+	err = ci.Sandbox.UploadFile(ctx, strings.NewReader(content), opensandbox.UploadFileOptions{
+		FileName: filename,
 	})
+	if err != nil {
+		return fmt.Errorf("opensandbox upload %s: %w", path, err)
+	}
+
+	// Move from upload dir to target path
+	if len(parts) > 1 {
+		dir := strings.Join(parts[:len(parts)-1], "/")
+		mvCmd := fmt.Sprintf("mkdir -p %q && mv %q %q", dir, "/uploads/"+filename, path)
+		_, execErr := ci.Sandbox.RunCommand(ctx, mvCmd, nil)
+		if execErr != nil {
+			return fmt.Errorf("opensandbox move to %s: %w", path, execErr)
+		}
+	}
+	return nil
 }
 
-// ReadFile downloads the content of a file from the sandbox.
-func (d *OpenSandboxDriver) ReadFile(ctx context.Context, id string, path string) (string, error) {
-	ci, err := d.get(ctx, id)
+// ReadFile downloads a file from the sandbox.
+func (d *OpenSandboxDriver) ReadFile(ctx context.Context, sandboxID, path string) (string, error) {
+	ci, err := d.resolve(ctx, sandboxID)
 	if err != nil {
 		return "", err
 	}
 	rc, err := ci.Sandbox.DownloadFile(ctx, path, "")
 	if err != nil {
-		return "", fmt.Errorf("opensandbox: read file %s: %w", path, err)
+		return "", fmt.Errorf("opensandbox read %s: %w", path, err)
 	}
 	defer rc.Close()
-
 	data, err := io.ReadAll(rc)
 	if err != nil {
-		return "", fmt.Errorf("opensandbox: read file data %s: %w", path, err)
+		return "", fmt.Errorf("opensandbox read body: %w", err)
 	}
 	return string(data), nil
 }
 
-// Destroy terminates a sandbox and removes it from the cache.
-func (d *OpenSandboxDriver) Destroy(ctx context.Context, id string) error {
-	d.mu.Lock()
-	ci, ok := d.sandboxes[id]
-	if ok {
-		delete(d.sandboxes, id)
-	}
-	d.mu.Unlock()
-
-	if !ok {
-		return nil
-	}
-	return ci.Sandbox.Kill(ctx)
+// Destroy terminates the sandbox.
+func (d *OpenSandboxDriver) Destroy(ctx context.Context, sandboxID string) error {
+	delete(d.instances, sandboxID)
+	lc := opensandbox.NewLifecycleClient(d.conn.GetBaseURL(), d.conn.GetAPIKey())
+	return lc.DeleteSandbox(ctx, sandboxID)
 }
 
-// Status returns the current lifecycle state of the sandbox.
-func (d *OpenSandboxDriver) Status(ctx context.Context, id string) (autobuild.SandboxStatus, error) {
-	d.mu.Lock()
-	ci, ok := d.sandboxes[id]
-	d.mu.Unlock()
-
-	if !ok {
-		return autobuild.SandboxStatusUnknown, fmt.Errorf("opensandbox: unknown sandbox %q", id)
-	}
-
-	info, err := ci.Sandbox.GetInfo(ctx)
+// Status returns the current lifecycle state.
+func (d *OpenSandboxDriver) Status(ctx context.Context, sandboxID string) (autobuild.SandboxStatus, error) {
+	lc := opensandbox.NewLifecycleClient(d.conn.GetBaseURL(), d.conn.GetAPIKey())
+	info, err := lc.GetSandbox(ctx, sandboxID)
 	if err != nil {
-		return autobuild.SandboxStatusError, fmt.Errorf("opensandbox: get info: %w", err)
+		return autobuild.SandboxStatusUnknown, fmt.Errorf("opensandbox status: %w", err)
 	}
-
-	return mapState(info.Status.State), nil
+	return mapSandboxState(info.Status.State), nil
 }
 
-// IP returns the endpoint URL for the default HTTP port (8080) of the sandbox.
-// Useful when the sandbox is serving a web app (HTML artifact).
-func (d *OpenSandboxDriver) IP(ctx context.Context, id string) (string, error) {
-	d.mu.Lock()
-	ci, ok := d.sandboxes[id]
-	d.mu.Unlock()
+// IP returns the public URL of the sandbox on port 8080.
+// Use GetEndpointURL for other ports (e.g. a web app serving HTML artifacts).
+func (d *OpenSandboxDriver) IP(ctx context.Context, sandboxID string) (string, error) {
+	url, err := d.GetEndpointURL(ctx, sandboxID, 8080)
+	return url, err
+}
 
-	if !ok {
-		return "", fmt.Errorf("opensandbox: unknown sandbox %q", id)
-	}
-
-	endpoint, err := ci.Sandbox.GetEndpoint(ctx, 8080)
+// GetEndpointURL returns the public URL for a specific port inside the sandbox.
+// Use port 8080 for web artifacts (e.g. HTML/React served from inside).
+func (d *OpenSandboxDriver) GetEndpointURL(ctx context.Context, sandboxID string, port int) (string, error) {
+	lc := opensandbox.NewLifecycleClient(d.conn.GetBaseURL(), d.conn.GetAPIKey())
+	ep, err := lc.GetEndpoint(ctx, sandboxID, port, nil)
 	if err != nil {
-		return "", fmt.Errorf("opensandbox: get endpoint: %w", err)
+		return "", fmt.Errorf("opensandbox endpoint port %d: %w", port, err)
 	}
-	return endpoint.Endpoint, nil
+	return ep.Endpoint, nil
 }
 
-// GetCodeInterpreter returns the underlying CodeInterpreter for a sandbox ID.
-// Use this when you need direct access to OpenSandbox-specific methods
-// (e.g. ExecCodeStreaming with custom handlers).
-func (d *OpenSandboxDriver) GetCodeInterpreter(ctx context.Context, id string) (*opensandbox.CodeInterpreter, error) {
-	return d.get(ctx, id)
+// RenewExpiration extends the sandbox TTL to the given time.
+func (d *OpenSandboxDriver) RenewExpiration(ctx context.Context, sandboxID string, expiresAt time.Time) error {
+	lc := opensandbox.NewLifecycleClient(d.conn.GetBaseURL(), d.conn.GetAPIKey())
+	_, err := lc.RenewExpiration(ctx, sandboxID, expiresAt)
+	return err
 }
 
 // ── helpers ──────────────────────────────────────────────────────────────────
 
-func (d *OpenSandboxDriver) get(ctx context.Context, id string) (*opensandbox.CodeInterpreter, error) {
-	d.mu.Lock()
-	ci, ok := d.sandboxes[id]
-	d.mu.Unlock()
-
-	if ok {
+// resolve returns a cached CodeInterpreter or reconnects to an existing sandbox.
+func (d *OpenSandboxDriver) resolve(ctx context.Context, sandboxID string) (*opensandbox.CodeInterpreter, error) {
+	if ci, ok := d.instances[sandboxID]; ok {
 		return ci, nil
 	}
-
-	// Not in cache — try to reconnect (e.g. after process restart)
-	sb, err := opensandbox.ConnectSandbox(ctx, d.config, id)
+	sb, err := opensandbox.ConnectSandbox(ctx, d.conn, sandboxID)
 	if err != nil {
-		return nil, fmt.Errorf("opensandbox: sandbox %q not found and reconnect failed: %w", id, err)
+		return nil, fmt.Errorf("opensandbox connect %s: %w", sandboxID, err)
 	}
-	ci = &opensandbox.CodeInterpreter{Sandbox: sb}
-	d.mu.Lock()
-	d.sandboxes[id] = ci
-	d.mu.Unlock()
+	ci := &opensandbox.CodeInterpreter{Sandbox: sb}
+	d.instances[sandboxID] = ci
 	return ci, nil
 }
 
-func (d *OpenSandboxDriver) timeoutPtr() *int {
-	t := 900 // 15 min default
-	return &t
+func toExecResult(exec *opensandbox.Execution) autobuild.ExecResult {
+	result := autobuild.ExecResult{Stdout: exec.Text()}
+	stderrParts := make([]string, 0, len(exec.Stderr))
+	for _, m := range exec.Stderr {
+		stderrParts = append(stderrParts, m.Text)
+	}
+	result.Stderr = strings.Join(stderrParts, "\n")
+	if exec.Error != nil {
+		if result.Stderr != "" {
+			result.Stderr += "\n"
+		}
+		result.Stderr += exec.Error.Name + ": " + exec.Error.Value
+		result.ExitCode = 1
+	}
+	if exec.ExitCode != nil {
+		result.ExitCode = *exec.ExitCode
+	}
+	return result
 }
 
-func mapState(state opensandbox.SandboxState) autobuild.SandboxStatus {
+func mapSandboxState(state opensandbox.SandboxState) autobuild.SandboxStatus {
 	switch state {
-	case opensandbox.StatePending:
-		return autobuild.SandboxStatusCreating
 	case opensandbox.StateRunning:
 		return autobuild.SandboxStatusRunning
-	case opensandbox.StatePausing, opensandbox.StatePaused, opensandbox.StateStopping:
+	case opensandbox.StatePausing, opensandbox.StatePaused:
 		return autobuild.SandboxStatusStopped
-	case opensandbox.StateTerminated, opensandbox.StateFailed:
-		return autobuild.SandboxStatusStopped
+	case opensandbox.StatePending:
+		return autobuild.SandboxStatusCreating
+	case opensandbox.StateFailed:
+		return autobuild.SandboxStatusError
 	default:
 		return autobuild.SandboxStatusUnknown
 	}
 }
 
-// Verify interface at compile time.
 var _ autobuild.SandboxDriver = (*OpenSandboxDriver)(nil)

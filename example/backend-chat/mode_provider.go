@@ -31,6 +31,7 @@ func newModeEngineWithDB(provider ab.LLMProvider, model string, logContext Runti
 	memory, _ := loadBackendMemory()
 
 	rt := &agentRuntime{
+		chatID:      logContext.ChatID,
 		skills:      skills,
 		memory:      memory,
 		checkpoints: &checkpointStore{},

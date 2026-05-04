@@ -16,6 +16,7 @@ import (
 
 // agentRuntime wires the SDK Engine + Runtime for a single request.
 type agentRuntime struct {
+	chatID         int64
 	tools          *ab.ToolRegistry
 	engine         *ab.Engine
 	runtime        *ab.Runtime
@@ -40,6 +41,13 @@ func (r *agentRuntime) buildToolRegistry() *ab.ToolRegistry {
 		reg.Register(r.newMemoryTool())
 	}
 	reg.Register(r.newSubagentDispatchTool())
+	// Sandbox tools — only when OPEN_SANDBOX_API_KEY is configured
+	if isSandboxAvailable() && r.chatID > 0 {
+		reg.Register(r.newBashTool(r.chatID))
+		reg.Register(r.newCodeInterpreterTool(r.chatID))
+		reg.Register(r.newFileWriteTool(r.chatID))
+		reg.Register(r.newFileReadTool(r.chatID))
+	}
 	return reg
 }
 
