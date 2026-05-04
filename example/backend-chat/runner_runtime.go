@@ -57,9 +57,17 @@ func (r *agentRuntime) buildToolRegistry() *ab.ToolRegistry {
 func (r *agentRuntime) buildSubagentToolRegistry() *ab.ToolRegistry {
 	reg := ab.NewToolRegistry()
 	reg.Register(r.newCheckpointTool())
-	reg.Register(r.newDocumentTool())
+	if !isSandboxAvailable() || r.chatID <= 0 {
+		reg.Register(r.newDocumentTool())
+	}
 	if r.memory != nil {
 		reg.Register(r.newMemoryTool())
+	}
+	if isSandboxAvailable() && r.chatID > 0 {
+		reg.Register(r.newBashTool(r.chatID))
+		reg.Register(r.newCodeInterpreterTool(r.chatID))
+		reg.Register(r.newFileWriteTool(r.chatID))
+		reg.Register(r.newFileReadTool(r.chatID))
 	}
 	return reg
 }
