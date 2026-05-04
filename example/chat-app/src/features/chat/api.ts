@@ -1,4 +1,7 @@
 import type {
+    ArtifactRecord,
+    ArtifactStorageResponse,
+    ArtifactVersion,
     BackendChat,
     BackendMessage,
     ChatMode,
@@ -101,6 +104,77 @@ export class ChatAPI {
 
     const tail = buffer + decoder.decode()
     emitSSEEvents(tail, callbacks.onEvent)
+  }
+
+  // ── Artifact endpoints ──────────────────────────────────────────────────────
+
+  async listArtifacts(chatId: number): Promise<Array<ArtifactRecord>> {
+    const r = await fetch(`${this.baseURL}/api/chats/${chatId}/artifacts`)
+    return readJSON<Array<ArtifactRecord>>(r)
+  }
+
+  async createArtifact(
+    chatId: number,
+    payload: { language: string; title?: string; content: string; messageId?: number }
+  ): Promise<ArtifactRecord> {
+    const r = await fetch(`${this.baseURL}/api/chats/${chatId}/artifacts`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    })
+    return readJSON<ArtifactRecord>(r)
+  }
+
+  async getArtifact(artifactId: string): Promise<ArtifactRecord> {
+    const r = await fetch(`${this.baseURL}/api/artifacts/${artifactId}`)
+    return readJSON<ArtifactRecord>(r)
+  }
+
+  async addArtifactVersion(artifactId: string, content: string): Promise<ArtifactVersion> {
+    const r = await fetch(`${this.baseURL}/api/artifacts/${artifactId}/versions`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ content }),
+    })
+    return readJSON<ArtifactVersion>(r)
+  }
+
+  async getArtifactStorage(
+    artifactId: string,
+    shared: boolean,
+    userId?: string
+  ): Promise<ArtifactStorageResponse> {
+    const params = new URLSearchParams({ shared: String(shared) })
+    if (userId) params.set("userId", userId)
+    const r = await fetch(`${this.baseURL}/api/artifacts/${artifactId}/storage?${params}`)
+    return readJSON<ArtifactStorageResponse>(r)
+  }
+
+  async setArtifactStorage(
+    artifactId: string,
+    key: string,
+    value: unknown,
+    shared: boolean,
+    userId?: string
+  ): Promise<void> {
+    await fetch(`${this.baseURL}/api/artifacts/${artifactId}/storage`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ key, value, shared, userId: userId ?? "" }),
+    })
+  }
+
+  async deleteArtifactStorageKey(
+    artifactId: string,
+    key: string,
+    shared: boolean,
+    userId?: string
+  ): Promise<void> {
+    const params = new URLSearchParams({ shared: String(shared) })
+    if (userId) params.set("userId", userId)
+    await fetch(`${this.baseURL}/api/artifacts/${artifactId}/storage/${key}?${params}`, {
+      method: "DELETE",
+    })
   }
 }
 
