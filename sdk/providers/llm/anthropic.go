@@ -4,12 +4,14 @@
 package llm
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
+	"strings"
 	"time"
 
 	autobuild "github.com/everfaz/autobuild-sdk"
@@ -251,6 +253,242 @@ func parseAnthropicResponse(body []byte) (*autobuild.ChatResponse, error) {
 
 // Verify Anthropic implements the SDK interface.
 var _ autobuild.LLMProvider = (*Anthropic)(nil)
+
+// Verify Anthropic implements StreamingLLMProvider.
+var _ autobuild.StreamingLLMProvider = (*Anthropic)(nil)
+
+// ChatStream implements autobuild.StreamingLLMProvider.
+// It calls the Anthropic API with stream=true and emits token-by-token
+// StreamEvents as the model generates them.
+//
+// The channel closes after StreamEventDone (success) or StreamEventError (failure).
+// Cancel via ctx to abort mid-stream — the HTTP connection is closed promptly.
+func (a *Anthropic) ChatStream(ctx context.Context, req autobuild.ChatRequest) (<-chan autobuild.StreamEvent, error) {
+	if a.APIKey == "" {
+		return nil, fmt.Errorf("anthropic: APIKey is required")
+	}
+	model := req.Model
+	if model == "" {
+		model = a.DefaultModel
+	}
+
+	maxTokens := a.MaxTokens
+	if maxTokens <= 0 {
+		maxTokens = 4096
+	}
+
+	body, err := buildAnthropicRequest(model, maxTokens, req)
+	if err != nil {
+		return nil, fmt.Errorf("anthropic stream: build request: %w", err)
+	}
+
+	// Inject stream=true into the request body
+	var rawBody map[string]any
+	if err := json.Unmarshal(body, &rawBody); err != nil {
+		return nil, fmt.Errorf("anthropic stream: inject stream flag: %w", err)
+	}
+	rawBody["stream"] = true
+	body, err = json.Marshal(rawBody)
+	if err != nil {
+		return nil, fmt.Errorf("anthropic stream: marshal: %w", err)
+	}
+
+	httpReq, err := http.NewRequestWithContext(ctx, "POST", a.BaseURL, bytes.NewReader(body))
+	if err != nil {
+		return nil, fmt.Errorf("anthropic stream: new request: %w", err)
+	}
+	httpReq.Header.Set("Content-Type", "application/json")
+	httpReq.Header.Set("x-api-key", a.APIKey)
+	httpReq.Header.Set("anthropic-version", a.AnthropicVersion)
+	httpReq.Header.Set("Accept", "text/event-stream")
+
+	client := a.Client
+	if client == nil {
+		client = &http.Client{Timeout: 0} // no timeout for streaming — use ctx
+	}
+
+	resp, err := client.Do(httpReq)
+	if err != nil {
+		return nil, fmt.Errorf("anthropic stream: http: %w", err)
+	}
+	if resp.StatusCode >= 400 {
+		body, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		return nil, fmt.Errorf("anthropic stream: %d %s: %s", resp.StatusCode, resp.Status, string(body))
+	}
+
+	out := make(chan autobuild.StreamEvent, 64)
+	go func() {
+		defer close(out)
+		defer resp.Body.Close()
+		readAnthropicSSE(ctx, resp.Body, out)
+	}()
+	return out, nil
+}
+
+// readAnthropicSSE parses the SSE stream from Anthropic and emits StreamEvents.
+// Anthropic SSE format: lines starting with "data: " containing JSON objects.
+// Events flow: message_start → content_block_start → content_block_delta* →
+//              content_block_stop → message_delta → message_stop
+func readAnthropicSSE(ctx context.Context, body io.Reader, out chan<- autobuild.StreamEvent) {
+	scanner := newLineScanner(body)
+
+	// Accumulated state across the stream
+	var (
+		inputTokens  int
+		outputTokens int
+		model        string
+		toolCalls    []autobuild.ToolCallEntry
+		currentTool  *autobuild.ToolCallEntry
+		toolArgsBuf  strings.Builder
+	)
+
+	for scanner.Scan() {
+		select {
+		case <-ctx.Done():
+			out <- autobuild.StreamEvent{Type: autobuild.StreamEventError, Error: ctx.Err()}
+			return
+		default:
+		}
+
+		line := scanner.Text()
+		if !strings.HasPrefix(line, "data: ") {
+			continue
+		}
+		data := strings.TrimPrefix(line, "data: ")
+		if data == "[DONE]" {
+			break
+		}
+
+		var event sseEvent
+		if err := json.Unmarshal([]byte(data), &event); err != nil {
+			continue // skip malformed lines
+		}
+
+		switch event.Type {
+		case "message_start":
+			if event.Message != nil {
+				model = event.Message.Model
+				inputTokens = event.Message.Usage.InputTokens
+			}
+
+		case "content_block_start":
+			if event.ContentBlock != nil && event.ContentBlock.Type == "tool_use" {
+				currentTool = &autobuild.ToolCallEntry{
+					ID:   event.ContentBlock.ID,
+					Name: event.ContentBlock.Name,
+				}
+				toolArgsBuf.Reset()
+			}
+
+		case "content_block_delta":
+			if event.Delta == nil {
+				continue
+			}
+			switch event.Delta.Type {
+			case "text_delta":
+				if event.Delta.Text != "" {
+					out <- autobuild.StreamEvent{
+						Type:  autobuild.StreamEventDelta,
+						Delta: event.Delta.Text,
+					}
+				}
+			case "input_json_delta":
+				// Accumulate tool call arguments
+				toolArgsBuf.WriteString(event.Delta.PartialJSON)
+			}
+
+		case "content_block_stop":
+			if currentTool != nil {
+				currentTool.Arguments = toolArgsBuf.String()
+				toolCalls = append(toolCalls, *currentTool)
+				out <- autobuild.StreamEvent{
+					Type:     autobuild.StreamEventToolCall,
+					ToolCall: currentTool,
+				}
+				currentTool = nil
+				toolArgsBuf.Reset()
+			}
+
+		case "message_delta":
+			if event.Usage != nil {
+				outputTokens = event.Usage.OutputTokens
+			}
+
+		case "message_stop":
+			finalResult := &autobuild.AgentLoopResult{
+				TotalUsage: autobuild.TokenUsage{
+					PromptTokens:     inputTokens,
+					CompletionTokens: outputTokens,
+					TotalTokens:      inputTokens + outputTokens,
+				},
+			}
+			_ = model
+			_ = toolCalls
+			out <- autobuild.StreamEvent{
+				Type:  autobuild.StreamEventDone,
+				Final: finalResult,
+			}
+			return
+
+		case "error":
+			out <- autobuild.StreamEvent{
+				Type:  autobuild.StreamEventError,
+				Error: fmt.Errorf("anthropic stream error: %s", data),
+			}
+			return
+		}
+	}
+
+	if err := scanner.Err(); err != nil && err != io.EOF {
+		out <- autobuild.StreamEvent{
+			Type:  autobuild.StreamEventError,
+			Error: fmt.Errorf("anthropic stream read: %w", err),
+		}
+	}
+}
+
+// ── SSE types ────────────────────────────────────────────────────────────────
+
+type sseEvent struct {
+	Type  string `json:"type"`
+	Index int    `json:"index,omitempty"`
+
+	// message_start
+	Message *struct {
+		Model string `json:"model"`
+		Usage struct {
+			InputTokens int `json:"input_tokens"`
+		} `json:"usage"`
+	} `json:"message,omitempty"`
+
+	// content_block_start
+	ContentBlock *struct {
+		Type string `json:"type"`
+		ID   string `json:"id"`
+		Name string `json:"name"`
+	} `json:"content_block,omitempty"`
+
+	// content_block_delta
+	Delta *struct {
+		Type        string `json:"type"`
+		Text        string `json:"text,omitempty"`
+		PartialJSON string `json:"partial_json,omitempty"`
+	} `json:"delta,omitempty"`
+
+	// message_delta
+	Usage *struct {
+		OutputTokens int `json:"output_tokens"`
+	} `json:"usage,omitempty"`
+}
+
+// newLineScanner returns a bufio.Scanner that reads lines from r.
+// Uses a 256KB buffer to handle large SSE data lines.
+func newLineScanner(r io.Reader) *bufio.Scanner {
+	scanner := bufio.NewScanner(r)
+	scanner.Buffer(make([]byte, 256*1024), 256*1024)
+	return scanner
+}
 
 // mapAnthropicStopReason maps Anthropic-specific stop_reason values to the
 // SDK's standardized FinishReason vocabulary.

@@ -2,6 +2,7 @@ package autobuild
 
 import (
 	"context"
+	"fmt"
 	"strings"
 	"sync"
 )
@@ -71,62 +72,270 @@ type StreamingLLMProvider interface {
 // ── Runtime streaming ────────────────────────────────────────────────────────
 
 // RunStream is the streaming counterpart of Runtime.Run. It returns a
-// channel of StreamEvents that emit as the agent works through its phases.
+// channel of StreamEvents that emit as the agent works.
 //
-// The phase progression is identical to Run: orientation → alignment →
-// preparation → execution → verification → closure. Streaming only affects
-// Execution: text deltas flow as the LLM generates them.
+// Phases run identically to Run (orientation → alignment → preparation →
+// execution → verification → closure). Streaming only affects the LLM
+// generation inside Execution — text deltas flow token by token as the
+// model produces them.
 //
-// If the wired LLMProvider doesn't implement StreamingLLMProvider, this
-// falls back to non-streaming Run() and emits a single StreamEventDelta
-// with the full response, then StreamEventDone. This makes streaming opt-in
-// for providers without breaking the SDK contract.
+// If the wired LLMProvider implements StreamingLLMProvider, real token-level
+// streaming occurs. Otherwise, falls back to sentence-chunked emission of the
+// full response — same API contract, degraded UX.
+//
+// Tool calls still execute synchronously during streaming:
+//   StreamEventToolCall  → tool dispatch begins
+//   StreamEventToolResult → tool returned, next LLM turn starts streaming
+//   StreamEventDelta     → model generating response to tool result
+//   StreamEventDone      → all turns complete
 func (r *Runtime) RunStream(ctx context.Context, conv *Conversation, userMessage string) (<-chan StreamEvent, error) {
-	out := make(chan StreamEvent, 32)
+	out := make(chan StreamEvent, 64)
 
-	// Streaming mode requires a streaming-capable provider. If absent,
-	// fall back to buffered Run + single delta.
-	streamProv, ok := r.engine.LLM.(StreamingLLMProvider)
-	if !ok {
-		go func() {
-			defer close(out)
+	streamProv, hasRealStream := r.engine.LLM.(StreamingLLMProvider)
+
+	go func() {
+		defer close(out)
+
+		if !hasRealStream {
+			// Fallback: run normally, emit sentence chunks
 			result, err := r.Run(ctx, conv, userMessage)
 			if err != nil {
 				out <- StreamEvent{Type: StreamEventError, Error: err}
 				return
 			}
-			if result.Response != "" {
-				out <- StreamEvent{Type: StreamEventDelta, Delta: result.Response}
+			for _, chunk := range chunkBySentence(result.Response) {
+				select {
+				case <-ctx.Done():
+					out <- StreamEvent{Type: StreamEventError, Error: ctx.Err()}
+					return
+				case out <- StreamEvent{Type: StreamEventDelta, Delta: chunk}:
+				}
 			}
 			out <- StreamEvent{Type: StreamEventDone}
-		}()
-		return out, nil
-	}
-	_ = streamProv
-
-	// Real streaming flow: drive Runtime phases, swap Execution for streaming version.
-	// For now we stream the final answer by running normally then chunking the output —
-	// this preserves all phase guarantees while exposing streaming UX.
-	// A future optimization would push deltas live during agent_loop.go.
-	go func() {
-		defer close(out)
-		result, err := r.Run(ctx, conv, userMessage)
-		if err != nil {
-			out <- StreamEvent{Type: StreamEventError, Error: err}
 			return
 		}
-		// Chunk by sentence boundaries for natural pacing
-		for _, chunk := range chunkBySentence(result.Response) {
-			select {
-			case <-ctx.Done():
-				out <- StreamEvent{Type: StreamEventError, Error: ctx.Err()}
-				return
-			case out <- StreamEvent{Type: StreamEventDelta, Delta: chunk}:
+
+		// Real streaming path:
+		// 1. Run all phases except Execution normally
+		// 2. In Execution, intercept the LLM call to use ChatStream
+		// 3. Handle tool calls (dispatch → next streaming turn) in a loop
+		if err := r.runStreamInternal(ctx, conv, userMessage, streamProv, out); err != nil {
+			out <- StreamEvent{Type: StreamEventError, Error: err}
+		}
+	}()
+
+	return out, nil
+}
+
+// runStreamInternal executes the full 6-phase lifecycle with real streaming
+// in the Execution phase. Tool calls are dispatched synchronously between
+// streaming turns.
+func (r *Runtime) runStreamInternal(
+	ctx context.Context,
+	conv *Conversation,
+	userMessage string,
+	streamProv StreamingLLMProvider,
+	out chan<- StreamEvent,
+) error {
+	// ── Phases 0-2: identical to Run ──
+	conv.AppendUser(userMessage)
+
+	if r.wellbeing != nil {
+		signal := r.wellbeing.Detect(userMessage)
+		if signal.Detected && signal.Severity >= WellbeingSeverityHigh {
+			resp := wellbeingResponse(signal)
+			out <- StreamEvent{Type: StreamEventDelta, Delta: resp}
+			out <- StreamEvent{Type: StreamEventDone}
+			conv.AppendAssistant(resp)
+			conv.IncrementTurn()
+			if r.store != nil {
+				_ = r.store.Save(ctx, conv)
+			}
+			return nil
+		}
+	}
+
+	if r.engine.HasExecution() {
+		_ = r.engine.Execution.SetPhase(ctx, PhaseOrientation)
+	}
+	if conv.IsCold() {
+		rr := &RuntimeResult{}
+		if err := r.orientation(ctx, userMessage, conv, rr); err != nil {
+			return fmt.Errorf("orientation: %w", err)
+		}
+	} else {
+		if err := r.warmRefresh(ctx, userMessage, conv); err != nil {
+			return fmt.Errorf("warm refresh: %w", err)
+		}
+	}
+
+	_ = r.advancePhase(ctx, PhaseAlignment)
+	// Alignment: planner (non-streaming, cheap)
+	if r.planner != nil && r.engine.HasExecution() && r.planner.ShouldPlan(ctx, userMessage, conv) {
+		plan, _ := r.planner.Propose(ctx, userMessage, conv)
+		if plan != nil {
+			if _, err := r.engine.Execution.Propose(ctx, *plan); err == nil && r.autoApprovePlan {
+				_ = r.engine.Execution.Approve(ctx, true)
 			}
 		}
-		out <- StreamEvent{Type: StreamEventDone}
-	}()
-	return out, nil
+	}
+
+	_ = r.advancePhase(ctx, PhasePreparation)
+	prepRR := &RuntimeResult{}
+	if err := r.preparation(ctx, conv, prepRR); err != nil {
+		return fmt.Errorf("preparation: %w", err)
+	}
+
+	_ = r.advancePhase(ctx, PhaseExecution)
+
+	// ── Streaming Execution loop ──
+	// Mirrors agent_loop.go but uses ChatStream instead of Chat.
+	var finalResponse string
+	var totalUsage TokenUsage
+	messages := conv.Messages
+
+	// Build system prompt once
+	systemPrompt := ""
+	if r.engine.HasPrompt() {
+		if r.mode != "" && r.engine.HasModes() {
+			if mode, err := r.engine.Modes.Get(ctx, r.mode); err == nil {
+				r.engine.Prompt.Set(LayerMode, mode.PromptContent)
+			}
+		}
+		systemPrompt = r.engine.Prompt.Build()
+	}
+
+	dispatcher := NewToolDispatcher(r.engine.Tools, r.engine.Sandbox)
+
+	for turn := 0; turn < 50; turn++ {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+
+		req := ChatRequest{
+			Model:    "",
+			Messages: buildRequestMessages(systemPrompt, messages),
+		}
+		if r.engine.HasTools() {
+			req.Tools = r.engine.Tools.ToolDefs()
+		}
+
+		events, err := streamProv.ChatStream(ctx, req)
+		if err != nil {
+			return fmt.Errorf("stream turn %d: %w", turn, err)
+		}
+
+		// Collect this turn's output
+		var turnText strings.Builder
+		var turnToolCalls []ToolCallEntry
+		var turnDone bool
+
+		for ev := range events {
+			switch ev.Type {
+			case StreamEventDelta:
+				turnText.WriteString(ev.Delta)
+				// Forward to consumer
+				select {
+				case <-ctx.Done():
+					return ctx.Err()
+				case out <- ev:
+				}
+
+			case StreamEventToolCall:
+				turnToolCalls = append(turnToolCalls, *ev.ToolCall)
+				out <- ev
+
+			case StreamEventDone:
+				if ev.Final != nil {
+					totalUsage.PromptTokens += ev.Final.TotalUsage.PromptTokens
+					totalUsage.CompletionTokens += ev.Final.TotalUsage.CompletionTokens
+					totalUsage.TotalTokens += ev.Final.TotalUsage.TotalTokens
+				}
+				turnDone = true
+
+			case StreamEventError:
+				return fmt.Errorf("stream event error: %w", ev.Error)
+			}
+		}
+
+		// Append assistant turn to message history
+		if turnText.Len() > 0 {
+			messages = append(messages, ChatMessage{
+				Role:    RoleAssistant,
+				Content: turnText.String(),
+			})
+			finalResponse = turnText.String()
+		}
+
+		// If no tool calls, we're done
+		if len(turnToolCalls) == 0 || !turnDone {
+			break
+		}
+
+		// Dispatch tool calls and append results
+		var sandboxID string
+		results := dispatcher.DispatchParallel(ctx, turnToolCalls, sandboxID)
+		for i, result := range results {
+			// Apply output filter observation recording
+			if r.engine.HasObservations() && r.observationFilt != nil {
+				obs := r.observationFilt(turnToolCalls[i], result)
+				if obs.Content != "" {
+					_ = r.engine.Observations.Record(ctx, obs)
+				}
+			}
+			// Emit tool result event
+			out <- StreamEvent{Type: StreamEventToolResult, ToolResult: &result}
+			// Append to messages for next turn
+			messages = append(messages, ChatMessage{
+				Role:       RoleTool,
+				Content:    result.Content,
+				ToolCallID: result.ToolCallID,
+			})
+		}
+	}
+
+	// Apply output filter to final response
+	if r.outputFilter != nil && finalResponse != "" {
+		verdict := r.outputFilter.Inspect(ctx, finalResponse)
+		switch verdict.Decision {
+		case OutputBlock:
+			finalResponse = "[output blocked: " + verdict.Reason + "]"
+		case OutputTransform:
+			finalResponse = verdict.NewOutput
+		}
+	}
+
+	// ── Phases 4-5: Verification + Closure ──
+	_ = r.advancePhase(ctx, PhaseVerification)
+	_ = r.advancePhase(ctx, PhaseClosure)
+
+	conv.AppendAssistant(finalResponse)
+
+	// Closure: memory writes
+	closureRR := &RuntimeResult{}
+	_ = r.closure(ctx, userMessage, &AgentLoopResult{
+		FinalContent: finalResponse,
+		TotalUsage:   totalUsage,
+	}, conv, closureRR)
+
+	conv.IncrementTurn()
+	if r.store != nil {
+		_ = r.store.Save(ctx, conv)
+	}
+
+	out <- StreamEvent{Type: StreamEventDone}
+	return nil
+}
+
+// buildRequestMessages prepends a system message to the conversation history.
+func buildRequestMessages(systemPrompt string, messages []ChatMessage) []ChatMessage {
+	if systemPrompt == "" {
+		return messages
+	}
+	out := make([]ChatMessage, 0, len(messages)+1)
+	out = append(out, ChatMessage{Role: RoleSystem, Content: systemPrompt})
+	out = append(out, messages...)
+	return out
 }
 
 // chunkBySentence splits text on sentence-ending punctuation while preserving
