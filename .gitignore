@@ -8,3 +8,5 @@ example/backend-chat/.DS_Store
 example/backend-chat/.env
 example/backend-chat/.env.*
 !example/backend-chat/.env.example
+example/backend-chat/memory/project/
+example/backend-chat/memory/user/
