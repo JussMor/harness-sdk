@@ -1,6 +1,9 @@
 package autobuild
 
-import "context"
+import (
+	"context"
+	"sync"
+)
 
 // ── Phase ────────────────────────────────────────────────────────────────────
 
@@ -125,7 +128,10 @@ type ExecutionContext interface {
 // InMemoryExecutionContext is a simple, non-persistent ExecutionContext.
 // Suitable for single-process use and tests. For production, implement
 // ExecutionContext against your persistence layer.
+//
+// All methods are safe for concurrent use.
 type InMemoryExecutionContext struct {
+	mu         sync.Mutex
 	phase      Phase
 	attempt    int
 	hooks      map[Phase][]PhaseHook
@@ -142,20 +148,44 @@ func NewExecutionContext() *InMemoryExecutionContext {
 	}
 }
 
-func (e *InMemoryExecutionContext) Phase() Phase   { return e.phase }
-func (e *InMemoryExecutionContext) Attempt() int   { return e.attempt }
-func (e *InMemoryExecutionContext) ActivePlan() *Plan { return e.activePlan }
-func (e *InMemoryExecutionContext) Todos() []Todo  { return e.todos }
+func (e *InMemoryExecutionContext) Phase() Phase {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return e.phase
+}
+
+func (e *InMemoryExecutionContext) Attempt() int {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return e.attempt
+}
+
+func (e *InMemoryExecutionContext) ActivePlan() *Plan {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return e.activePlan
+}
+
+func (e *InMemoryExecutionContext) Todos() []Todo {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	out := make([]Todo, len(e.todos))
+	copy(out, e.todos)
+	return out
+}
 
 func (e *InMemoryExecutionContext) Advance(ctx context.Context) error {
+	e.mu.Lock()
 	next := e.phase + 1
+	e.mu.Unlock()
 	if next > PhaseClosure {
-		return nil // already at end
+		return nil
 	}
 	return e.SetPhase(ctx, next)
 }
 
 func (e *InMemoryExecutionContext) SetPhase(ctx context.Context, p Phase) error {
+	e.mu.Lock()
 	prev := e.phase
 	if p == e.phase {
 		e.attempt++
@@ -163,9 +193,16 @@ func (e *InMemoryExecutionContext) SetPhase(ctx context.Context, p Phase) error 
 		e.attempt = 1
 	}
 	e.phase = p
-	for _, hook := range e.hooks[p] {
+	hooks := make([]PhaseHook, len(e.hooks[p]))
+	copy(hooks, e.hooks[p])
+	e.mu.Unlock()
+
+	// Run hooks outside the lock so hooks can call back into ExecutionContext.
+	for _, hook := range hooks {
 		if err := hook(ctx, prev, p); err != nil {
+			e.mu.Lock()
 			e.phase = prev // rollback
+			e.mu.Unlock()
 			return err
 		}
 	}
@@ -173,16 +210,22 @@ func (e *InMemoryExecutionContext) SetPhase(ctx context.Context, p Phase) error 
 }
 
 func (e *InMemoryExecutionContext) RegisterHook(target Phase, hook PhaseHook) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
 	e.hooks[target] = append(e.hooks[target], hook)
 }
 
 func (e *InMemoryExecutionContext) Propose(_ context.Context, p Plan) (*Plan, error) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
 	p.Approved = false
 	e.activePlan = &p
 	return &p, nil
 }
 
 func (e *InMemoryExecutionContext) Approve(_ context.Context, autoApprove bool) error {
+	e.mu.Lock()
+	defer e.mu.Unlock()
 	if e.activePlan == nil {
 		return nil
 	}
@@ -192,6 +235,8 @@ func (e *InMemoryExecutionContext) Approve(_ context.Context, autoApprove bool) 
 }
 
 func (e *InMemoryExecutionContext) UpdateExecutable(_ context.Context, execID string, status ExecutableStatus, result string) error {
+	e.mu.Lock()
+	defer e.mu.Unlock()
 	if e.activePlan == nil {
 		return nil
 	}
@@ -208,9 +253,15 @@ func (e *InMemoryExecutionContext) UpdateExecutable(_ context.Context, execID st
 	return nil
 }
 
-func (e *InMemoryExecutionContext) SetTodos(todos []Todo) { e.todos = todos }
+func (e *InMemoryExecutionContext) SetTodos(todos []Todo) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.todos = todos
+}
 
 func (e *InMemoryExecutionContext) MarkDone(id string) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
 	for i := range e.todos {
 		if e.todos[i].ID == id {
 			e.todos[i].Status = TodoStatusCompleted

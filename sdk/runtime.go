@@ -53,6 +53,7 @@ type Runtime struct {
 	autoApprovePlan bool
 	sessionContext  SessionContextProvider
 	outputFilter    OutputFilter
+	compactor       Compactor
 }
 
 // Tokenizer estimates token count for a string. Replace the default heuristic
@@ -128,6 +129,14 @@ func (r *Runtime) WithSessionContext(p SessionContextProvider) *Runtime {
 // or block responses that violate output policy.
 func (r *Runtime) WithOutputFilter(f OutputFilter) *Runtime {
 	r.outputFilter = f
+	return r
+}
+
+// WithCompactor installs a Compactor that summarizes dropped conversation
+// history when the context budget forces truncation. Without this, truncated
+// messages are silently lost. With it, a summary is injected into LayerMemory.
+func (r *Runtime) WithCompactor(c Compactor) *Runtime {
+	r.compactor = c
 	return r
 }
 
@@ -525,34 +534,41 @@ func (r *Runtime) preparation(ctx context.Context, conv *Conversation, rr *Runti
 		}
 	}
 
-	// Real budget enforcement (not just warnings)
+	// Real budget enforcement with optional compaction of dropped messages.
 	if r.engine.HasBudget() && r.engine.HasPrompt() {
-		assembled := r.engine.Prompt.Build()
 		skillTokens := 0
 		for _, s := range conv.LoadedSkills {
 			skillTokens += s.TokenEstimate
 		}
 		memoryTokens := r.tokenizer.Count(r.engine.Prompt.Get(LayerMemory))
-		_ = assembled
 
-		enforce := r.engine.Budget.Enforce(
-			ctx, conv, r.engine.Skills,
-			skillTokens, memoryTokens,
-			&conv.Messages,
+		compResult := EnforceWithCompaction(
+			ctx,
+			r.engine.Budget,
+			r.compactor,
+			conv,
+			r.engine.Skills,
+			skillTokens,
+			memoryTokens,
 		)
+		enforce := compResult.EnforcementResult
 		if enforce.OverflowTokens > 0 {
 			rr.Enforcement = enforce
 			if len(enforce.EvictedSkills) > 0 {
 				rr.Warnings = append(rr.Warnings,
-					fmt.Sprintf("budget enforcement: evicted %d skills", len(enforce.EvictedSkills)))
+					fmt.Sprintf("budget: evicted %d skills", len(enforce.EvictedSkills)))
 			}
 			if enforce.TruncatedHistory {
 				rr.Warnings = append(rr.Warnings,
-					fmt.Sprintf("budget enforcement: dropped %d history messages", enforce.HistoryDropped))
+					fmt.Sprintf("budget: dropped %d messages", enforce.HistoryDropped))
 			}
 			if enforce.StillOverflow {
-				rr.Warnings = append(rr.Warnings, "budget enforcement: still over budget after eviction")
+				rr.Warnings = append(rr.Warnings, "budget: still over after enforcement")
 			}
+		}
+		// Inject compacted summary into memory layer so the agent retains context.
+		if compResult.Summary != "" && r.engine.HasPrompt() {
+			r.engine.Prompt.Append(LayerMemory, "\n\nContext summary (from earlier turns):\n"+compResult.Summary)
 		}
 	}
 	return nil
