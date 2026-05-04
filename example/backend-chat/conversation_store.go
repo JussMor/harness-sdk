@@ -208,7 +208,6 @@ func toAgentMessages(messages []Message) []ab.ChatMessage {
 }
 
 // abToMessages converts []ab.ChatMessage → []Message for LoadOrCreateConversation.
-// Uses dummy IDs since we only need role+content.
 func abToMessages(msgs []ab.ChatMessage) []Message {
 	out := make([]Message, 0, len(msgs))
 	for _, m := range msgs {
@@ -218,9 +217,4 @@ func abToMessages(msgs []ab.ChatMessage) []Message {
 		})
 	}
 	return out
-}
-
-// messagesFromAB is an alias for abToMessages.
-func messagesFromAB(msgs []ab.ChatMessage) []Message {
-	return abToMessages(msgs)
 }

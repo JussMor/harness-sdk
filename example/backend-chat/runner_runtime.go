@@ -342,9 +342,3 @@ func previewText(value string, limit int) string {
 	return trimmed[:limit-3] + "..."
 }
 
-func providerOrEcho(provider ab.LLMProvider, model string) ab.LLMProvider {
-	if provider != nil {
-		return provider
-	}
-	return &EchoLLM{Model: model}
-}

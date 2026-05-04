@@ -112,53 +112,6 @@ func buildExecutablesFromTasks(chunks []string) []ab.Executable {
 	return execs
 }
 
-func splitPromptIntoTasks(prompt string) []string {
-	trimmed := strings.TrimSpace(prompt)
-	if trimmed == "" {
-		return nil
-	}
-	lines := strings.Split(trimmed, "\n")
-	bullets := make([]string, 0)
-	for _, line := range lines {
-		candidate := strings.TrimSpace(line)
-		if candidate == "" {
-			continue
-		}
-		if strings.HasPrefix(candidate, "-") || strings.HasPrefix(candidate, "*") {
-			candidate = strings.TrimSpace(strings.TrimLeft(candidate, "-*"))
-			if candidate != "" {
-				bullets = append(bullets, candidate)
-			}
-			continue
-		}
-		if len(candidate) > 2 && candidate[1] == '.' {
-			candidate = strings.TrimSpace(candidate[2:])
-			if candidate != "" {
-				bullets = append(bullets, candidate)
-			}
-		}
-	}
-	if len(bullets) > 0 {
-		return bullets
-	}
-	for _, sep := range []string{";", " then ", " despues ", " después ", " y luego ", " y también "} {
-		parts := strings.Split(trimmed, sep)
-		if len(parts) >= 2 {
-			out := make([]string, 0, len(parts))
-			for _, part := range parts {
-				c := strings.TrimSpace(part)
-				if c != "" {
-					out = append(out, c)
-				}
-			}
-			if len(out) > 1 {
-				return out
-			}
-		}
-	}
-	return []string{trimmed}
-}
-
 func summarizePlanForPrompt(plan *ab.Plan) string {
 	if plan == nil {
 		return ""
