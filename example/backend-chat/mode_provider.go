@@ -81,6 +81,38 @@ func newModeEngineWithDB(provider ab.LLMProvider, model string, logContext Runti
 			"Available tools:\n"+rt.tools.DescribeAvailable(),
 	)
 	engine.Prompt.Set(ab.LayerBehavior, ab.DefaultBehaviorPrompt)
+
+	// Artifact instructions — tells the LLM how to mark renderable content
+	// so the frontend can detect and display it in a side panel (iframe sandbox).
+	//
+	// Rules:
+	//   - Use fenced code blocks with the correct language tag
+	//   - Only wrap self-contained, renderable content
+	//   - Never split one artifact across multiple code blocks
+	//   - Inline snippets that are part of an explanation stay inline
+	engine.Prompt.Append(ab.LayerBehavior, `
+## Artifact instructions
+
+When your response contains content the user can view or interact with — complete HTML pages, React components, SVG graphics, or runnable scripts — wrap it in a fenced code block with the correct language tag. The frontend will detect these blocks and render them in a side panel.
+
+Rules for artifacts:
+- **html** — full HTML pages or fragments with embedded CSS/JS
+- **jsx** — React components (self-contained, default export preferred)
+- **svg** — standalone SVG graphics
+- **python** / **go** / **typescript** — complete runnable scripts
+
+Only wrap content that is self-contained and renderable on its own. Partial snippets that illustrate a point stay inline. Never split one artifact across multiple blocks.
+
+Examples of what SHOULD be an artifact:
+- A complete landing page
+- A working React component with useState
+- A data visualization chart
+- A full script the user can run
+
+Examples of what should NOT be an artifact:
+- A single function shown as an example
+- A code snippet mid-explanation
+- Shell commands`)
 	// LayerMemory, LayerSkills, LayerSession → filled by Runtime at orientation
 
 	// ── Conversation store (SQLite if DB available) ──
