@@ -259,11 +259,13 @@ func (r *Runtime) runStreamInternal(
 		}
 
 		// Append assistant turn to message history
+		assistantMsg := ChatMessage{
+			Role:      RoleAssistant,
+			Content:   turnText.String(),
+			ToolCalls: turnToolCalls,
+		}
+		messages = append(messages, assistantMsg)
 		if turnText.Len() > 0 {
-			messages = append(messages, ChatMessage{
-				Role:    RoleAssistant,
-				Content: turnText.String(),
-			})
 			finalResponse = turnText.String()
 		}
 

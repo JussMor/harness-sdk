@@ -127,14 +127,16 @@ type anthropicMessage struct {
 }
 
 type anthropicContent struct {
-	Type     string          `json:"type"`
-	Text     string          `json:"text,omitempty"`
-	ID       string          `json:"id,omitempty"`        // tool_use
-	Name     string          `json:"name,omitempty"`      // tool_use
-	Input    json.RawMessage `json:"input,omitempty"`     // tool_use
-	ToolUseID string         `json:"tool_use_id,omitempty"` // tool_result
-	Content  string          `json:"content,omitempty"`   // tool_result body
+	Type      string          `json:"type"`
+	Text      *string         `json:"text,omitempty"`
+	ID        string          `json:"id,omitempty"`          // tool_use
+	Name      string          `json:"name,omitempty"`        // tool_use
+	Input     json.RawMessage `json:"input,omitempty"`       // tool_use
+	ToolUseID string          `json:"tool_use_id,omitempty"` // tool_result
+	Content   string          `json:"content,omitempty"`     // tool_result body
 }
+
+func strPtr(s string) *string { return &s }
 
 type anthropicTool struct {
 	Name        string          `json:"name"`
@@ -178,12 +180,36 @@ func buildAnthropicRequest(model string, maxTokens int, req autobuild.ChatReques
 			} else {
 				out.System = m.Content
 			}
-		case autobuild.RoleUser, autobuild.RoleAssistant:
+		case autobuild.RoleUser:
 			out.Messages = append(out.Messages, anthropicMessage{
-				Role: string(m.Role),
+				Role: "user",
 				Content: []anthropicContent{
-					{Type: "text", Text: m.Content},
+					{Type: "text", Text: strPtr(m.Content)},
 				},
+			})
+		case autobuild.RoleAssistant:
+			var content []anthropicContent
+			if m.Content != "" {
+				content = append(content, anthropicContent{Type: "text", Text: strPtr(m.Content)})
+			}
+			for _, tc := range m.ToolCalls {
+				input := json.RawMessage(tc.Arguments)
+				if len(input) == 0 {
+					input = json.RawMessage(`{}`)
+				}
+				content = append(content, anthropicContent{
+					Type:  "tool_use",
+					ID:    tc.ID,
+					Name:  tc.Name,
+					Input: input,
+				})
+			}
+			if len(content) == 0 {
+				content = append(content, anthropicContent{Type: "text", Text: strPtr("")})
+			}
+			out.Messages = append(out.Messages, anthropicMessage{
+				Role:    "assistant",
+				Content: content,
 			})
 		case autobuild.RoleTool:
 			// Tool results land in a user message with a tool_result block.
@@ -235,10 +261,12 @@ func parseAnthropicResponse(body []byte) (*autobuild.ChatResponse, error) {
 	for _, c := range raw.Content {
 		switch c.Type {
 		case "text":
-			if out.Content != "" {
-				out.Content += "\n"
+			if c.Text != nil {
+				if out.Content != "" {
+					out.Content += "\n"
+				}
+				out.Content += *c.Text
 			}
-			out.Content += c.Text
 		case "tool_use":
 			out.ToolCalls = append(out.ToolCalls, autobuild.ToolCallEntry{
 				ID:        c.ID,
