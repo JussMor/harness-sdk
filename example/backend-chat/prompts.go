@@ -54,8 +54,6 @@ func GenerateAssistantReply(
 	messages []ab.ChatMessage,
 	mode, model string,
 	logContext RuntimeLogContext,
-	onRuntimeEvent func(ab.Event),
-	onTrace func(TraceStep),
 	db *sql.DB,
 ) AssistantRunResult {
 	if len(messages) == 0 {
@@ -72,10 +70,10 @@ func GenerateAssistantReply(
 	}
 	logContext.Mode = requestedMode
 
-	result, err := runWithMode(ctx, provider, requestedMode, model, messages, logContext, onRuntimeEvent, onTrace, db)
+	result, err := runWithMode(ctx, provider, requestedMode, model, messages, logContext, db)
 	if err != nil && requestedMode != "balanced" {
 		logContext.Mode = "balanced"
-		result, err = runWithMode(ctx, provider, "balanced", model, messages, logContext, onRuntimeEvent, onTrace, db)
+		result, err = runWithMode(ctx, provider, "balanced", model, messages, logContext, db)
 	}
 	if err != nil {
 		return AssistantRunResult{Content: fmt.Sprintf("[%s] Error: %v", model, err)}
@@ -89,45 +87,12 @@ func runWithMode(
 	mode, model string,
 	messages []ab.ChatMessage,
 	logContext RuntimeLogContext,
-	onRuntimeEvent func(ab.Event),
-	onTrace func(TraceStep),
 	db *sql.DB,
 ) (AssistantRunResult, error) {
 	_, agentRT, err := newModeEngineWithDB(provider, model, logContext, db)
 	if err != nil {
 		return AssistantRunResult{}, err
 	}
-
-	// Subscribe to events for frontend push
-	var subs []*ab.Subscription
-	if agentRT.events != nil {
-		if onRuntimeEvent != nil {
-			subs = append(subs,
-				agentRT.events.Subscribe(ab.EventSubagentCompleted, onRuntimeEvent),
-				agentRT.events.Subscribe(ab.EventExecutableUpdated, onRuntimeEvent),
-			)
-		}
-		if onTrace != nil {
-			subs = append(subs,
-				ab.SubscribeTransformed(agentRT.events, ab.EventAgentTraceStep,
-					func(e ab.Event) (any, bool) {
-						step, ok := e.Payload["step"].(ab.ReasoningStep)
-						return TraceStep(step), ok
-					},
-					func(v any) {
-						if step, ok := v.(TraceStep); ok {
-							onTrace(step)
-						}
-					},
-				),
-			)
-		}
-	}
-	defer func() {
-		for _, s := range subs {
-			s.Cancel()
-		}
-	}()
 
 	// Main path via Runtime.Run
 	userMessage := latestUserPrompt(messages)

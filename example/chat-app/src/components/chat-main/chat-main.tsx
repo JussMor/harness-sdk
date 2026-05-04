@@ -65,14 +65,6 @@ interface RunOptionsPayload {
   }
 }
 
-interface RunnerUpdateEvent {
-  type?: string
-  runId?: string
-  chatId?: number
-  runner?: BackendRunner
-  trace?: BackendTraceStep
-}
-
 interface BackendTraceStep {
   id?: string
   type?: "search" | "result" | "action" | "thinking"
@@ -267,86 +259,6 @@ export function ChatMain({
     void loadMessages()
     return () => controller.abort()
   }, [activeChatID, activeRunID, backendBaseURL, pendingAssistantID])
-
-  useEffect(() => {
-    if (!chatID) {
-      return
-    }
-
-    const source = new EventSource(
-      `${backendBaseURL}/api/chats/${chatID}/events`
-    )
-
-    source.addEventListener("runner.update", (event) => {
-      if (!activeRunID || !pendingAssistantID) {
-        return
-      }
-
-      try {
-        const payload = JSON.parse(event.data) as RunnerUpdateEvent
-        const runner = payload.runner
-        if (payload.runId !== activeRunID || !runner) {
-          return
-        }
-
-        setMessages((prev) =>
-          prev.map((message) => {
-            if (message.id !== pendingAssistantID) {
-              return message
-            }
-
-            return {
-              ...message,
-              parallelAgents: upsertRunnerAgent(
-                message.parallelAgents ?? [],
-                runner,
-                selectedMode
-              ),
-            }
-          })
-        )
-      } catch {
-        // Ignore malformed events.
-      }
-    })
-
-    source.addEventListener("trace.update", (event) => {
-      if (!activeRunID || !pendingAssistantID) {
-        return
-      }
-
-      try {
-        const payload = JSON.parse(event.data) as RunnerUpdateEvent
-        const step = payload.trace
-        if (payload.runId !== activeRunID || !step) {
-          return
-        }
-
-        setMessages((prev) =>
-          prev.map((message) => {
-            if (message.id !== pendingAssistantID) {
-              return message
-            }
-
-            return {
-              ...message,
-              chainOfThought: true,
-              chainOfThoughtSteps: upsertTraceStep(
-                message.chainOfThoughtSteps ?? [],
-                toTraceStep(step)
-              ),
-            }
-          })
-        )
-      } catch {
-        // Ignore malformed events.
-      }
-    })
-
-    return () => {
-      source.close()
-    }
-  }, [activeRunID, backendBaseURL, chatID, pendingAssistantID, selectedMode])
 
   const handleSubmit = async (prompt: string) => {
     const trimmedPrompt = prompt.trim()
@@ -874,22 +786,6 @@ async function consumeStreamedRun(
   return finalMessage
 }
 
-function upsertRunnerAgent(
-  existingAgents: Array<RunnerThreadProps>,
-  runner: BackendRunner,
-  fallbackModel: string
-): Array<RunnerThreadProps> {
-  const runnerID = String(runner.id || "runner")
-  const next = toRunnerAgent(runner, fallbackModel)
-  const idx = existingAgents.findIndex((agent) => agent.id === runnerID)
-
-  if (idx === -1) {
-    return [...existingAgents, next]
-  }
-
-  return existingAgents.map((agent, index) => (index === idx ? next : agent))
-}
-
 function toRunnerAgent(
   runner: BackendRunner,
   fallbackModel: string
@@ -971,16 +867,4 @@ function toTraceStep(step: BackendTraceStep): ChainOfThoughtStep {
     content: step.content,
     details: step.details,
   }
-}
-
-function upsertTraceStep(
-  existingSteps: Array<ChainOfThoughtStep>,
-  nextStep: ChainOfThoughtStep
-): Array<ChainOfThoughtStep> {
-  const idx = existingSteps.findIndex((step) => step.id === nextStep.id)
-  if (idx === -1) {
-    return [...existingSteps, nextStep]
-  }
-
-  return existingSteps.map((step, index) => (index === idx ? nextStep : step))
 }

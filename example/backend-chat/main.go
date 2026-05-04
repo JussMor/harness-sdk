@@ -40,7 +40,6 @@ func main() {
 		db:        db,
 		pub:       NewCentrifugoClient(getenv("CENTRIFUGO_API_URL", "http://localhost:8000/api"), getenv("CENTRIFUGO_API_KEY", "backend-chat-dev-api-key")),
 		llm:       BuildLLMFromEnv(),
-		runnerHub: NewRunnerEventHub(),
 		modelName: getenv("BACKEND_MODEL", "anthropic/claude-sonnet-4-20250514"),
 	}
 	if modes, err := loadBackendModes(); err == nil {
@@ -72,7 +71,6 @@ type BackendChatApp struct {
 	llm       ab.LLMProvider
 	multi     *ab.RoutedLLMProvider
 	modes     ab.ModeProvider
-	runnerHub *RunnerEventHub
 	modelName string
 }
 
@@ -222,52 +220,10 @@ func (a *BackendChatApp) handleChatRoutes(w http.ResponseWriter, r *http.Request
 	switch parts[1] {
 	case "messages":
 		a.handleMessages(w, r, chatID)
-	case "events":
-		a.handleRunnerEvents(w, r, chatID)
 	case "stream":
 		a.handleStream(w, r, chatID)
 	default:
 		w.WriteHeader(http.StatusNotFound)
-	}
-}
-
-func (a *BackendChatApp) handleRunnerEvents(w http.ResponseWriter, r *http.Request, chatID int64) {
-	if r.Method != http.MethodGet {
-		w.WriteHeader(http.StatusMethodNotAllowed)
-		return
-	}
-
-	flusher, ok := w.(http.Flusher)
-	if !ok {
-		writeErr(w, http.StatusInternalServerError, fmt.Errorf("streaming not supported"))
-		return
-	}
-
-	w.Header().Set("Content-Type", "text/event-stream")
-	w.Header().Set("Cache-Control", "no-cache")
-	w.Header().Set("Connection", "keep-alive")
-
-	events, unsubscribe := a.runnerHub.Subscribe(chatID)
-	defer unsubscribe()
-
-	_, _ = fmt.Fprint(w, "event: ready\ndata: {}\n\n")
-	flusher.Flush()
-
-	for {
-		select {
-		case <-r.Context().Done():
-			return
-		case event, ok := <-events:
-			if !ok {
-				return
-			}
-			payload, err := json.Marshal(event)
-			if err != nil {
-				continue
-			}
-			_, _ = fmt.Fprintf(w, "event: %s\ndata: %s\n\n", event.Type, payload)
-			flusher.Flush()
-		}
 	}
 }
 
@@ -323,6 +279,10 @@ func firstNonEmpty(values ...string) string {
 		}
 	}
 	return ""
+}
+
+func newRunID() string {
+	return fmt.Sprintf("run_%d", time.Now().UnixNano())
 }
 
 // handleStream is the real-time streaming counterpart of handleRun.

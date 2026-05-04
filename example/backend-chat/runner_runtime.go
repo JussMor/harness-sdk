@@ -27,7 +27,6 @@ type agentRuntime struct {
 	model      string
 	logContext RuntimeLogContext
 
-	events         *ab.InMemoryEventBus
 	tools          *ab.ToolRegistry
 	engine         *ab.Engine
 	runtime        *ab.Runtime

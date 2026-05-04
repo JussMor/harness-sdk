@@ -33,7 +33,6 @@ func newModeEngineWithDB(provider ab.LLMProvider, model string, logContext Runti
 		provider:    provider,
 		model:       model,
 		logContext:  logContext,
-		events:      ab.NewEventBus(),
 		skills:      skills,
 		memory:      memory,
 		checkpoints: &checkpointStore{},
@@ -54,7 +53,6 @@ func newModeEngineWithDB(provider ab.LLMProvider, model string, logContext Runti
 	engine.LLM = provider
 	engine.Skills = skills
 	engine.Memory = memory
-	engine.Events = rt.events
 	engine.Execution = execCtx
 	engine.Tools = rt.tools
 	engine.Checkpoints = checkpointProv
@@ -69,7 +67,6 @@ func newModeEngineWithDB(provider ab.LLMProvider, model string, logContext Runti
 	subEngine := ab.New(
 		ab.WithLLM(provider),
 		ab.WithToolRegistry(rt.buildSubagentToolRegistry()),
-		ab.WithEventBus(rt.events),
 	)
 	rt.subagentEngine = subEngine
 
