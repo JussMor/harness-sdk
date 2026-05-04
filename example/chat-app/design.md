@@ -153,7 +153,7 @@ El frontend esta disenado para una experiencia de chat en tiempo real conectada 
 ## Restricciones tecnicas
 
 - todos los archivos nuevos/modificados de esta iteracion estan por debajo de 500 lineas
-- integracion backend via `VITE_BACKEND_URL` (fallback `http://localhost:8080`)
+- integracion backend via `VITE_BACKEND_URL` (fallback `http://localhost:9090`)
 
 ## Notas para evolucion
 
