@@ -82,12 +82,32 @@ type Chat struct {
 }
 
 type Message struct {
-	ID        int64     `json:"id"`
-	ChatID    int64     `json:"chatId"`
-	Role      string    `json:"role"`
-	Content   string    `json:"content"`
-	Model     string    `json:"model"`
-	CreatedAt time.Time `json:"createdAt"`
+	ID        int64            `json:"id"`
+	ChatID    int64            `json:"chatId"`
+	Role      string           `json:"role"`
+	Content   string           `json:"content"`
+	Model     string           `json:"model"`
+	Metadata  *MessageMetadata `json:"metadata,omitempty"`
+	CreatedAt time.Time        `json:"createdAt"`
+}
+
+// MessageMetadata stores tool calls and artifacts for persistence.
+type MessageMetadata struct {
+	ToolCalls []MetadataToolCall `json:"toolCalls,omitempty"`
+	Artifacts []MetadataArtifact `json:"artifacts,omitempty"`
+}
+
+type MetadataToolCall struct {
+	Name   string `json:"name"`
+	Args   any    `json:"args,omitempty"`
+	Result string `json:"result,omitempty"`
+	Error  bool   `json:"error,omitempty"`
+}
+
+type MetadataArtifact struct {
+	Path     string `json:"path"`
+	Language string `json:"language"`
+	Content  string `json:"content"`
 }
 
 func (a *BackendChatApp) handleHealth(w http.ResponseWriter, _ *http.Request) {
@@ -140,6 +160,46 @@ func parseSandboxOutput(content string) map[string]any {
 		}
 	}
 	return nil
+}
+
+// inferLangFromPath returns the language for an artifact based on file extension.
+func inferLangFromPath(path string) string {
+	ext := filepath.Ext(path)
+	if len(ext) > 0 {
+		ext = ext[1:] // strip leading dot
+	}
+	switch strings.ToLower(ext) {
+	case "html", "htm":
+		return "html"
+	case "md", "markdown":
+		return "markdown"
+	case "css":
+		return "css"
+	case "js":
+		return "javascript"
+	case "ts":
+		return "typescript"
+	case "jsx":
+		return "jsx"
+	case "tsx":
+		return "tsx"
+	case "py":
+		return "python"
+	case "json":
+		return "json"
+	case "yaml", "yml":
+		return "yaml"
+	case "go":
+		return "go"
+	case "svg":
+		return "svg"
+	case "sql":
+		return "sql"
+	case "sh", "bash":
+		return "bash"
+	default:
+		return "text"
+	}
 }
 
 func (a *BackendChatApp) handleProviders(w http.ResponseWriter, r *http.Request) {
@@ -427,6 +487,8 @@ func (a *BackendChatApp) handleStream(w http.ResponseWriter, r *http.Request, ch
 	}
 
 	var fullResponse strings.Builder
+	var streamMeta MessageMetadata
+	var lastToolCall string // track last tool_call name for pairing with result
 	for {
 		select {
 		case <-ctx.Done():
@@ -444,11 +506,39 @@ func (a *BackendChatApp) handleStream(w http.ResponseWriter, r *http.Request, ch
 
 		case ab.StreamEventToolCall:
 			if ev.ToolCall != nil {
+				// Parse args JSON string into object so frontend receives structured data
+				var parsedArgs any
+				if json.Unmarshal([]byte(ev.ToolCall.Arguments), &parsedArgs) != nil {
+					parsedArgs = ev.ToolCall.Arguments // fallback to raw string
+				}
 				d, _ := json.Marshal(map[string]any{
 					"name": ev.ToolCall.Name,
-					"args": ev.ToolCall.Arguments,
+					"args": parsedArgs,
 				})
 				sseWrite("tool_call", string(d))
+
+				lastToolCall = ev.ToolCall.Name
+
+				// Collect file_write as artifact
+				if ev.ToolCall.Name == "file_write" {
+					var fileArgs struct {
+						Path    string `json:"path"`
+						Content string `json:"content"`
+					}
+					if json.Unmarshal([]byte(ev.ToolCall.Arguments), &fileArgs) == nil && fileArgs.Content != "" {
+						streamMeta.Artifacts = append(streamMeta.Artifacts, MetadataArtifact{
+							Path:     fileArgs.Path,
+							Language: inferLangFromPath(fileArgs.Path),
+							Content:  fileArgs.Content,
+						})
+					}
+				}
+
+				// Track tool call in metadata
+				streamMeta.ToolCalls = append(streamMeta.ToolCalls, MetadataToolCall{
+					Name: ev.ToolCall.Name,
+					Args: parsedArgs,
+				})
 			}
 
 		case ab.StreamEventToolResult:
@@ -460,9 +550,17 @@ func (a *BackendChatApp) handleStream(w http.ResponseWriter, r *http.Request, ch
 				})
 				sseWrite("tool_result", string(d))
 
+				// Pair result with last matching tool call in metadata
+				for i := len(streamMeta.ToolCalls) - 1; i >= 0; i-- {
+					if streamMeta.ToolCalls[i].Name == ev.ToolResult.Name && streamMeta.ToolCalls[i].Result == "" {
+						streamMeta.ToolCalls[i].Result = ev.ToolResult.Content
+						streamMeta.ToolCalls[i].Error = ev.ToolResult.Error != nil
+						break
+					}
+				}
+				_ = lastToolCall // used above
+
 				// For sandbox tools, emit structured sandbox_output event
-				// so the frontend can render rich outputs (charts, images, HTML)
-				// in the artifact canvas rather than raw text.
 				if isSandboxOutput(ev.ToolResult.Name) {
 					if sbData := parseSandboxOutput(ev.ToolResult.Content); sbData != nil {
 						sbJSON, _ := json.Marshal(sbData)
@@ -472,8 +570,12 @@ func (a *BackendChatApp) handleStream(w http.ResponseWriter, r *http.Request, ch
 			}
 
 		case ab.StreamEventDone:
-			// Persist assistant message
-			assistantMsg, _ := InsertMessage(ctx, a.db, chatID, "assistant", fullResponse.String(), effectiveModel)
+			// Persist assistant message with metadata
+			var metaOpt []MessageMetadata
+			if len(streamMeta.ToolCalls) > 0 || len(streamMeta.Artifacts) > 0 {
+				metaOpt = []MessageMetadata{streamMeta}
+			}
+			assistantMsg, _ := InsertMessage(ctx, a.db, chatID, "assistant", fullResponse.String(), effectiveModel, metaOpt...)
 			_ = a.pub.PublishChatMessage(ctx, chatID, assistantMsg)
 			d, _ := json.Marshal(map[string]any{"runId": runID, "messageId": assistantMsg.ID})
 			sseWrite("done", string(d))

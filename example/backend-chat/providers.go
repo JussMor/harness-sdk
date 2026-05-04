@@ -55,13 +55,19 @@ CREATE TABLE IF NOT EXISTS messages (
   role TEXT NOT NULL,
   content TEXT NOT NULL,
   model TEXT NOT NULL,
+  metadata TEXT NOT NULL DEFAULT '{}',
   created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
   FOREIGN KEY(chat_id) REFERENCES chats(id) ON DELETE CASCADE
 );
 CREATE INDEX IF NOT EXISTS idx_messages_chat_id ON messages(chat_id, id);
 `
 	_, err := db.ExecContext(ctx, schema)
-	return err
+	if err != nil {
+		return err
+	}
+	// Migrate: add metadata column if missing (for existing databases)
+	_, _ = db.ExecContext(ctx, `ALTER TABLE messages ADD COLUMN metadata TEXT NOT NULL DEFAULT '{}'`)
+	return nil
 }
 
 func CreateChat(ctx context.Context, db *sql.DB, title string) (Chat, error) {
@@ -91,14 +97,20 @@ func ListChats(ctx context.Context, db *sql.DB) ([]Chat, error) {
 	return items, rows.Err()
 }
 
-func InsertMessage(ctx context.Context, db *sql.DB, chatID int64, role, content, model string) (Message, error) {
+func InsertMessage(ctx context.Context, db *sql.DB, chatID int64, role, content, model string, opts ...MessageMetadata) (Message, error) {
 	if role == "" {
 		role = "user"
 	}
 	if model == "" {
 		model = "unknown"
 	}
-	res, err := db.ExecContext(ctx, `INSERT INTO messages(chat_id, role, content, model) VALUES(?,?,?,?)`, chatID, role, content, model)
+	metadata := "{}"
+	if len(opts) > 0 {
+		if raw, err := json.Marshal(opts[0]); err == nil {
+			metadata = string(raw)
+		}
+	}
+	res, err := db.ExecContext(ctx, `INSERT INTO messages(chat_id, role, content, model, metadata) VALUES(?,?,?,?,?)`, chatID, role, content, model, metadata)
 	if err != nil {
 		return Message{}, err
 	}
@@ -108,7 +120,7 @@ func InsertMessage(ctx context.Context, db *sql.DB, chatID int64, role, content,
 }
 
 func ListMessages(ctx context.Context, db *sql.DB, chatID int64) ([]Message, error) {
-	rows, err := db.QueryContext(ctx, `SELECT id, chat_id, role, content, model, created_at FROM messages WHERE chat_id = ? ORDER BY id ASC`, chatID)
+	rows, err := db.QueryContext(ctx, `SELECT id, chat_id, role, content, model, COALESCE(metadata, '{}'), created_at FROM messages WHERE chat_id = ? ORDER BY id ASC`, chatID)
 	if err != nil {
 		return nil, err
 	}
@@ -117,9 +129,11 @@ func ListMessages(ctx context.Context, db *sql.DB, chatID int64) ([]Message, err
 	items := make([]Message, 0)
 	for rows.Next() {
 		var m Message
-		if err := rows.Scan(&m.ID, &m.ChatID, &m.Role, &m.Content, &m.Model, &m.CreatedAt); err != nil {
+		var metaRaw string
+		if err := rows.Scan(&m.ID, &m.ChatID, &m.Role, &m.Content, &m.Model, &metaRaw, &m.CreatedAt); err != nil {
 			return nil, err
 		}
+		_ = json.Unmarshal([]byte(metaRaw), &m.Metadata)
 		items = append(items, m)
 	}
 	return items, rows.Err()
@@ -134,8 +148,10 @@ func getChat(ctx context.Context, db *sql.DB, id int64) (Chat, error) {
 
 func getMessage(ctx context.Context, db *sql.DB, id int64) (Message, error) {
 	var m Message
-	err := db.QueryRowContext(ctx, `SELECT id, chat_id, role, content, model, created_at FROM messages WHERE id = ?`, id).
-		Scan(&m.ID, &m.ChatID, &m.Role, &m.Content, &m.Model, &m.CreatedAt)
+	var metaRaw string
+	err := db.QueryRowContext(ctx, `SELECT id, chat_id, role, content, model, COALESCE(metadata, '{}'), created_at FROM messages WHERE id = ?`, id).
+		Scan(&m.ID, &m.ChatID, &m.Role, &m.Content, &m.Model, &metaRaw, &m.CreatedAt)
+	_ = json.Unmarshal([]byte(metaRaw), &m.Metadata)
 	return m, err
 }
 
