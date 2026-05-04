@@ -32,6 +32,9 @@ func main() {
 	if err := EnsureSchema(ctx, db); err != nil {
 		log.Fatalf("ensure schema: %v", err)
 	}
+	if err := EnsureConversationSchema(ctx, db); err != nil {
+		log.Fatalf("ensure conversation schema: %v", err)
+	}
 
 	app := &BackendChatApp{
 		db:        db,
@@ -334,6 +337,10 @@ func (a *BackendChatApp) handleRun(w http.ResponseWriter, r *http.Request, chatI
 	logContext := RuntimeLogContext{ChatID: chatID, RunID: runID, Mode: strings.TrimSpace(req.Mode)}
 	log.Printf("run.start chat_id=%d run_id=%s mode=%s model=%s history_messages=%d prompt=%q", chatID, runID, firstNonEmpty(logContext.Mode, "balanced"), effectiveModel, len(history), previewText(req.Prompt, 160))
 
+	// Attach tracer to context for structured span tracking
+	tracer := ab.NewTracer()
+	ctx = ab.WithTracer(ctx, tracer)
+
 	publishRunner := func(summary RunnerSummary) {
 		a.runnerHub.Publish(RunnerEvent{
 			Type:      "runner.update",
@@ -397,7 +404,7 @@ func (a *BackendChatApp) handleRun(w http.ResponseWriter, r *http.Request, chatI
 		publishRunner(summary)
 	}
 
-	assistant := GenerateAssistantReply(ctx, a.llm, toAgentMessages(history), req.Mode, effectiveModel, logContext, emitRunnerEvent, publishTrace)
+	assistant := GenerateAssistantReply(ctx, a.llm, toAgentMessages(history), req.Mode, effectiveModel, logContext, emitRunnerEvent, publishTrace, a.db)
 	for _, summary := range assistant.Runners {
 		publishRunner(summary)
 	}
@@ -412,6 +419,7 @@ func (a *BackendChatApp) handleRun(w http.ResponseWriter, r *http.Request, chatI
 		"id":        assistantMsg.ID,
 		"chatId":    assistantMsg.ChatID,
 		"runId":     runID,
+		"traceId":   string(tracer.TraceID()),
 		"role":      assistantMsg.Role,
 		"content":   assistantMsg.Content,
 		"model":     assistantMsg.Model,
@@ -456,29 +464,6 @@ func firstNonEmpty(values ...string) string {
 		}
 	}
 	return ""
-}
-
-func toAgentMessages(messages []Message) []ab.ChatMessage {
-	out := make([]ab.ChatMessage, 0, len(messages))
-	for _, msg := range messages {
-		content := strings.TrimSpace(msg.Content)
-		if content == "" {
-			continue
-		}
-
-		role := ab.RoleUser
-		switch strings.ToLower(strings.TrimSpace(msg.Role)) {
-		case "assistant":
-			role = ab.RoleAssistant
-		case "tool":
-			role = ab.RoleTool
-		case "system":
-			role = ab.RoleSystem
-		}
-
-		out = append(out, ab.ChatMessage{Role: role, Content: content})
-	}
-	return out
 }
 
 func withCORS(next http.Handler) http.Handler {

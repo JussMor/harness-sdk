@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -57,6 +58,7 @@ func GenerateAssistantReply(
 	logContext RuntimeLogContext,
 	onRuntimeEvent func(ab.Event),
 	onTrace func(TraceStep),
+	db *sql.DB,
 ) AssistantRunResult {
 	if len(messages) == 0 {
 		return AssistantRunResult{Content: "Necesito un prompt para responder."}
@@ -72,10 +74,10 @@ func GenerateAssistantReply(
 	}
 	logContext.Mode = requestedMode
 
-	result, err := runWithMode(ctx, provider, requestedMode, model, messages, logContext, onRuntimeEvent, onTrace)
+	result, err := runWithMode(ctx, provider, requestedMode, model, messages, logContext, onRuntimeEvent, onTrace, db)
 	if err != nil && requestedMode != "balanced" {
 		logContext.Mode = "balanced"
-		result, err = runWithMode(ctx, provider, "balanced", model, messages, logContext, onRuntimeEvent, onTrace)
+		result, err = runWithMode(ctx, provider, "balanced", model, messages, logContext, onRuntimeEvent, onTrace, db)
 	}
 	if err != nil {
 		return AssistantRunResult{Content: fmt.Sprintf("[%s] Error: %v", model, err)}
@@ -91,8 +93,9 @@ func runWithMode(
 	logContext RuntimeLogContext,
 	onRuntimeEvent func(ab.Event),
 	onTrace func(TraceStep),
+	db *sql.DB,
 ) (AssistantRunResult, error) {
-	_, agentRT, err := newModeEngine(provider, model, logContext)
+	_, agentRT, err := newModeEngineWithDB(provider, model, logContext, db)
 	if err != nil {
 		return AssistantRunResult{}, err
 	}
@@ -159,15 +162,12 @@ func runWithMode(
 		userMessage = planSummary + "\n\n" + userMessage
 	}
 
-	// Reconstruct conversation from history (all turns except last user)
-	conv := ab.NewConversation(fmt.Sprintf("chat-%d", logContext.ChatID))
-	for _, m := range messages[:len(messages)-1] {
-		switch m.Role {
-		case ab.RoleUser:
-			conv.AppendUser(m.Content)
-		case ab.RoleAssistant:
-			conv.AppendAssistant(m.Content)
-		}
+	// Load persisted conversation or create from history
+	// messagesFromAB converts []ab.ChatMessage → []Message for LoadOrCreateConversation
+	conv, err := LoadOrCreateConversation(ctx, agentRT.convStore, logContext.ChatID, abToMessages(messages))
+	if err != nil {
+		// Fallback: fresh conversation
+		conv = ab.NewConversation(ConversationID(logContext.ChatID))
 	}
 
 	rr, err := agentRT.runtime.Run(ctx, conv, userMessage)

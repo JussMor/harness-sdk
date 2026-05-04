@@ -36,6 +36,7 @@ type agentRuntime struct {
 	skills         ab.SkillProvider
 	memory         ab.MemoryProvider
 	checkpoints    *checkpointStore
+	convStore      ab.ConversationStore
 }
 
 // ── Tool registries ──────────────────────────────────────────────────────────
