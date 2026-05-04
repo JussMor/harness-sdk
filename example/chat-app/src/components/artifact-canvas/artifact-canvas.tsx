@@ -4,28 +4,33 @@ import {
   ChevronLeft,
   ChevronRight,
   Code,
+  Eye,
   FileText,
   Maximize2,
   Minimize2,
-  Pencil,
   X,
 } from "lucide-react"
-import { useCallback, useEffect, useRef, useState } from "react"
+import { lazy, Suspense, useCallback, useEffect, useRef, useState } from "react"
+
+// Lazy-load heavy editors to avoid bundle bloat
+const MDEditor = lazy(() => import("@uiw/react-md-editor"))
+const MDPreview = lazy(() =>
+  import("@uiw/react-md-editor").then((m) => ({ default: m.default.Markdown }))
+)
 
 export interface ArtifactCanvasProps {
-  /** The artifact to render (streaming or complete) */
   artifact: Artifact | null
-  /** Whether the stream is still producing content for this artifact */
   isStreaming: boolean
-  /** All persisted versions from the backend (may be empty during streaming) */
   versions?: ArtifactVersion[]
-  /** Called when user closes the canvas */
   onClose: () => void
-  /** Called when user saves a local edit — triggers a new version on the backend */
   onSaveVersion?: (artifactId: string, content: string) => Promise<void>
-  /** Backend API base URL — used by the storage bridge */
   apiBaseURL?: string
 }
+
+type ViewMode = "preview" | "edit" | "split"
+
+const isMarkdown = (lang: string) => lang === "md" || lang === "markdown"
+const isHtml = (lang: string) => lang === "html" || lang === "htm"
 
 export function ArtifactCanvas({
   artifact,
@@ -36,176 +41,143 @@ export function ArtifactCanvas({
   apiBaseURL = "",
 }: ArtifactCanvasProps) {
   const [isFullscreen, setIsFullscreen] = useState(false)
-  const [isEditing, setIsEditing] = useState(false)
-  const [editContent, setEditContent] = useState("")
   const [isSaving, setIsSaving] = useState(false)
-  // Which version index is shown (0 = oldest, versions.length-1 = newest)
   const [versionIndex, setVersionIndex] = useState<number | null>(null)
-  const contentRef = useRef<HTMLDivElement>(null)
-  const textareaRef = useRef<HTMLTextAreaElement>(null)
+  const [viewMode, setViewMode] = useState<ViewMode>("preview")
+  // Local edit buffer — only for non-streaming artifacts
+  const [editContent, setEditContent] = useState("")
+  const [isDirty, setIsDirty] = useState(false)
   const iframeRef = useRef<HTMLIFrameElement>(null)
+  const autosaveTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
 
-  // Auto-scroll during streaming
+  // Sync version index to latest when new versions arrive
   useEffect(() => {
-    if (isStreaming && contentRef.current) {
-      contentRef.current.scrollTop = contentRef.current.scrollHeight
-    }
-  }, [artifact?.content, isStreaming])
-
-  // When artifact completes and user hasn't started editing, sync edit content
-  useEffect(() => {
-    if (artifact?.complete && !isEditing) {
-      setEditContent(activeContent)
-    }
-  }, [artifact?.complete, artifact?.content, isEditing])
-
-  // Reset version index to latest when versions change
-  useEffect(() => {
-    if (versions.length > 0) {
-      setVersionIndex(versions.length - 1)
-    }
+    if (versions.length > 0) setVersionIndex(versions.length - 1)
   }, [versions.length])
 
-  // Storage bridge: handle postMessage from iframe artifacts
-  // Mirrors the window.storage API described in Claude's system prompt
+  // Sync edit buffer when artifact changes or version switches
+  useEffect(() => {
+    if (!isStreaming) {
+      setEditContent(activeContent)
+      setIsDirty(false)
+    }
+  }, [artifact?.id, versionIndex, isStreaming])
+
+  // Autosave 2s after last keystroke (markdown only)
+  const scheduleAutosave = useCallback(
+    (content: string) => {
+      if (!artifact?.id || !onSaveVersion) return
+      if (autosaveTimer.current) clearTimeout(autosaveTimer.current)
+      autosaveTimer.current = setTimeout(async () => {
+        setIsSaving(true)
+        try {
+          await onSaveVersion(artifact.id, content)
+          setIsDirty(false)
+        } finally {
+          setIsSaving(false)
+        }
+      }, 2000)
+    },
+    [artifact?.id, onSaveVersion]
+  )
+
+  const handleContentChange = useCallback(
+    (value: string | undefined) => {
+      const next = value ?? ""
+      setEditContent(next)
+      setIsDirty(true)
+      scheduleAutosave(next)
+    },
+    [scheduleAutosave]
+  )
+
+  // Storage bridge for HTML iframe artifacts
   useEffect(() => {
     if (!apiBaseURL || !artifact?.id) return
-
     const handleMessage = async (ev: MessageEvent) => {
       if (ev.source !== iframeRef.current?.contentWindow) return
       const { type, key, value, shared } = ev.data ?? {}
       if (!type || !key) return
-
-      const artifactId = artifact.id
-
+      const id = artifact.id
       try {
-        switch (type) {
-          case "storage:get": {
-            const r = await fetch(
-              `${apiBaseURL}/api/artifacts/${artifactId}/storage?shared=${shared ?? false}`
-            )
-            const body = await r.json()
-            const result = body.data?.[key] ?? null
-            ev.source?.postMessage({ type: "storage:get:result", key, value: result }, { targetOrigin: "*" })
-            break
-          }
-          case "storage:set": {
-            await fetch(`${apiBaseURL}/api/artifacts/${artifactId}/storage`, {
-              method: "POST",
-              headers: { "Content-Type": "application/json" },
-              body: JSON.stringify({ key, value, shared: shared ?? false }),
-            })
-            ev.source?.postMessage({ type: "storage:set:result", key, ok: true }, { targetOrigin: "*" })
-            break
-          }
-          case "storage:delete": {
-            const params = new URLSearchParams({ shared: String(shared ?? false) })
-            await fetch(`${apiBaseURL}/api/artifacts/${artifactId}/storage/${key}?${params}`, {
-              method: "DELETE",
-            })
-            ev.source?.postMessage({ type: "storage:delete:result", key, ok: true }, { targetOrigin: "*" })
-            break
-          }
-          case "storage:list": {
-            const r = await fetch(
-              `${apiBaseURL}/api/artifacts/${artifactId}/storage?shared=${shared ?? false}`
-            )
-            const body = await r.json()
-            const keys = Object.keys(body.data ?? {})
-            ev.source?.postMessage({ type: "storage:list:result", keys }, { targetOrigin: "*" })
-            break
-          }
+        if (type === "storage:get") {
+          const r = await fetch(`${apiBaseURL}/api/artifacts/${id}/storage?shared=${shared ?? false}`)
+          const body = await r.json()
+          ev.source?.postMessage({ type: "storage:get:result", key, value: body.data?.[key] ?? null }, { targetOrigin: "*" })
+        } else if (type === "storage:set") {
+          await fetch(`${apiBaseURL}/api/artifacts/${id}/storage`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ key, value, shared: shared ?? false }),
+          })
+          ev.source?.postMessage({ type: "storage:set:result", key, ok: true }, { targetOrigin: "*" })
+        } else if (type === "storage:delete") {
+          const params = new URLSearchParams({ shared: String(shared ?? false) })
+          await fetch(`${apiBaseURL}/api/artifacts/${id}/storage/${key}?${params}`, { method: "DELETE" })
+          ev.source?.postMessage({ type: "storage:delete:result", key, ok: true }, { targetOrigin: "*" })
         }
-      } catch (err) {
-        console.warn("storage bridge error", err)
+      } catch (e) {
+        console.warn("storage bridge error", e)
       }
     }
-
     window.addEventListener("message", handleMessage)
     return () => window.removeEventListener("message", handleMessage)
   }, [artifact?.id, apiBaseURL])
 
-  const handleStartEditing = useCallback(() => {
-    if (!artifact || isStreaming) return
-    setEditContent(activeContent)
-    setIsEditing(true)
-    setTimeout(() => textareaRef.current?.focus(), 0)
-  }, [artifact, isStreaming])
-
-  const handleSaveEdit = useCallback(async () => {
-    if (!artifact) return
-    setIsSaving(true)
-    try {
-      await onSaveVersion?.(artifact.id, editContent)
-    } finally {
-      setIsSaving(false)
-    }
-    setIsEditing(false)
-  }, [artifact, editContent, onSaveVersion])
-
-  const handleCancelEdit = useCallback(() => {
-    setIsEditing(false)
-    setEditContent(activeContent)
-  }, [artifact])
-
   if (!artifact) return null
 
-  // Determine which content to display: backend version or streaming content
   const currentVersion = versionIndex !== null ? versions[versionIndex] : null
   const activeContent = currentVersion?.content ?? artifact.content ?? ""
   const totalVersions = versions.length || (artifact.complete ? 1 : 0)
   const displayVersionNum = versionIndex !== null ? versionIndex + 1 : totalVersions
-
+  const isMd = isMarkdown(artifact.language)
+  const isHtmlArt = isHtml(artifact.language)
   const title = artifact.title || `${artifact.language} artifact`
-  const langIcon = getLanguageIcon(artifact.language)
-  const showPreview = artifact.language === "html" && !isEditing
 
   return (
     <aside className={`artifact-canvas ${isFullscreen ? "artifact-canvas--fullscreen" : ""}`}>
+
       {/* Header */}
       <header className="artifact-canvas__header">
         <div className="artifact-canvas__title">
-          {langIcon}
+          {isMd ? <FileText size={14} /> : <Code size={14} />}
           <span>{title}</span>
-          {isStreaming && (
-            <span className="artifact-canvas__streaming-badge">streaming…</span>
-          )}
-          {artifact.complete && !isStreaming && (
-            <span className="artifact-canvas__complete-badge">complete</span>
-          )}
+          {isStreaming && <span className="artifact-canvas__streaming-badge">streaming…</span>}
+          {isDirty && !isSaving && <span className="artifact-canvas__dirty-badge">unsaved</span>}
+          {isSaving && <span className="artifact-canvas__saving-badge">saving…</span>}
         </div>
 
         <div className="artifact-canvas__actions">
-          {artifact.complete && !isStreaming && !isEditing && (
-            <button
-              type="button"
-              className="artifact-canvas__btn"
-              onClick={handleStartEditing}
-              title="Edit"
-            >
-              <Pencil size={14} />
-            </button>
-          )}
-          {isEditing && (
-            <>
+          {/* View mode toggle — only for markdown */}
+          {isMd && artifact.complete && !isStreaming && (
+            <div className="artifact-canvas__view-toggle">
               <button
                 type="button"
-                className={`artifact-canvas__btn artifact-canvas__btn--save ${isSaving ? "artifact-canvas__btn--loading" : ""}`}
-                onClick={handleSaveEdit}
-                disabled={isSaving}
+                className={`artifact-canvas__toggle-btn ${viewMode === "preview" ? "artifact-canvas__toggle-btn--active" : ""}`}
+                onClick={() => setViewMode("preview")}
+                title="Preview"
               >
-                {isSaving ? "Saving…" : "Save"}
+                <Eye size={13} />
               </button>
               <button
                 type="button"
-                className="artifact-canvas__btn"
-                onClick={handleCancelEdit}
-                disabled={isSaving}
+                className={`artifact-canvas__toggle-btn ${viewMode === "split" ? "artifact-canvas__toggle-btn--active" : ""}`}
+                onClick={() => setViewMode("split")}
+                title="Split view"
               >
-                Cancel
+                <span style={{ fontSize: 10, fontWeight: 600 }}>½</span>
               </button>
-            </>
+              <button
+                type="button"
+                className={`artifact-canvas__toggle-btn ${viewMode === "edit" ? "artifact-canvas__toggle-btn--active" : ""}`}
+                onClick={() => setViewMode("edit")}
+                title="Edit source"
+              >
+                <Code size={13} />
+              </button>
+            </div>
           )}
+
           <button
             type="button"
             className="artifact-canvas__btn"
@@ -225,22 +197,19 @@ export function ArtifactCanvas({
         </div>
       </header>
 
-      {/* Language + version bar */}
+      {/* Lang + version bar */}
       <div className="artifact-canvas__lang-bar">
         <span className="artifact-canvas__lang-badge">{artifact.language}</span>
         {activeContent && (
           <span className="artifact-canvas__size">{activeContent.length} chars</span>
         )}
-
-        {/* Version navigator */}
-        {totalVersions > 1 && !isEditing && (
+        {totalVersions > 1 && (
           <div className="artifact-canvas__versions">
             <button
               type="button"
               className="artifact-canvas__version-btn"
               disabled={displayVersionNum <= 1}
               onClick={() => setVersionIndex((i) => Math.max(0, (i ?? versions.length - 1) - 1))}
-              title="Previous version"
             >
               <ChevronLeft size={12} />
             </button>
@@ -251,10 +220,7 @@ export function ArtifactCanvas({
               type="button"
               className="artifact-canvas__version-btn"
               disabled={displayVersionNum >= totalVersions}
-              onClick={() =>
-                setVersionIndex((i) => Math.min(versions.length - 1, (i ?? 0) + 1))
-              }
-              title="Next version"
+              onClick={() => setVersionIndex((i) => Math.min(versions.length - 1, (i ?? 0) + 1))}
             >
               <ChevronRight size={12} />
             </button>
@@ -262,22 +228,50 @@ export function ArtifactCanvas({
         )}
       </div>
 
-      {/* Content area */}
-      <div className="artifact-canvas__content" ref={contentRef}>
-        {isEditing ? (
-          <textarea
-            ref={textareaRef}
-            className="artifact-canvas__editor"
-            value={editContent}
-            onChange={(e) => setEditContent(e.target.value)}
-            spellCheck={false}
-          />
-        ) : showPreview ? (
+      {/* Content */}
+      <div className="artifact-canvas__content">
+        {isStreaming ? (
+          // During streaming always show raw text with cursor
+          <pre className="artifact-canvas__pre">
+            <code>{activeContent || " "}</code>
+            <span className="artifact-canvas__cursor">▊</span>
+          </pre>
+        ) : isMd ? (
+          // Markdown: WYSIWYG editor or preview depending on mode
+          <Suspense fallback={<div className="artifact-canvas__loading">Loading editor…</div>}>
+            {viewMode === "preview" && (
+              <div className="artifact-canvas__md-preview" data-color-mode="light">
+                <MDPreview source={editContent || activeContent} />
+              </div>
+            )}
+            {viewMode === "edit" && (
+              <div data-color-mode="light" className="artifact-canvas__md-editor">
+                <MDEditor
+                  value={editContent}
+                  onChange={handleContentChange}
+                  preview="edit"
+                  hideToolbar={false}
+                  height="100%"
+                />
+              </div>
+            )}
+            {viewMode === "split" && (
+              <div data-color-mode="light" className="artifact-canvas__md-editor">
+                <MDEditor
+                  value={editContent}
+                  onChange={handleContentChange}
+                  preview="live"
+                  hideToolbar={false}
+                  height="100%"
+                />
+              </div>
+            )}
+          </Suspense>
+        ) : isHtmlArt ? (
           <HtmlPreview ref={iframeRef} content={activeContent} artifactId={artifact.id} />
         ) : (
           <pre className="artifact-canvas__pre">
             <code>{activeContent || " "}</code>
-            {isStreaming && <span className="artifact-canvas__cursor">▊</span>}
           </pre>
         )}
       </div>
@@ -285,7 +279,7 @@ export function ArtifactCanvas({
   )
 }
 
-// ── HTML Preview (sandboxed iframe) ───────────────────────────────────────────
+// ── HTML Preview ──────────────────────────────────────────────────────────────
 
 interface HtmlPreviewProps {
   content: string
@@ -294,64 +288,35 @@ interface HtmlPreviewProps {
 }
 
 function HtmlPreview({ content, artifactId, ref }: HtmlPreviewProps) {
-  // Inject the storage bridge client script into the HTML so artifacts
-  // can call window.storage.get/set/delete/list from inside the iframe.
-  const bridgedContent = injectStorageBridge(content, artifactId)
+  const bridge = `<script>(function(){function req(t,k,v,s){return new Promise(function(res,rej){var id=Math.random().toString(36).slice(2);function h(e){if(!e.data||e.data._id!==id)return;window.removeEventListener('message',h);e.data.ok===false?rej(new Error(e.data.error||'err')):res(e.data.value!==undefined?e.data.value:e.data);}window.addEventListener('message',h);window.parent.postMessage({type:t,key:k,value:v,shared:s,_id:id,artifactId:'${artifactId}'},'*');});}window.storage={get:function(k,s){return req('storage:get',k,undefined,s);},set:function(k,v,s){return req('storage:set',k,v,s);},delete:function(k,s){return req('storage:delete',k,undefined,s);},list:function(s){return req('storage:list','*',undefined,s).then(function(r){return r.keys||[];});}};})();</script>`
+
+  const html = content.includes("<head>")
+    ? content.replace("<head>", `<head>${bridge}`)
+    : bridge + content
+
   return (
     <iframe
       ref={ref}
       className="artifact-canvas__iframe"
-      srcDoc={bridgedContent}
+      srcDoc={html}
       sandbox="allow-scripts allow-same-origin"
       title="HTML Preview"
     />
   )
 }
 
-// Injects a tiny script that translates window.storage API calls
-// into postMessage calls to the parent (chat-app), which forwards
-// them to the backend storage endpoint.
-function injectStorageBridge(html: string, artifactId: string): string {
-  const bridge = `
-<script>
-(function() {
-  function req(type, key, value, shared) {
-    return new Promise(function(resolve, reject) {
-      var id = Math.random().toString(36).slice(2);
-      function handler(ev) {
-        if (!ev.data || ev.data._id !== id) return;
-        window.removeEventListener('message', handler);
-        if (ev.data.ok === false) reject(new Error(ev.data.error || 'storage error'));
-        else resolve(ev.data.value !== undefined ? ev.data.value : ev.data);
-      }
-      window.addEventListener('message', handler);
-      window.parent.postMessage({ type: type, key: key, value: value, shared: shared, _id: id, artifactId: '${artifactId}' }, '*');
-    });
-  }
-  window.storage = {
-    get: function(key, shared) { return req('storage:get', key, undefined, shared); },
-    set: function(key, value, shared) { return req('storage:set', key, value, shared); },
-    delete: function(key, shared) { return req('storage:delete', key, undefined, shared); },
-    list: function(shared) { return req('storage:list', '*', undefined, shared).then(function(r) { return r.keys || []; }); },
-  };
-})();
-</script>`
-
-  // Inject after <head> or at the start
-  if (html.includes("<head>")) {
-    return html.replace("<head>", "<head>" + bridge)
-  }
-  return bridge + html
+export interface ArtifactCanvasProps {
+  /** The artifact to render (streaming or complete) */
+  artifact: Artifact | null
+  /** Whether the stream is still producing content for this artifact */
+  isStreaming: boolean
+  /** All persisted versions from the backend (may be empty during streaming) */
+  versions?: ArtifactVersion[]
+  /** Called when user closes the canvas */
+  onClose: () => void
+  /** Called when user saves a local edit — triggers a new version on the backend */
+  onSaveVersion?: (artifactId: string, content: string) => Promise<void>
+  /** Backend API base URL — used by the storage bridge */
+  apiBaseURL?: string
 }
 
-// ── Helpers ───────────────────────────────────────────────────────────────────
-
-function getLanguageIcon(language: string) {
-  switch (language) {
-    case "markdown":
-    case "md":
-      return <FileText size={14} />
-    default:
-      return <Code size={14} />
-  }
-}

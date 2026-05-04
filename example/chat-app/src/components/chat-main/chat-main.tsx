@@ -693,7 +693,8 @@ export function ChatMain({
             setActiveArtifact(null)
             setIsArtifactStreaming(false)
           }}
-          onContentChange={(artifactId, newContent) => {
+          onSaveVersion={async (artifactId, newContent) => {
+            // Update local state immediately
             setAllArtifacts((prev) =>
               prev.map((a) =>
                 a.id === artifactId ? { ...a, content: newContent } : a
