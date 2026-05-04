@@ -106,6 +106,13 @@ func (d *OpenSandboxDriver) Create(ctx context.Context, cfg autobuild.SandboxCon
 		opts.Image = cfg.Image
 	}
 
+	// TODO: Configure volumes (Docker named volumes / PVCs) when opensandbox.CodeInterpreterCreateOptions
+	// supports Volume fields. See: https://github.com/alibaba/OpenSandbox/tree/main/examples/docker-pvc-volume-mount
+	// For now, volumes will be passed through future SDK updates:
+	// if len(cfg.Volumes) > 0 {
+	//     opts.Volumes = toOpenSandboxVolumes(cfg.Volumes)
+	// }
+
 	ci, err := opensandbox.CreateCodeInterpreter(ctx, d.conn, opts)
 	if err != nil {
 		return "", fmt.Errorf("opensandbox create: %w", err)
@@ -164,32 +171,23 @@ func (d *OpenSandboxDriver) ExecCode(ctx context.Context, sandboxID, language, c
 }
 
 // WriteFile uploads content to a path inside the sandbox.
-// Uploads to a temp name then moves to the target path via mv.
+// The target path is set directly via FileMetadata.Path.
 func (d *OpenSandboxDriver) WriteFile(ctx context.Context, sandboxID, path, content string) error {
 	ci, err := d.resolve(ctx, sandboxID)
 	if err != nil {
 		return err
 	}
-	// UploadFile uploads to the sandbox's upload directory.
-	// We use the filename from path, then move it to the correct location.
 	parts := strings.Split(strings.TrimRight(path, "/"), "/")
 	filename := parts[len(parts)-1]
 
 	err = ci.Sandbox.UploadFile(ctx, strings.NewReader(content), opensandbox.UploadFileOptions{
 		FileName: filename,
+		Metadata: opensandbox.FileMetadata{
+			Path: path,
+		},
 	})
 	if err != nil {
 		return fmt.Errorf("opensandbox upload %s: %w", path, err)
-	}
-
-	// Move from upload dir to target path
-	if len(parts) > 1 {
-		dir := strings.Join(parts[:len(parts)-1], "/")
-		mvCmd := fmt.Sprintf("mkdir -p %q && mv %q %q", dir, "/uploads/"+filename, path)
-		_, execErr := ci.Sandbox.RunCommand(ctx, mvCmd, nil)
-		if execErr != nil {
-			return fmt.Errorf("opensandbox move to %s: %w", path, execErr)
-		}
 	}
 	return nil
 }
@@ -303,6 +301,36 @@ func mapSandboxState(state opensandbox.SandboxState) autobuild.SandboxStatus {
 	default:
 		return autobuild.SandboxStatusUnknown
 	}
+}
+
+// toOpenSandboxVolumes converts from autobuild.Volume to opensandbox.Volume.
+// This enables Docker named volumes (PVC backend) and Kubernetes PersistentVolumeClaims.
+// 
+// Currently unused pending opensandbox.CodeInterpreterCreateOptions volume support.
+// When available, volumes will be passed during sandbox creation:
+//
+//	if len(cfg.Volumes) > 0 {
+//	    opts.Volumes = toOpenSandboxVolumes(cfg.Volumes)
+//	}
+//
+// See: https://github.com/alibaba/OpenSandbox/tree/main/examples/docker-pvc-volume-mount
+func toOpenSandboxVolumes(volumes []autobuild.Volume) []opensandbox.Volume {
+	result := make([]opensandbox.Volume, len(volumes))
+	for i, v := range volumes {
+		osVol := opensandbox.Volume{
+			Name:      v.Name,
+			MountPath: v.MountPath,
+			ReadOnly:  v.ReadOnly,
+			SubPath:   v.SubPath,
+		}
+		if v.PVC != nil {
+			osVol.PVC = &opensandbox.PVC{
+				ClaimName: v.PVC.ClaimName,
+			}
+		}
+		result[i] = osVol
+	}
+	return result
 }
 
 var _ autobuild.SandboxDriver = (*OpenSandboxDriver)(nil)

@@ -10,7 +10,7 @@ export const Route = createFileRoute("/")({
 })
 
 const backendBaseURL =
-  import.meta.env.VITE_BACKEND_URL?.trim() || "http://localhost:8080"
+  import.meta.env.VITE_BACKEND_URL?.trim() || "http://localhost:9090"
 
 function IndexRoute() {
   const api = useMemo(() => new ChatAPI(backendBaseURL), [])

@@ -52,7 +52,7 @@ const fallbackModes: Array<ChatMode> = [
 export function ChatMain({
   userName = "Operator",
   showGreeting = true,
-  backendBaseURL = "http://localhost:8080",
+  backendBaseURL = "http://localhost:9090",
   activeChatID,
   onChatCreated,
   onChatsChanged,

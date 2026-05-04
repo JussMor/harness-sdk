@@ -21,7 +21,7 @@ func main() {
 
 	ctx := context.Background()
 	dbPath := getenv("BACKEND_CHAT_DB", "example/backend-chat/chat.db")
-	addr := getenv("BACKEND_CHAT_ADDR", ":8080")
+	addr := getenv("BACKEND_CHAT_ADDR", ":9090")
 
 	db, err := OpenSQLite(dbPath)
 	if err != nil {
