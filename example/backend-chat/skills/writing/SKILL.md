@@ -1,7 +1,7 @@
 ---
 name: writing
-version: 1.0.0
-description: Professional writing and document creation. Use BLUF-first structure, prose over bullets for arguments, and clear section hierarchy.
+version: 1.1.0
+description: Professional writing and document creation. BLUF-first structure, prose over bullets for arguments, clear hierarchy. Use for memos, reports, articles, and long-form content.
 category: documents
 triggers:
   - writing
@@ -12,30 +12,58 @@ triggers:
   - prose
   - article
   - memo
+  - redactar
+  - documento
+  - informe
+  - artículo
 author: obvious-team
 created: 2026-03-15
+updated: 2026-05-04
 ---
 
 # Writing Skill
 
-## When to Use
+## When to use
 
-- User asks for document creation, editing, or rewriting.
-- The task involves long-form prose, memos, reports, or articles.
-- A deliverable must be professional, clear, and structured.
+Load this skill when:
+- User asks to write, draft, rewrite, or edit a document
+- The output is long-form prose (memo, report, article, proposal)
+- The writing needs to be professional and structured
 
-## Non-Negotiables
+## Core principles
 
-1. **BLUF first.** Every document starts with the Bottom Line Up Front — the answer, recommendation, or summary before supporting detail.
-2. **Prose over bullets for arguments.** Bullet lists are for reference sections, not for building an argument.
-3. **Section hierarchy.** Use H2 for major sections, H3 for subsections. Never skip heading levels.
-4. **Active voice.** Prefer "the system validates tokens" over "tokens are validated by the system."
-5. **One idea per paragraph.** If a paragraph exceeds 5 sentences, split it.
+**1. BLUF first.** Every document starts with the Bottom Line Up Front — the answer, recommendation, or key finding. Supporting detail follows.
 
-## Quality Bar
+**2. Prose for arguments, bullets for reference.** Build arguments in paragraphs. Use lists for steps, options, or items the reader will scan back to.
 
-- [ ] BLUF is present in the first paragraph
-- [ ] No orphan headings (heading followed immediately by another heading)
+**3. One idea per paragraph.** If a paragraph exceeds 5 sentences, split it.
+
+**4. Active voice.** "The system validates tokens" not "tokens are validated by the system."
+
+**5. No filler.** Cut: "in order to", "it should be noted that", "as previously mentioned", "needless to say."
+
+## Document structure
+
+```
+[BLUF — answer or recommendation in 1-2 sentences]
+
+## Background / Context
+[Why this document exists]
+
+## [Main sections — H2 for major, H3 for sub]
+
+## Conclusion / Next steps
+[What the reader should do or decide]
+```
+
+## Quality bar
+
+- [ ] First paragraph contains the BLUF
+- [ ] No heading is immediately followed by another heading
 - [ ] Consistent tense throughout
 - [ ] Acronyms defined on first use
-- [ ] No filler phrases ("in order to", "it should be noted that")
+- [ ] No orphan bullets (single-item lists → prose instead)
+
+## Using document-operations
+
+To save the document as a file, use the `document-operations` tool with `action: write` and the relative file path. Use `.md` for markdown, `.txt` for plain text.

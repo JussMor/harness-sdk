@@ -1,69 +1,73 @@
 ---
 name: execution-planning
-version: 1.0.0
-description: Turn an approved spec into an execution plan with features, executables, planned commits, dependency DAGs, sequencing, parallelization, and visibility for implementation.
-category: autobuild
+version: 1.1.0
+description: Break down a multi-step task into an execution plan with dependencies, sequencing, and parallelization. Use when the task has 3+ executables or unclear ordering.
+category: planning
 triggers:
   - execution planning
-  - autobuild plan
   - implementation plan
   - dependency dag
-  - planned commits
-  - sequencing
-  - parallelization
   - break down the work
-  - how we will execute
+  - how to sequence
+  - parallelization
+  - plan the work
+  - planificar
+  - plan de ejecución
 author: obvious-team
 created: 2026-04-06
+updated: 2026-05-04
 ---
 
 # Execution Planning Skill
 
-## When to Use
+## When to use
 
-- The orchestrator needs to convert an approved spec into a plan.
-- Work has multiple executables, dependencies, or PRs.
-- The user asks how work will be sequenced, parallelized, or tracked.
-- A plan needs to show commit lists, dependency DAGs, or what can run in parallel.
+Load this skill when:
+- A task has 3 or more distinct steps that need ordering
+- The user asks how to sequence or parallelize work
+- Dependencies between steps need to be made explicit
+- You need to identify what can run in parallel vs what must be serialized
 
-## Non-Negotiables
+## How to produce a plan
 
-1. **Consume the spec; do not rewrite it.** Planning starts from locked design decisions. Reopen the spec only if execution reveals a material contradiction.
-2. **Make dependencies explicit.** Every executable must list blockers and downstream dependents.
-3. **Show the DAG.** Provide a text DAG or table that makes sequencing reviewable.
-4. **List planned commits.** Each executable should include a commit sequence so reviewers know the intended diff boundaries.
-5. **Identify parallel work.** State which executables can run concurrently and which must be serialized.
+1. List all executables (concrete units of work)
+2. For each executable, identify its blockers (what must complete first)
+3. Draw the dependency DAG as text
+4. Group into waves: Wave 1 = no deps, Wave 2 = blocked by Wave 1, etc.
+5. State which executables in the same wave can run in parallel
 
-## Plan Template
+## Plan template
 
 ```
-## Execution Plan: <title>
+## Plan: <title>
 
-### Features
-| # | Feature | Executables |
-|---|---------|-------------|
-| 1 | <name>  | exe_01, exe_02 |
+### Executables
+| ID  | Name             | Depends on |
+|-----|------------------|------------|
+| E1  | <name>           | —          |
+| E2  | <name>           | E1         |
+| E3  | <name>           | E1         |
+| E4  | <name>           | E2, E3     |
 
 ### Dependency DAG
-exe_01 (schema) ──→ exe_02 (API) ──→ exe_03 (tests)
-                                  ──→ exe_04 (docs)
+E1 ──→ E2 ──→ E4
+  └──→ E3 ──┘
 
-### Parallelization
-- Wave 1: exe_01 (no deps)
-- Wave 2: exe_02 (blocked by exe_01)
-- Wave 3: exe_03, exe_04 (parallel, both blocked by exe_02)
-
-### Planned Commits per Executable
-exe_01:
-  1. Add migration file
-  2. Run migrate up
-  3. Seed test data
+### Waves (execution order)
+- Wave 1: E1
+- Wave 2: E2, E3 (parallel)
+- Wave 3: E4
 ```
 
-## Quality Bar
+## Quality bar
 
-- [ ] Every executable has a clear owner (thread/runner)
-- [ ] Dependencies form a valid DAG (no cycles)
-- [ ] Parallel opportunities are identified
-- [ ] Planned commits are listed per executable
-- [ ] Total estimated waves match DAG depth
+- Every executable has a clear, concrete description
+- No cycles in the DAG
+- Parallel opportunities are named explicitly
+- Total waves match DAG depth
+
+## What this skill does NOT do
+
+- It does not execute the plan — it only produces it
+- It does not call any external tools
+- It does not monitor CI or PRs
