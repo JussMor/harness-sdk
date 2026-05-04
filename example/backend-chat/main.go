@@ -381,12 +381,11 @@ func (a *BackendChatApp) handleRun(w http.ResponseWriter, r *http.Request, chatI
 				summary.Status = status
 			}
 			summary.Result = payloadString(event.Payload, "result")
-		case ab.EventRunnerCompleted:
+		case ab.EventSubagentCompleted:
 			summary.Status = "success"
-			summary.Result = asString(event.Payload["result"])
-		case ab.EventRunnerFailed:
-			summary.Status = "failure"
-			summary.Result = asString(event.Payload["error"])
+			summary.Result = asString(event.Payload["output"])
+		case ab.EventSubagentStarted:
+			summary.Status = "running"
 		default:
 			return
 		}
