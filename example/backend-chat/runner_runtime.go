@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -341,7 +342,7 @@ func previewText(value string, limit int) string {
 func (r *agentRuntime) newSubagentDispatchTool() *ab.Tool {
 	return &ab.Tool{
 		Name:        "dispatch-subagents",
-		Description: "Spawn one or more isolated subagents to handle independent tasks in parallel. Each subagent gets its own focused agent loop with restricted tools (memory, document, checkpoint) and returns a structured result. Use this for fan-out work: research multiple sources, create multiple files, validate against multiple criteria. Each task must be self-contained — subagents do not share parent context beyond the task description.",
+		Description: "Spawn one or more isolated subagents to handle independent tasks in parallel. Each subagent gets its own focused agent loop with restricted tools (memory, document, checkpoint) and returns a structured result. Use this for fan-out work: research multiple sources, create multiple files, validate against multiple criteria. Each task must be self-contained — subagents do not share parent context beyond the task description. For research + writing tasks, set timeout_seconds to 60-120 (default 90).",
 		Category:    ab.ToolCategoryPlanning,
 		Parameters: ab.ToolFuncParams{
 			Type: "object",
@@ -356,7 +357,7 @@ func (r *agentRuntime) newSubagentDispatchTool() *ab.Tool {
 							"task":            {Type: "string", Description: "Self-contained instruction the subagent will execute."},
 							"mode":            {Type: "string", Description: "Optional mode override (e.g. 'analyst', 'code-agent')."},
 							"max_turns":       {Type: "integer", Description: "Cap on subagent loop iterations (default 4)."},
-							"timeout_seconds": {Type: "integer", Description: "Wall-clock timeout in seconds (default 30)."},
+							"timeout_seconds": {Type: "integer", Description: "Wall-clock timeout in seconds (default 90). Use 60-120 for larger research/writing tasks."},
 						},
 						Required: []string{"task"},
 					},
@@ -391,7 +392,7 @@ func (r *agentRuntime) newSubagentDispatchTool() *ab.Tool {
 				if v, ok := m["max_turns"].(float64); ok && v > 0 {
 					maxTurns = int(v)
 				}
-				timeout := 30 * time.Second
+				timeout := 90 * time.Second
 				if v, ok := m["timeout_seconds"].(float64); ok && v > 0 {
 					timeout = time.Duration(v) * time.Second
 				}
@@ -423,6 +424,9 @@ func (r *agentRuntime) newSubagentDispatchTool() *ab.Tool {
 				}
 				if res.Error != nil {
 					entry["error"] = res.Error.Error()
+					if isTimeoutError(res.Error) {
+						entry["timed_out"] = true
+					}
 				}
 				summaries = append(summaries, entry)
 			}
@@ -446,4 +450,14 @@ func truncate(value string, limit int) string {
 		return value[:limit]
 	}
 	return value[:limit-3] + "..."
+}
+
+func isTimeoutError(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		return true
+	}
+	return strings.Contains(strings.ToLower(err.Error()), "deadline exceeded")
 }
