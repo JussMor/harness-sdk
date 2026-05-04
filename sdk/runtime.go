@@ -757,9 +757,9 @@ func DefaultMemoryTriggerDetector(message string) (MemoryLayer, string, bool) {
 	// State change — multilingual
 	stateChange := []string{
 		// English
-		"i no longer ", "i moved to ", "i now work at ", "i changed ", "i started ",
+		"i no longer ", "i moved to ", "i now work at ", "i changed ", "i started ", "my name is ", "i am ",
 		// Spanish
-		"ya no ", "me mudé a ", "ahora trabajo en ", "cambié ", "empecé ",
+		"ya no ", "me mudé a ", "ahora trabajo en ", "cambié ", "empecé ", "mi nombre es ", "me llamo ",
 	}
 	for _, trigger := range stateChange {
 		if idx := strings.Index(lower, trigger); idx >= 0 {
