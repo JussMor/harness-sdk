@@ -317,6 +317,11 @@ func (a *BackendChatApp) handleStream(w http.ResponseWriter, r *http.Request, ch
 		writeErr(w, http.StatusBadRequest, err)
 		return
 	}
+	req.Prompt = strings.TrimSpace(req.Prompt)
+	if req.Prompt == "" {
+		writeErr(w, http.StatusBadRequest, fmt.Errorf("prompt is required"))
+		return
+	}
 
 	effectiveModel := strings.TrimSpace(req.Model)
 	if effectiveModel == "" {

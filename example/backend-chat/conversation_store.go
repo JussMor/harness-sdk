@@ -164,6 +164,7 @@ func LoadOrCreateConversation(ctx context.Context, store ab.ConversationStore, c
 			return nil, fmt.Errorf("load conversation: %w", err)
 		}
 		if conv != nil {
+			sanitizeConversation(conv)
 			return conv, nil
 		}
 	}
@@ -182,7 +183,23 @@ func LoadOrCreateConversation(ctx context.Context, store ab.ConversationStore, c
 			}
 		}
 	}
+	sanitizeConversation(conv)
 	return conv, nil
+}
+
+func sanitizeConversation(conv *ab.Conversation) {
+	if conv == nil || len(conv.Messages) == 0 {
+		return
+	}
+
+	clean := conv.Messages[:0]
+	for _, msg := range conv.Messages {
+		if strings.TrimSpace(msg.Content) == "" {
+			continue
+		}
+		clean = append(clean, msg)
+	}
+	conv.Messages = clean
 }
 
 // toAgentMessages converts DB messages to SDK ChatMessages.
