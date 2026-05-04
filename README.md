@@ -1,7 +1,8 @@
+![Uploading Screenshot 2026-05-04 at 11.00.08 AM.png…]()
 
 # Autobuild SDK
 
-<img width="1569" height="887" alt="Screenshot 2026-05-04 at 12 11 26 AM" src="https://github.com/user-attachments/assets/2089cc54-d289-43e0-a825-d66aceea00db" />
+<img width="1646" height="1021" alt="Screenshot 2026-05-04 at 11 00 55 AM" src="https://github.com/user-attachments/assets/598352b7-1198-4de5-9b0a-be219c310068" />
 
 A minimal, extensible Go SDK for building AI agents with a structured lifecycle, layered memory, and multi-provider support. Designed to replicate the same operational discipline as Claude — same 6-phase lifecycle, same memory model, same layered prompt assembly.
 
