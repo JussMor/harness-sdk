@@ -32,12 +32,14 @@ func main() {
 	if err := EnsureSchema(ctx, db); err != nil {
 		log.Fatalf("ensure schema: %v", err)
 	}
+	if err := EnsureConversationSchema(ctx, db); err != nil {
+		log.Fatalf("ensure conversation schema: %v", err)
+	}
 
 	app := &BackendChatApp{
 		db:        db,
 		pub:       NewCentrifugoClient(getenv("CENTRIFUGO_API_URL", "http://localhost:8000/api"), getenv("CENTRIFUGO_API_KEY", "backend-chat-dev-api-key")),
 		llm:       BuildLLMFromEnv(),
-		runnerHub: NewRunnerEventHub(),
 		modelName: getenv("BACKEND_MODEL", "anthropic/claude-sonnet-4-20250514"),
 	}
 	if modes, err := loadBackendModes(); err == nil {
@@ -55,6 +57,7 @@ func main() {
 	mux.HandleFunc("/api/providers", app.handleProviders)
 	mux.HandleFunc("/api/chats", app.handleChats)
 	mux.HandleFunc("/api/chats/", app.handleChatRoutes)
+	mux.HandleFunc("/admin/eval", app.handleEval)
 
 	log.Printf("backend-chat listening on %s", addr)
 	if err := http.ListenAndServe(addr, withRequestLog(withCORS(mux))); err != nil {
@@ -68,7 +71,6 @@ type BackendChatApp struct {
 	llm       ab.LLMProvider
 	multi     *ab.RoutedLLMProvider
 	modes     ab.ModeProvider
-	runnerHub *RunnerEventHub
 	modelName string
 }
 
@@ -90,6 +92,29 @@ type Message struct {
 
 func (a *BackendChatApp) handleHealth(w http.ResponseWriter, _ *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+}
+
+// handleEval runs the built-in regression eval suite.
+// POST /admin/eval → {"pass": 4, "fail": 1, "results": [...]}
+// GET  /admin/eval → same (runs without a request body)
+func (a *BackendChatApp) handleEval(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	results := RunBackendEvals(ctx, a.llm, a.modelName)
+
+	pass, fail := 0, 0
+	for _, res := range results {
+		if res.Pass {
+			pass++
+		} else {
+			fail++
+		}
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"pass":    pass,
+		"fail":    fail,
+		"total":   len(results),
+		"results": results,
+	})
 }
 
 func (a *BackendChatApp) handleProviders(w http.ResponseWriter, r *http.Request) {
@@ -195,52 +220,10 @@ func (a *BackendChatApp) handleChatRoutes(w http.ResponseWriter, r *http.Request
 	switch parts[1] {
 	case "messages":
 		a.handleMessages(w, r, chatID)
-	case "events":
-		a.handleRunnerEvents(w, r, chatID)
-	case "run":
-		a.handleRun(w, r, chatID)
+	case "stream":
+		a.handleStream(w, r, chatID)
 	default:
 		w.WriteHeader(http.StatusNotFound)
-	}
-}
-
-func (a *BackendChatApp) handleRunnerEvents(w http.ResponseWriter, r *http.Request, chatID int64) {
-	if r.Method != http.MethodGet {
-		w.WriteHeader(http.StatusMethodNotAllowed)
-		return
-	}
-
-	flusher, ok := w.(http.Flusher)
-	if !ok {
-		writeErr(w, http.StatusInternalServerError, fmt.Errorf("streaming not supported"))
-		return
-	}
-
-	w.Header().Set("Content-Type", "text/event-stream")
-	w.Header().Set("Cache-Control", "no-cache")
-	w.Header().Set("Connection", "keep-alive")
-
-	events, unsubscribe := a.runnerHub.Subscribe(chatID)
-	defer unsubscribe()
-
-	_, _ = fmt.Fprint(w, "event: ready\ndata: {}\n\n")
-	flusher.Flush()
-
-	for {
-		select {
-		case <-r.Context().Done():
-			return
-		case event, ok := <-events:
-			if !ok {
-				return
-			}
-			payload, err := json.Marshal(event)
-			if err != nil {
-				continue
-			}
-			_, _ = fmt.Fprintf(w, "event: %s\ndata: %s\n\n", event.Type, payload)
-			flusher.Flush()
-		}
 	}
 }
 
@@ -274,167 +257,6 @@ func (a *BackendChatApp) handleMessages(w http.ResponseWriter, r *http.Request, 
 	}
 }
 
-func (a *BackendChatApp) handleRun(w http.ResponseWriter, r *http.Request, chatID int64) {
-	if r.Method != http.MethodPost {
-		w.WriteHeader(http.StatusMethodNotAllowed)
-		return
-	}
-
-	var req struct {
-		Prompt      string `json:"prompt"`
-		Mode        string `json:"mode"`
-		Provider    string `json:"provider"`
-		Model       string `json:"model"`
-		ClientRunID string `json:"clientRunId"`
-	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeErr(w, http.StatusBadRequest, err)
-		return
-	}
-
-	effectiveModel := strings.TrimSpace(req.Model)
-	if effectiveModel == "" {
-		effectiveModel = a.modelName
-	}
-
-	requestedProvider := strings.ToLower(strings.TrimSpace(req.Provider))
-	if requestedProvider != "" {
-		if a.multi != nil && !a.multi.HasProvider(requestedProvider) {
-			writeErr(w, http.StatusBadRequest, fmt.Errorf("provider %q not configured", requestedProvider))
-			return
-		}
-		_, modelOnly := ab.ParseModelRef(effectiveModel)
-		if modelOnly == "" {
-			modelOnly = effectiveModel
-		}
-		effectiveModel = requestedProvider + "/" + modelOnly
-	}
-
-	// Detach from the HTTP request context so LLM and DB operations finish
-	// even if the browser closes the connection early (context canceled).
-	ctx := context.WithoutCancel(r.Context())
-
-	userMsg, err := InsertMessage(ctx, a.db, chatID, "user", req.Prompt, effectiveModel)
-	if err != nil {
-		writeErr(w, http.StatusInternalServerError, err)
-		return
-	}
-	_ = a.pub.PublishChatMessage(ctx, chatID, userMsg)
-
-	history, err := ListMessages(ctx, a.db, chatID)
-	if err != nil {
-		writeErr(w, http.StatusInternalServerError, err)
-		return
-	}
-
-	runID := strings.TrimSpace(req.ClientRunID)
-	if runID == "" {
-		runID = newRunID()
-	}
-	logContext := RuntimeLogContext{ChatID: chatID, RunID: runID, Mode: strings.TrimSpace(req.Mode)}
-	log.Printf("run.start chat_id=%d run_id=%s mode=%s model=%s history_messages=%d prompt=%q", chatID, runID, firstNonEmpty(logContext.Mode, "balanced"), effectiveModel, len(history), previewText(req.Prompt, 160))
-
-	publishRunner := func(summary RunnerSummary) {
-		a.runnerHub.Publish(RunnerEvent{
-			Type:      "runner.update",
-			RunID:     runID,
-			ChatID:    chatID,
-			Runner:    &summary,
-			Timestamp: time.Now().UTC(),
-		})
-	}
-
-	publishTrace := func(step TraceStep) {
-		a.runnerHub.Publish(RunnerEvent{
-			Type:      "trace.update",
-			RunID:     runID,
-			ChatID:    chatID,
-			Trace:     &step,
-			Timestamp: time.Now().UTC(),
-		})
-	}
-
-	emitRunnerEvent := func(event ab.Event) {
-		threadID := strings.TrimSpace(event.Source)
-		summary := RunnerSummary{Model: effectiveModel, Status: "running"}
-
-		if payloadThreadID := payloadString(event.Payload, "thread_id"); payloadThreadID != "" {
-			threadID = payloadThreadID
-		}
-		if threadID != "" {
-			summary.ID = threadID
-		}
-		if task := payloadString(event.Payload, "task"); task != "" {
-			summary.Task = task
-		}
-		if tier := payloadString(event.Payload, "tier"); tier != "" {
-			summary.Tier = tier
-		}
-		if model := payloadString(event.Payload, "model"); model != "" {
-			summary.Model = model
-		}
-
-		switch event.Type {
-		case ab.EventExecutableUpdated:
-			status := payloadString(event.Payload, "status")
-			if status != "" {
-				summary.Status = status
-			}
-			summary.Result = payloadString(event.Payload, "result")
-		case ab.EventRunnerCompleted:
-			summary.Status = "success"
-			summary.Result = asString(event.Payload["result"])
-		case ab.EventRunnerFailed:
-			summary.Status = "failure"
-			summary.Result = asString(event.Payload["error"])
-		default:
-			return
-		}
-		if strings.TrimSpace(summary.ID) == "" {
-			return
-		}
-		log.Printf("run.event chat_id=%d run_id=%s mode=%s event=%s thread_id=%s status=%s", chatID, runID, firstNonEmpty(logContext.Mode, "balanced"), event.Type, threadID, summary.Status)
-
-		publishRunner(summary)
-	}
-
-	assistant := GenerateAssistantReply(ctx, a.llm, toAgentMessages(history), req.Mode, effectiveModel, logContext, emitRunnerEvent, publishTrace)
-	for _, summary := range assistant.Runners {
-		publishRunner(summary)
-	}
-	assistantMsg, err := InsertMessage(ctx, a.db, chatID, "assistant", assistant.Content, effectiveModel)
-	if err != nil {
-		writeErr(w, http.StatusInternalServerError, err)
-		return
-	}
-	_ = a.pub.PublishChatMessage(ctx, chatID, assistantMsg)
-
-	assistantPayload := map[string]any{
-		"id":        assistantMsg.ID,
-		"chatId":    assistantMsg.ChatID,
-		"runId":     runID,
-		"role":      assistantMsg.Role,
-		"content":   assistantMsg.Content,
-		"model":     assistantMsg.Model,
-		"createdAt": assistantMsg.CreatedAt,
-	}
-	if strings.TrimSpace(assistant.Reasoning) != "" {
-		assistantPayload["reasoning"] = assistant.Reasoning
-	}
-	if len(assistant.Runners) > 0 {
-		assistantPayload["runners"] = assistant.Runners
-	}
-	if len(assistant.Trace) > 0 {
-		assistantPayload["trace"] = assistant.Trace
-	}
-	log.Printf("run.completed chat_id=%d run_id=%s mode=%s model=%s runners=%d assistant_message_id=%d", chatID, runID, firstNonEmpty(logContext.Mode, "balanced"), effectiveModel, len(assistant.Runners), assistantMsg.ID)
-
-	writeJSON(w, http.StatusOK, map[string]any{
-		"user":      userMsg,
-		"assistant": assistantPayload,
-	})
-}
-
 func payloadString(payload map[string]any, key string) string {
 	if payload == nil {
 		return ""
@@ -459,27 +281,180 @@ func firstNonEmpty(values ...string) string {
 	return ""
 }
 
-func toAgentMessages(messages []Message) []ab.ChatMessage {
-	out := make([]ab.ChatMessage, 0, len(messages))
-	for _, msg := range messages {
-		content := strings.TrimSpace(msg.Content)
-		if content == "" {
-			continue
-		}
+func newRunID() string {
+	return fmt.Sprintf("run_%d", time.Now().UnixNano())
+}
 
-		role := ab.RoleUser
-		switch strings.ToLower(strings.TrimSpace(msg.Role)) {
-		case "assistant":
-			role = ab.RoleAssistant
-		case "tool":
-			role = ab.RoleTool
-		case "system":
-			role = ab.RoleSystem
-		}
-
-		out = append(out, ab.ChatMessage{Role: role, Content: content})
+// handleStream is the real-time streaming counterpart of handleRun.
+// Uses Server-Sent Events to push token deltas as the LLM generates them.
+//
+// POST /api/chats/:id/stream
+// Same request body as /run. Response is text/event-stream with events:
+//   event: delta    → {"delta": "token text"}
+//   event: tool     → {"name": "tool_name", "args": {...}}
+//   event: done     → {"runId": "...", "messageId": 123}
+//   event: error    → {"error": "message"}
+func (a *BackendChatApp) handleStream(w http.ResponseWriter, r *http.Request, chatID int64) {
+	if r.Method != http.MethodPost {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
 	}
-	return out
+
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		writeErr(w, http.StatusInternalServerError, fmt.Errorf("streaming not supported"))
+		return
+	}
+
+	var req struct {
+		Prompt      string `json:"prompt"`
+		Mode        string `json:"mode"`
+		Provider    string `json:"provider"`
+		Model       string `json:"model"`
+		ClientRunID string `json:"clientRunId"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeErr(w, http.StatusBadRequest, err)
+		return
+	}
+	req.Prompt = strings.TrimSpace(req.Prompt)
+	if req.Prompt == "" {
+		writeErr(w, http.StatusBadRequest, fmt.Errorf("prompt is required"))
+		return
+	}
+
+	effectiveModel := strings.TrimSpace(req.Model)
+	if effectiveModel == "" {
+		effectiveModel = a.modelName
+	}
+	requestedProvider := strings.ToLower(strings.TrimSpace(req.Provider))
+	if requestedProvider != "" {
+		_, modelOnly := ab.ParseModelRef(effectiveModel)
+		if modelOnly == "" {
+			modelOnly = effectiveModel
+		}
+		effectiveModel = requestedProvider + "/" + modelOnly
+	}
+
+	// SSE headers
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Connection", "keep-alive")
+	w.Header().Set("X-Accel-Buffering", "no")
+
+	ctx := r.Context()
+	tracer := ab.NewTracer()
+	ctx = ab.WithTracer(ctx, tracer)
+
+	sseWrite := func(event, data string) {
+		if ctx.Err() != nil {
+			return
+		}
+		if _, err := fmt.Fprintf(w, "event: %s\ndata: %s\n\n", event, data); err != nil {
+			log.Printf("stream.write_failed chat_id=%d run_id=%s error=%v", chatID, strings.TrimSpace(req.ClientRunID), err)
+			return
+		}
+		flusher.Flush()
+	}
+
+	// Insert user message
+	userMsg, err := InsertMessage(ctx, a.db, chatID, "user", req.Prompt, effectiveModel)
+	if err != nil {
+		d, _ := json.Marshal(map[string]string{"error": err.Error()})
+		sseWrite("error", string(d))
+		return
+	}
+	_ = a.pub.PublishChatMessage(ctx, chatID, userMsg)
+
+	history, err := ListMessages(ctx, a.db, chatID)
+	if err != nil {
+		d, _ := json.Marshal(map[string]string{"error": err.Error()})
+		sseWrite("error", string(d))
+		return
+	}
+
+	runID := strings.TrimSpace(req.ClientRunID)
+	if runID == "" {
+		runID = newRunID()
+	}
+	logContext := RuntimeLogContext{ChatID: chatID, RunID: runID, Mode: strings.TrimSpace(req.Mode)}
+	log.Printf("stream.start chat_id=%d run_id=%s model=%s", chatID, runID, effectiveModel)
+
+	_, agentRT, err := newModeEngineWithDB(a.llm, effectiveModel, logContext, a.db)
+	if err != nil {
+		d, _ := json.Marshal(map[string]string{"error": err.Error()})
+		sseWrite("error", string(d))
+		return
+	}
+
+	conv, err := LoadOrCreateConversation(ctx, agentRT.convStore, chatID, history)
+	if err != nil {
+		d, _ := json.Marshal(map[string]string{"error": err.Error()})
+		sseWrite("error", string(d))
+		return
+	}
+
+	events, err := agentRT.runtime.RunStream(ctx, conv, req.Prompt)
+	if err != nil {
+		d, _ := json.Marshal(map[string]string{"error": err.Error()})
+		sseWrite("error", string(d))
+		return
+	}
+
+	var fullResponse strings.Builder
+	for {
+		select {
+		case <-ctx.Done():
+			log.Printf("stream.canceled chat_id=%d run_id=%s", chatID, runID)
+			return
+		case ev, ok := <-events:
+			if !ok {
+				return
+			}
+		switch ev.Type {
+		case ab.StreamEventDelta:
+			fullResponse.WriteString(ev.Delta)
+			d, _ := json.Marshal(map[string]string{"delta": ev.Delta})
+			sseWrite("delta", string(d))
+
+		case ab.StreamEventToolCall:
+			if ev.ToolCall != nil {
+				d, _ := json.Marshal(map[string]any{
+					"name": ev.ToolCall.Name,
+					"args": ev.ToolCall.Arguments,
+				})
+				sseWrite("tool_call", string(d))
+			}
+
+		case ab.StreamEventToolResult:
+			if ev.ToolResult != nil {
+				d, _ := json.Marshal(map[string]any{
+					"name":    ev.ToolResult.Name,
+					"content": ev.ToolResult.Content,
+					"error":   ev.ToolResult.Error != nil,
+				})
+				sseWrite("tool_result", string(d))
+			}
+
+		case ab.StreamEventDone:
+			// Persist assistant message
+			assistantMsg, _ := InsertMessage(ctx, a.db, chatID, "assistant", fullResponse.String(), effectiveModel)
+			_ = a.pub.PublishChatMessage(ctx, chatID, assistantMsg)
+			d, _ := json.Marshal(map[string]any{"runId": runID, "messageId": assistantMsg.ID})
+			sseWrite("done", string(d))
+			log.Printf("stream.done chat_id=%d run_id=%s chars=%d", chatID, runID, fullResponse.Len())
+
+		case ab.StreamEventError:
+			msg := "unknown error"
+			if ev.Error != nil {
+				msg = ev.Error.Error()
+			}
+			d, _ := json.Marshal(map[string]string{"error": msg})
+			sseWrite("error", string(d))
+			log.Printf("stream.error chat_id=%d run_id=%s error=%s", chatID, runID, msg)
+		}
+		}
+	}
 }
 
 func withCORS(next http.Handler) http.Handler {

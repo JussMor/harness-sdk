@@ -2,6 +2,7 @@ package autobuild
 
 import (
 	"context"
+	"fmt"
 	"sort"
 	"strings"
 	"sync"
@@ -32,6 +33,11 @@ type Tool struct {
 	Category    ToolCategory   `json:"category"`
 	Parameters  ToolFuncParams `json:"parameters"`
 	Execute     ToolExecuteFunc `json:"-"`
+
+	// Hidden tools are present in the registry but excluded from ToolDefs.
+	// Use Search + Reveal to expose them to the LLM dynamically.
+	// This mirrors Claude's tool_search pattern: visible list is partial.
+	Hidden bool `json:"hidden,omitempty"`
 }
 
 // ToolFuncParams is a JSON-Schema-like description of a tool's input.
@@ -179,13 +185,95 @@ func (r *ToolRegistry) DescribeAvailable() string {
 	return strings.Join(lines, "\n")
 }
 
-// ToolDefs returns all tools as LLM wire-format definitions.
+// ToolDefs returns all visible tools as LLM wire-format definitions.
+// Hidden tools are excluded — use Search + Reveal to expose them.
 func (r *ToolRegistry) ToolDefs() []ToolDef {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 	out := make([]ToolDef, 0, len(r.tools))
 	for _, t := range r.tools {
+		if t.Hidden {
+			continue
+		}
 		out = append(out, t.ToToolDef())
 	}
 	return out
+}
+
+// Search returns tools whose name, description, or category matches the query.
+// Used by the LLM via a tool_search tool to discover capabilities dynamically
+// instead of being shown all tools upfront. This mirrors how Claude operates:
+// the visible tool list is partial; tools are discovered as needed.
+//
+// Hidden tools ARE included in search results — that's the point. Use
+// Reveal to make a discovered tool callable.
+func (r *ToolRegistry) Search(query string) []ToolMatch {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	q := strings.ToLower(strings.TrimSpace(query))
+	if q == "" {
+		return nil
+	}
+	var matches []ToolMatch
+	for _, t := range r.tools {
+		score := scoreToolMatch(t, q)
+		if score > 0 {
+			matches = append(matches, ToolMatch{Tool: t, Score: score})
+		}
+	}
+	// Sort desc by score (insertion sort — tool registries are small)
+	for i := 1; i < len(matches); i++ {
+		for j := i; j > 0 && matches[j].Score > matches[j-1].Score; j-- {
+			matches[j], matches[j-1] = matches[j-1], matches[j]
+		}
+	}
+	return matches
+}
+
+// Reveal makes a hidden tool visible (callable by the LLM in subsequent turns).
+// Use after Search returns a hidden tool the agent decided to use.
+func (r *ToolRegistry) Reveal(name string) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	t, ok := r.tools[name]
+	if !ok {
+		return fmt.Errorf("tool %q not found", name)
+	}
+	t.Hidden = false
+	r.tools[name] = t
+	return nil
+}
+
+// Hide marks a tool as hidden — it stays in the registry but is excluded
+// from ToolDefs. Useful for tools that should only be discoverable via Search.
+func (r *ToolRegistry) Hide(name string) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	t, ok := r.tools[name]
+	if !ok {
+		return fmt.Errorf("tool %q not found", name)
+	}
+	t.Hidden = true
+	r.tools[name] = t
+	return nil
+}
+
+// ToolMatch is a tool with its relevance score for a search query.
+type ToolMatch struct {
+	Tool  *Tool   `json:"tool"`
+	Score float64 `json:"score"`
+}
+
+func scoreToolMatch(t *Tool, query string) float64 {
+	var score float64
+	if strings.Contains(strings.ToLower(t.Name), query) {
+		score += 0.6
+	}
+	if strings.Contains(strings.ToLower(t.Description), query) {
+		score += 0.3
+	}
+	if strings.Contains(strings.ToLower(string(t.Category)), query) {
+		score += 0.1
+	}
+	return score
 }

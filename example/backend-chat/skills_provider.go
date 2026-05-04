@@ -78,15 +78,33 @@ func (p *fileSkillProvider) Unload(_ context.Context, name string) error {
 	return nil
 }
 
-func (p *fileSkillProvider) Match(_ context.Context, text string) ([]*ab.Skill, error) {
+func (p *fileSkillProvider) Loaded(_ context.Context) []string {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	names := make([]string, 0, len(p.loaded))
+	for name := range p.loaded {
+		names = append(names, name)
+	}
+	return names
+}
+
+func (p *fileSkillProvider) Match(_ context.Context, text string) ([]ab.SkillMatch, error) {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
 
-	matches := make([]*ab.Skill, 0)
+	matches := make([]ab.SkillMatch, 0)
 	for _, name := range p.names {
 		skill := p.all[name]
-		if skill != nil && skill.MatchesTrigger(text) {
-			matches = append(matches, skill)
+		if skill == nil {
+			continue
+		}
+		score := skill.MatchScore(text)
+		if score > 0 {
+			matches = append(matches, ab.SkillMatch{
+				Skill:     skill,
+				Score:     score,
+				MatchedOn: text,
+			})
 		}
 	}
 	return matches, nil

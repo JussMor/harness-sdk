@@ -137,26 +137,6 @@ func (m *fsMemoryProvider) StrReplace(_ context.Context, scope ab.Scope, path, o
 	return os.WriteFile(target, []byte(text), 0o644)
 }
 
-func (m *fsMemoryProvider) Insert(_ context.Context, scope ab.Scope, path string, line int, text string) error {
-	target, err := m.resolve(scope, path)
-	if err != nil {
-		return err
-	}
-	data, err := os.ReadFile(target)
-	if err != nil {
-		return err
-	}
-
-	lines := strings.Split(string(data), "\n")
-	if line < 0 || line > len(lines) {
-		return fmt.Errorf("insert line out of range")
-	}
-
-	insertLines := strings.Split(text, "\n")
-	combined := append(lines[:line], append(insertLines, lines[line:]...)...)
-	return os.WriteFile(target, []byte(strings.Join(combined, "\n")), 0o644)
-}
-
 func (m *fsMemoryProvider) Delete(_ context.Context, scope ab.Scope, path string) error {
 	target, err := m.resolve(scope, path)
 	if err != nil {

@@ -4,20 +4,33 @@ package autobuild
 // Every provider is optional — if nil, the corresponding capability is
 // simply unavailable. Consumers build an Engine via [New] and functional
 // options.
+//
+// Compared to the original design, three changes were made:
+//
+//  1. WorkflowEngine + PlanProvider are replaced by ExecutionContext —
+//     a single object that owns phase, plan, and todos together.
+//
+//  2. ModelRouter is removed as a separate field. If you need multi-model
+//     routing, pass a RoutedLLMProvider as the LLM field — it implements
+//     both LLMProvider and ModelRouter via duck typing.
+//
+//  3. ObservationStore and SystemPromptBuilder are added — they model
+//     the session working memory and layered prompt assembly that were
+//     previously implicit or missing entirely.
 type Engine struct {
-	Memory      MemoryProvider
-	Sandbox     SandboxDriver
-	Tools       *ToolRegistry
-	Skills      SkillProvider
-	Threads     ThreadProvider
-	Checkpoints CheckpointProvider
-	Plans       PlanProvider
-	Tasks       TaskProvider
-	Modes       ModeProvider
-	Workflow    WorkflowEngine
-	Events      EventBus
-	LLM         LLMProvider  // primary LLM for chat completions
-	Router      ModelRouter  // optional multi-model routing
+	Memory       MemoryProvider
+	Sandbox      SandboxDriver
+	Tools        *ToolRegistry
+	Skills       SkillProvider
+	Threads      ThreadProvider
+	Checkpoints  CheckpointProvider
+	Modes        ModeProvider
+	Events       EventBus
+	LLM          LLMProvider         // primary LLM — use RoutedLLMProvider for multi-model
+	Execution    ExecutionContext     // phase + plan + todos unified
+	Observations ObservationStore    // session-scoped working memory
+	Prompt       *SystemPromptBuilder // layered system prompt assembly
+	Budget       *ContextBudget       // token budget across context layers
 }
 
 // New creates an Engine configured with the given options.
@@ -30,41 +43,29 @@ func New(opts ...Option) *Engine {
 	return e
 }
 
-// HasMemory returns true if a MemoryProvider is wired.
-func (e *Engine) HasMemory() bool { return e.Memory != nil }
+// NewWithDefaults creates an Engine with sensible in-memory defaults wired.
+// Use this for quick setup; replace individual providers for production.
+func NewWithDefaults(windowSize int) *Engine {
+	budget := DefaultContextBudget(windowSize)
+	return &Engine{
+		Events:       NewEventBus(),
+		Execution:    NewExecutionContext(),
+		Observations: NewObservationStore(),
+		Prompt:       NewSystemPromptBuilder(),
+		Budget:       &budget,
+	}
+}
 
-// HasSandbox returns true if a SandboxDriver is wired.
-func (e *Engine) HasSandbox() bool { return e.Sandbox != nil }
-
-// HasTools returns true if a ToolRegistry is wired and non-empty.
-func (e *Engine) HasTools() bool { return e.Tools != nil }
-
-// HasSkills returns true if a SkillProvider is wired.
-func (e *Engine) HasSkills() bool { return e.Skills != nil }
-
-// HasThreads returns true if a ThreadProvider is wired.
-func (e *Engine) HasThreads() bool { return e.Threads != nil }
-
-// HasCheckpoints returns true if a CheckpointProvider is wired.
-func (e *Engine) HasCheckpoints() bool { return e.Checkpoints != nil }
-
-// HasPlans returns true if a PlanProvider is wired.
-func (e *Engine) HasPlans() bool { return e.Plans != nil }
-
-// HasTasks returns true if a TaskProvider is wired.
-func (e *Engine) HasTasks() bool { return e.Tasks != nil }
-
-// HasModes returns true if a ModeProvider is wired.
-func (e *Engine) HasModes() bool { return e.Modes != nil }
-
-// HasWorkflow returns true if a WorkflowEngine is wired.
-func (e *Engine) HasWorkflow() bool { return e.Workflow != nil }
-
-// HasEvents returns true if an EventBus is wired.
-func (e *Engine) HasEvents() bool { return e.Events != nil }
-
-// HasLLM returns true if an LLMProvider is wired.
-func (e *Engine) HasLLM() bool { return e.LLM != nil }
-
-// HasRouter returns true if a ModelRouter is wired.
-func (e *Engine) HasRouter() bool { return e.Router != nil }
+func (e *Engine) HasMemory() bool       { return e.Memory != nil }
+func (e *Engine) HasSandbox() bool      { return e.Sandbox != nil }
+func (e *Engine) HasTools() bool        { return e.Tools != nil }
+func (e *Engine) HasSkills() bool       { return e.Skills != nil }
+func (e *Engine) HasThreads() bool      { return e.Threads != nil }
+func (e *Engine) HasCheckpoints() bool  { return e.Checkpoints != nil }
+func (e *Engine) HasModes() bool        { return e.Modes != nil }
+func (e *Engine) HasEvents() bool       { return e.Events != nil }
+func (e *Engine) HasLLM() bool          { return e.LLM != nil }
+func (e *Engine) HasExecution() bool    { return e.Execution != nil }
+func (e *Engine) HasObservations() bool { return e.Observations != nil }
+func (e *Engine) HasPrompt() bool       { return e.Prompt != nil }
+func (e *Engine) HasBudget() bool       { return e.Budget != nil }
