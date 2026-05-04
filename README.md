@@ -1,4 +1,3 @@
-![Uploading Screenshot 2026-05-04 at 11.00.08 AM.png…]()
 
 # Autobuild SDK
 
