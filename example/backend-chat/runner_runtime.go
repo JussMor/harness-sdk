@@ -33,7 +33,10 @@ type agentRuntime struct {
 func (r *agentRuntime) buildToolRegistry() *ab.ToolRegistry {
 	reg := ab.NewToolRegistry()
 	reg.Register(r.newCheckpointTool())
-	reg.Register(r.newDocumentTool())
+	// Prefer sandbox file tools when available to avoid writing local host files.
+	if !isSandboxAvailable() || r.chatID <= 0 {
+		reg.Register(r.newDocumentTool())
+	}
 	if r.skills != nil {
 		reg.Register(r.newSkillsTool())
 	}
