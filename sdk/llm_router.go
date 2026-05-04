@@ -87,3 +87,32 @@ func (r *RoutedLLMProvider) Providers() []string {
 func (r *RoutedLLMProvider) DefaultProvider() string {
 	return r.defaultProvider
 }
+
+// ChatStream implements StreamingLLMProvider. It routes the request to the
+// configured provider for the model's "provider/model" prefix and, if that
+// provider also implements StreamingLLMProvider, forwards its stream events.
+//
+// Returns an error if the routed provider does not support streaming, so
+// the caller (e.g. Runtime.RunStream) can fall back gracefully.
+func (r *RoutedLLMProvider) ChatStream(ctx context.Context, req ChatRequest) (<-chan StreamEvent, error) {
+	providerName, modelName := ParseModelRef(req.Model)
+	if providerName == "" {
+		providerName = r.defaultProvider
+	}
+	provider, ok := r.providers[providerName]
+	if !ok {
+		return nil, fmt.Errorf("provider %q not configured", providerName)
+	}
+	streamer, ok := provider.(StreamingLLMProvider)
+	if !ok {
+		return nil, fmt.Errorf("provider %q does not support streaming", providerName)
+	}
+
+	routedReq := req
+	routedReq.Model = modelName
+	return streamer.ChatStream(ctx, routedReq)
+}
+
+// Verify RoutedLLMProvider implements StreamingLLMProvider so Runtime.RunStream
+// takes the real streaming path when at least one underlying provider streams.
+var _ StreamingLLMProvider = (*RoutedLLMProvider)(nil)
