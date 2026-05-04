@@ -58,6 +58,7 @@ func main() {
 	mux.HandleFunc("/api/providers", app.handleProviders)
 	mux.HandleFunc("/api/chats", app.handleChats)
 	mux.HandleFunc("/api/chats/", app.handleChatRoutes)
+	mux.HandleFunc("/admin/eval", app.handleEval)
 
 	log.Printf("backend-chat listening on %s", addr)
 	if err := http.ListenAndServe(addr, withRequestLog(withCORS(mux))); err != nil {
@@ -93,6 +94,29 @@ type Message struct {
 
 func (a *BackendChatApp) handleHealth(w http.ResponseWriter, _ *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+}
+
+// handleEval runs the built-in regression eval suite.
+// POST /admin/eval → {"pass": 4, "fail": 1, "results": [...]}
+// GET  /admin/eval → same (runs without a request body)
+func (a *BackendChatApp) handleEval(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	results := RunBackendEvals(ctx, a.llm, a.modelName)
+
+	pass, fail := 0, 0
+	for _, res := range results {
+		if res.Pass {
+			pass++
+		} else {
+			fail++
+		}
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"pass":    pass,
+		"fail":    fail,
+		"total":   len(results),
+		"results": results,
+	})
 }
 
 func (a *BackendChatApp) handleProviders(w http.ResponseWriter, r *http.Request) {
@@ -202,6 +226,8 @@ func (a *BackendChatApp) handleChatRoutes(w http.ResponseWriter, r *http.Request
 		a.handleRunnerEvents(w, r, chatID)
 	case "run":
 		a.handleRun(w, r, chatID)
+	case "stream":
+		a.handleStream(w, r, chatID)
 	default:
 		w.WriteHeader(http.StatusNotFound)
 	}
@@ -464,6 +490,145 @@ func firstNonEmpty(values ...string) string {
 		}
 	}
 	return ""
+}
+
+// handleStream is the real-time streaming counterpart of handleRun.
+// Uses Server-Sent Events to push token deltas as the LLM generates them.
+//
+// POST /api/chats/:id/stream
+// Same request body as /run. Response is text/event-stream with events:
+//   event: delta    → {"delta": "token text"}
+//   event: tool     → {"name": "tool_name", "args": {...}}
+//   event: done     → {"runId": "...", "messageId": 123}
+//   event: error    → {"error": "message"}
+func (a *BackendChatApp) handleStream(w http.ResponseWriter, r *http.Request, chatID int64) {
+	if r.Method != http.MethodPost {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		writeErr(w, http.StatusInternalServerError, fmt.Errorf("streaming not supported"))
+		return
+	}
+
+	var req struct {
+		Prompt      string `json:"prompt"`
+		Mode        string `json:"mode"`
+		Provider    string `json:"provider"`
+		Model       string `json:"model"`
+		ClientRunID string `json:"clientRunId"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeErr(w, http.StatusBadRequest, err)
+		return
+	}
+
+	effectiveModel := strings.TrimSpace(req.Model)
+	if effectiveModel == "" {
+		effectiveModel = a.modelName
+	}
+	requestedProvider := strings.ToLower(strings.TrimSpace(req.Provider))
+	if requestedProvider != "" {
+		_, modelOnly := ab.ParseModelRef(effectiveModel)
+		if modelOnly == "" {
+			modelOnly = effectiveModel
+		}
+		effectiveModel = requestedProvider + "/" + modelOnly
+	}
+
+	// SSE headers
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Connection", "keep-alive")
+	w.Header().Set("X-Accel-Buffering", "no")
+
+	sseWrite := func(event, data string) {
+		fmt.Fprintf(w, "event: %s\ndata: %s\n\n", event, data)
+		flusher.Flush()
+	}
+
+	ctx := context.WithoutCancel(r.Context())
+	tracer := ab.NewTracer()
+	ctx = ab.WithTracer(ctx, tracer)
+
+	// Insert user message
+	userMsg, err := InsertMessage(ctx, a.db, chatID, "user", req.Prompt, effectiveModel)
+	if err != nil {
+		d, _ := json.Marshal(map[string]string{"error": err.Error()})
+		sseWrite("error", string(d))
+		return
+	}
+	_ = a.pub.PublishChatMessage(ctx, chatID, userMsg)
+
+	history, err := ListMessages(ctx, a.db, chatID)
+	if err != nil {
+		d, _ := json.Marshal(map[string]string{"error": err.Error()})
+		sseWrite("error", string(d))
+		return
+	}
+
+	runID := strings.TrimSpace(req.ClientRunID)
+	if runID == "" {
+		runID = newRunID()
+	}
+	logContext := RuntimeLogContext{ChatID: chatID, RunID: runID, Mode: strings.TrimSpace(req.Mode)}
+	log.Printf("stream.start chat_id=%d run_id=%s model=%s", chatID, runID, effectiveModel)
+
+	_, agentRT, err := newModeEngineWithDB(a.llm, effectiveModel, logContext, a.db)
+	if err != nil {
+		d, _ := json.Marshal(map[string]string{"error": err.Error()})
+		sseWrite("error", string(d))
+		return
+	}
+
+	conv, err := LoadOrCreateConversation(ctx, agentRT.convStore, chatID, history)
+	if err != nil {
+		d, _ := json.Marshal(map[string]string{"error": err.Error()})
+		sseWrite("error", string(d))
+		return
+	}
+
+	events, err := agentRT.runtime.RunStream(ctx, conv, req.Prompt)
+	if err != nil {
+		d, _ := json.Marshal(map[string]string{"error": err.Error()})
+		sseWrite("error", string(d))
+		return
+	}
+
+	var fullResponse strings.Builder
+	for ev := range events {
+		switch ev.Type {
+		case ab.StreamEventDelta:
+			fullResponse.WriteString(ev.Delta)
+			d, _ := json.Marshal(map[string]string{"delta": ev.Delta})
+			sseWrite("delta", string(d))
+
+		case ab.StreamEventToolCall:
+			if ev.ToolCall != nil {
+				d, _ := json.Marshal(map[string]any{"name": ev.ToolCall.Name, "args": ev.ToolCall.Arguments})
+				sseWrite("tool", string(d))
+			}
+
+		case ab.StreamEventDone:
+			// Persist assistant message
+			assistantMsg, _ := InsertMessage(ctx, a.db, chatID, "assistant", fullResponse.String(), effectiveModel)
+			_ = a.pub.PublishChatMessage(ctx, chatID, assistantMsg)
+			d, _ := json.Marshal(map[string]any{"runId": runID, "messageId": assistantMsg.ID})
+			sseWrite("done", string(d))
+			log.Printf("stream.done chat_id=%d run_id=%s chars=%d", chatID, runID, fullResponse.Len())
+
+		case ab.StreamEventError:
+			msg := "unknown error"
+			if ev.Error != nil {
+				msg = ev.Error.Error()
+			}
+			d, _ := json.Marshal(map[string]string{"error": msg})
+			sseWrite("error", string(d))
+			log.Printf("stream.error chat_id=%d run_id=%s error=%s", chatID, runID, msg)
+		}
+	}
 }
 
 func withCORS(next http.Handler) http.Handler {

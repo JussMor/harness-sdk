@@ -7,6 +7,7 @@ import (
 	"strings"
 
 	ab "github.com/everfaz/autobuild-sdk"
+	sdkllm "github.com/everfaz/autobuild-sdk/providers/llm"
 	agent "github.com/everfaz/backend-chat/ai-sdk"
 )
 
@@ -48,46 +49,52 @@ func (a *agentProviderAdapter) Chat(ctx context.Context, req ab.ChatRequest) (*a
 	return resp, nil
 }
 
+// BuildLLMFromEnv builds the LLM provider from environment variables.
+// When ANTHROPIC_API_KEY is set, uses the SDK's native Anthropic provider
+// (which supports real token streaming via ChatStream). Falls back to the
+// ai-sdk adapter for other providers.
 func BuildLLMFromEnv() ab.LLMProvider {
 	defaultProvider := strings.ToLower(getenv("BACKEND_LLM_PROVIDER", "anthropic"))
-	providers := map[string]agent.Provider{}
+	routedProviders := map[string]ab.LLMProvider{}
 
+	// Anthropic: use SDK provider directly (supports real streaming)
 	if key := strings.TrimSpace(os.Getenv("ANTHROPIC_API_KEY")); key != "" {
-		providers["anthropic"] = agent.NewAnthropicProvider(agent.ProviderConfig{
-			Name:   "anthropic",
-			APIKey: key,
-		})
+		model := getenv("BACKEND_MODEL", "claude-sonnet-4-20250514")
+		// Strip provider prefix if present
+		if idx := strings.Index(model, "/"); idx >= 0 {
+			model = model[idx+1:]
+		}
+		routedProviders["anthropic"] = sdkllm.NewAnthropic(key, model)
 	}
 
+	// OpenAI: use ai-sdk adapter (no streaming support yet)
 	if key := strings.TrimSpace(os.Getenv("OPENAI_API_KEY")); key != "" {
-		providers["openai"] = agent.NewOpenAICompatProvider(agent.ProviderConfig{
+		prov := agent.NewOpenAICompatProvider(agent.ProviderConfig{
 			Name:    "openai",
 			BaseURL: getenv("OPENAI_BASE_URL", "https://api.openai.com/v1"),
 			APIKey:  key,
 		})
+		routedProviders["openai"] = &agentProviderAdapter{provider: prov}
 	}
 
-	providers["ollama"] = agent.NewOllamaProvider(agent.ProviderConfig{
-		Name:    "ollama",
-		BaseURL: getenv("OLLAMA_BASE_URL", "http://localhost:11434"),
-	})
+	// Ollama: use SDK provider (supports Ollama native API)
+	ollamaURL := getenv("OLLAMA_BASE_URL", "http://localhost:11434")
+	ollamaModel := getenv("OLLAMA_MODEL", "llama3.1")
+	routedProviders["ollama"] = sdkllm.NewOllama(ollamaModel)
+	_ = ollamaURL // Ollama provider uses default localhost
 
-	if _, ok := providers[defaultProvider]; !ok {
+	// Ensure defaultProvider exists
+	if _, ok := routedProviders[defaultProvider]; !ok {
 		for _, preferred := range []string{"anthropic", "openai", "ollama"} {
-			if _, exists := providers[preferred]; exists {
+			if _, exists := routedProviders[preferred]; exists {
 				defaultProvider = preferred
 				break
 			}
 		}
 	}
 
-	if len(providers) == 0 {
+	if len(routedProviders) == 0 {
 		return &EchoLLM{Model: getenv("BACKEND_MODEL", "anthropic/claude-sonnet-4-20250514")}
-	}
-
-	routedProviders := make(map[string]ab.LLMProvider, len(providers))
-	for name, provider := range providers {
-		routedProviders[name] = &agentProviderAdapter{provider: provider}
 	}
 
 	return ab.NewRoutedLLMProvider(defaultProvider, routedProviders)
