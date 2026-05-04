@@ -73,12 +73,19 @@ func (m *fsMemoryProvider) View(_ context.Context, scope ab.Scope, path string) 
 	if err != nil {
 		return "", err
 	}
+	cleanPath := filepath.Clean(strings.TrimSpace(path))
+	if cleanPath == "" {
+		cleanPath = "."
+	}
 	info, err := os.Stat(target)
 	if err != nil {
 		return "", err
 	}
 
 	if info.IsDir() {
+		if cleanPath == "." || cleanPath == string(os.PathSeparator) {
+			return m.renderDirectoryContents(target)
+		}
 		entries, err := os.ReadDir(target)
 		if err != nil {
 			return "", err
@@ -103,6 +110,37 @@ func (m *fsMemoryProvider) View(_ context.Context, scope ab.Scope, path string) 
 		return "", err
 	}
 	return string(data), nil
+}
+
+func (m *fsMemoryProvider) renderDirectoryContents(root string) (string, error) {
+	sections := make([]string, 0, 16)
+	err := filepath.WalkDir(root, func(p string, d fs.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		if d.IsDir() {
+			return nil
+		}
+		data, err := os.ReadFile(p)
+		if err != nil {
+			return err
+		}
+		content := strings.TrimSpace(string(data))
+		if content == "" {
+			return nil
+		}
+		rel, err := filepath.Rel(root, p)
+		if err != nil {
+			return err
+		}
+		sections = append(sections, fmt.Sprintf("[%s]\n%s", filepath.ToSlash(rel), content))
+		return nil
+	})
+	if err != nil {
+		return "", err
+	}
+	sort.Strings(sections)
+	return strings.Join(sections, "\n\n"), nil
 }
 
 func (m *fsMemoryProvider) Create(_ context.Context, scope ab.Scope, path, content string) error {
