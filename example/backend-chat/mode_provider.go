@@ -111,8 +111,8 @@ func newModeEngineWithDB(provider ab.LLMProvider, model string, logContext Runti
 			MaxFacts:      3,
 			MinConfidence: 0.75,
 		}).
-		// Planning: detect complex multi-step tasks
-		WithPlanner(ab.DefaultHeuristicPlanner()).
+		// Planning: LLM-driven decision + executable DAG proposal
+		WithPlanner(&ab.LLMPlanner{Provider: provider, Model: model, MaxExecutables: 6}).
 		WithAutoApprovePlan(true).
 		// Session context: inject time every turn
 		WithSessionContext(ab.LocalTimeSessionContext()).

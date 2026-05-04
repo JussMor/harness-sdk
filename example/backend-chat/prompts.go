@@ -3,9 +3,7 @@ package main
 import (
 	"context"
 	"database/sql"
-	"encoding/json"
 	"fmt"
-	"log"
 	"strings"
 
 	ab "github.com/everfaz/autobuild-sdk"
@@ -131,35 +129,10 @@ func runWithMode(
 		}
 	}()
 
-	// Parallel subagents path
-	useFormalPlan, proposedTasks := shouldUseFormalPlan(ctx, provider, messages, model)
-	log.Printf("formal_plan: useFormalPlan=%v tasks=%v", useFormalPlan, proposedTasks)
-
-	var planRunners []RunnerSummary
-	var planSummary string
-
-	if useFormalPlan && len(proposedTasks) > 0 {
-		planRunners, planSummary, err = executeFormalPlanWithTasks(
-			ctx, agentRT.execCtx, agentRT, messages, model, proposedTasks,
-		)
-		if err != nil {
-			return AssistantRunResult{}, err
-		}
-		if len(planRunners) > 0 {
-			return AssistantRunResult{
-				Content: buildFormalPlanResponse(planSummary, planRunners),
-				Runners: planRunners,
-			}, nil
-		}
-	}
-
-	// Single-agent path via Runtime.Run
+	// Main path via Runtime.Run
 	userMessage := latestUserPrompt(messages)
 	if userMessage == "" {
 		return AssistantRunResult{Content: "No user message found."}, nil
-	}
-	if planSummary != "" {
-		userMessage = planSummary + "\n\n" + userMessage
 	}
 
 	// Load persisted conversation or create from history
@@ -175,9 +148,23 @@ func runWithMode(
 		return AssistantRunResult{}, err
 	}
 
+	var planRunners []RunnerSummary
+	var planSummary string
+	if rr.PlanProposed != nil {
+		planRunners, planSummary, err = executeFormalPlanFromProposedPlan(ctx, agentRT.execCtx, agentRT, rr.PlanProposed, model)
+		if err != nil {
+			return AssistantRunResult{}, err
+		}
+	}
+
 	content := strings.TrimSpace(rr.Response)
-	if content == "" && len(planRunners) > 0 {
-		content = fmt.Sprintf("Se ejecutaron %d runners en paralelo.", len(planRunners))
+	if len(planRunners) > 0 {
+		formalContent := buildFormalPlanResponse(planSummary, planRunners)
+		if content == "" {
+			content = formalContent
+		} else {
+			content = strings.TrimSpace(content + "\n\n" + formalContent)
+		}
 	}
 
 	return AssistantRunResult{Content: content, Runners: planRunners}, nil
@@ -208,58 +195,4 @@ func buildFormalPlanResponse(planSummary string, runners []RunnerSummary) string
 		parts = append(parts, fmt.Sprintf("%d. [%s] %s: %s", i+1, status, task, result))
 	}
 	return strings.Join(parts, "\n")
-}
-
-func shouldUseFormalPlan(ctx context.Context, llm ab.LLMProvider, messages []ab.ChatMessage, model string) (bool, []string) {
-	var userPrompt string
-	for i := len(messages) - 1; i >= 0; i-- {
-		if messages[i].Role == ab.RoleUser {
-			userPrompt = strings.TrimSpace(messages[i].Content)
-			break
-		}
-	}
-	if userPrompt == "" {
-		return false, nil
-	}
-
-	resp, err := llm.Chat(ctx, ab.ChatRequest{
-		Model: model,
-		Messages: []ab.ChatMessage{
-			{
-				Role: ab.RoleSystem,
-				Content: `Task decomposition assistant. Respond ONLY with JSON:
-{"parallel": bool, "count": int, "tasks": [strings]}
-parallel: true only if multiple independent subtasks.
-count: number of subtasks (0 if parallel=false).
-tasks: concrete subtask descriptions (empty if parallel=false).`,
-			},
-			{Role: ab.RoleUser, Content: userPrompt},
-		},
-	})
-	if err != nil {
-		log.Printf("shouldUseFormalPlan: %v", err)
-		return false, nil
-	}
-
-	content := strings.TrimSpace(resp.Content)
-	if idx := strings.Index(content, "{"); idx > 0 {
-		content = content[idx:]
-	}
-	if idx := strings.LastIndex(content, "}"); idx >= 0 {
-		content = content[:idx+1]
-	}
-
-	var result struct {
-		Parallel bool     `json:"parallel"`
-		Count    int      `json:"count"`
-		Tasks    []string `json:"tasks"`
-	}
-	if err := json.Unmarshal([]byte(content), &result); err != nil {
-		log.Printf("shouldUseFormalPlan parse error: %v content=%q", err, content)
-		return false, nil
-	}
-	if !result.Parallel || result.Count < 2 || len(result.Tasks) < 2 {
-		return false, nil
-	}
-	return true, result.Tasks
 }
