@@ -1,307 +1,65 @@
 package main
 
 import (
-	"context"
 	"fmt"
-	"io/fs"
+	"log"
 	"os"
 	"path/filepath"
-	"sort"
-	"strings"
 
 	ab "github.com/everfaz/autobuild-sdk"
+	sdkmemory "github.com/everfaz/autobuild-sdk/providers/memory"
 )
 
-type fsMemoryProvider struct {
-	root string
-}
+// loadBackendMemory initializes the LayeredFilesystemMemory provider from
+// the SDK. It creates the standard directory structure expected by
+// DefaultMemoryRoots:
+//
+//	{root}/user/profile/    — user preferences, identity
+//	{root}/user/facts/      — inferred and explicit facts about the user
+//	{root}/project/         — project context, decisions, workflow state
+//
+// Returns a LayeredMemoryProvider (superset of MemoryProvider), and separately
+// returns the MemoryRoot configuration so the Runtime can inject labeled
+// sections into LayerMemory during orientation.
+func loadBackendMemory() (ab.MemoryProvider, []ab.MemoryRoot, error) {
+	root := resolveMemoryRoot()
 
-func newFSMemoryProvider(root string) (*fsMemoryProvider, error) {
-	root = strings.TrimSpace(root)
-	if root == "" {
-		return nil, fmt.Errorf("memory root is required")
+	// Create all subdirs that DefaultMemoryRoots will read
+	dirs := []string{
+		filepath.Join(root, "user", "profile"),
+		filepath.Join(root, "user", "facts"),
+		filepath.Join(root, "project"),
 	}
-	absRoot, err := filepath.Abs(root)
+	for _, dir := range dirs {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			return nil, nil, fmt.Errorf("create memory dir %s: %w", dir, err)
+		}
+	}
+
+	provider, err := sdkmemory.NewLayeredFilesystem(root)
 	if err != nil {
-		return nil, err
+		return nil, nil, fmt.Errorf("layered filesystem memory: %w", err)
 	}
-	if err := os.MkdirAll(filepath.Join(absRoot, string(ab.ScopeUser)), 0o755); err != nil {
-		return nil, err
-	}
-	if err := os.MkdirAll(filepath.Join(absRoot, string(ab.ScopeProject)), 0o755); err != nil {
-		return nil, err
-	}
-	return &fsMemoryProvider{root: absRoot}, nil
+
+	log.Printf("backend memory: root=%s (BM25 search, layered)", root)
+	return provider, ab.DefaultMemoryRoots, nil
 }
 
-func loadBackendMemory() (ab.MemoryProvider, error) {
-	paths := []string{
+// resolveMemoryRoot finds or creates the memory directory.
+// Priority: BACKEND_MEMORY_ROOT env var → ./memory → relative fallbacks.
+func resolveMemoryRoot() string {
+	if env := os.Getenv("BACKEND_MEMORY_ROOT"); env != "" {
+		return env
+	}
+	candidates := []string{
 		"memory",
 		filepath.Join("example", "backend-chat", "memory"),
 		filepath.Join("..", "backend-chat", "memory"),
 	}
-
-	var lastErr error
-	for _, p := range paths {
-		provider, err := newFSMemoryProvider(p)
-		if err == nil {
-			return provider, nil
+	for _, c := range candidates {
+		if _, err := os.Stat(filepath.Dir(c)); err == nil {
+			return c
 		}
-		lastErr = err
 	}
-
-	if lastErr != nil {
-		return nil, lastErr
-	}
-	return nil, fmt.Errorf("unable to initialize backend memory provider")
-}
-
-func (m *fsMemoryProvider) View(_ context.Context, scope ab.Scope, path string) (string, error) {
-	if scope == ab.Scope("*") {
-		userOut, err := m.View(context.Background(), ab.ScopeUser, path)
-		if err != nil {
-			userOut = fmt.Sprintf("error: %v", err)
-		}
-		projectOut, err := m.View(context.Background(), ab.ScopeProject, path)
-		if err != nil {
-			projectOut = fmt.Sprintf("error: %v", err)
-		}
-		return "[user]\n" + userOut + "\n\n[project]\n" + projectOut, nil
-	}
-
-	target, err := m.resolve(scope, path)
-	if err != nil {
-		return "", err
-	}
-	cleanPath := filepath.Clean(strings.TrimSpace(path))
-	if cleanPath == "" {
-		cleanPath = "."
-	}
-	info, err := os.Stat(target)
-	if err != nil {
-		return "", err
-	}
-
-	if info.IsDir() {
-		if cleanPath == "." || cleanPath == string(os.PathSeparator) {
-			return m.renderDirectoryContents(target)
-		}
-		entries, err := os.ReadDir(target)
-		if err != nil {
-			return "", err
-		}
-		items := make([]string, 0, len(entries))
-		for _, e := range entries {
-			name := e.Name()
-			if e.IsDir() {
-				name += "/"
-			}
-			items = append(items, name)
-		}
-		sort.Strings(items)
-		if len(items) == 0 {
-			return "", nil
-		}
-		return strings.Join(items, "\n"), nil
-	}
-
-	data, err := os.ReadFile(target)
-	if err != nil {
-		return "", err
-	}
-	return string(data), nil
-}
-
-func (m *fsMemoryProvider) renderDirectoryContents(root string) (string, error) {
-	sections := make([]string, 0, 16)
-	err := filepath.WalkDir(root, func(p string, d fs.DirEntry, walkErr error) error {
-		if walkErr != nil {
-			return walkErr
-		}
-		if d.IsDir() {
-			return nil
-		}
-		data, err := os.ReadFile(p)
-		if err != nil {
-			return err
-		}
-		content := strings.TrimSpace(string(data))
-		if content == "" {
-			return nil
-		}
-		rel, err := filepath.Rel(root, p)
-		if err != nil {
-			return err
-		}
-		sections = append(sections, fmt.Sprintf("[%s]\n%s", filepath.ToSlash(rel), content))
-		return nil
-	})
-	if err != nil {
-		return "", err
-	}
-	sort.Strings(sections)
-	return strings.Join(sections, "\n\n"), nil
-}
-
-func (m *fsMemoryProvider) Create(_ context.Context, scope ab.Scope, path, content string) error {
-	target, err := m.resolve(scope, path)
-	if err != nil {
-		return err
-	}
-	if _, err := os.Stat(target); err == nil {
-		return fmt.Errorf("memory file already exists: %s", path)
-	}
-	if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
-		return err
-	}
-	return os.WriteFile(target, []byte(content), 0o644)
-}
-
-func (m *fsMemoryProvider) StrReplace(_ context.Context, scope ab.Scope, path, oldStr, newStr string) error {
-	target, err := m.resolve(scope, path)
-	if err != nil {
-		return err
-	}
-	data, err := os.ReadFile(target)
-	if err != nil {
-		return err
-	}
-	text := string(data)
-	count := strings.Count(text, oldStr)
-	if count != 1 {
-		return fmt.Errorf("old_str must appear exactly once (found %d)", count)
-	}
-	text = strings.Replace(text, oldStr, newStr, 1)
-	return os.WriteFile(target, []byte(text), 0o644)
-}
-
-func (m *fsMemoryProvider) Delete(_ context.Context, scope ab.Scope, path string) error {
-	target, err := m.resolve(scope, path)
-	if err != nil {
-		return err
-	}
-	return os.RemoveAll(target)
-}
-
-func (m *fsMemoryProvider) Rename(_ context.Context, scope ab.Scope, oldPath, newPath string) error {
-	oldTarget, err := m.resolve(scope, oldPath)
-	if err != nil {
-		return err
-	}
-	newTarget, err := m.resolve(scope, newPath)
-	if err != nil {
-		return err
-	}
-	if err := os.MkdirAll(filepath.Dir(newTarget), 0o755); err != nil {
-		return err
-	}
-	return os.Rename(oldTarget, newTarget)
-}
-
-func (m *fsMemoryProvider) List(_ context.Context, scope ab.Scope, path string) ([]string, error) {
-	target, err := m.resolve(scope, path)
-	if err != nil {
-		return nil, err
-	}
-
-	items := make([]string, 0)
-	err = filepath.WalkDir(target, func(p string, d fs.DirEntry, walkErr error) error {
-		if walkErr != nil {
-			return walkErr
-		}
-		rel, err := filepath.Rel(target, p)
-		if err != nil {
-			return err
-		}
-		if rel == "." {
-			return nil
-		}
-		rel = filepath.ToSlash(rel)
-		if d.IsDir() {
-			rel += "/"
-		}
-		items = append(items, rel)
-		return nil
-	})
-	if err != nil {
-		return nil, err
-	}
-	sort.Strings(items)
-	return items, nil
-}
-
-func (m *fsMemoryProvider) Search(_ context.Context, scope ab.Scope, query string) ([]ab.MemoryEntry, error) {
-	query = strings.ToLower(strings.TrimSpace(query))
-	if query == "" {
-		return nil, fmt.Errorf("search query is required")
-	}
-
-	searchScopes := []ab.Scope{scope}
-	if scope == ab.Scope("*") {
-		searchScopes = []ab.Scope{ab.ScopeUser, ab.ScopeProject}
-	}
-
-	out := make([]ab.MemoryEntry, 0)
-	for _, sc := range searchScopes {
-		root, err := m.resolve(sc, ".")
-		if err != nil {
-			return nil, err
-		}
-		_ = filepath.WalkDir(root, func(p string, d fs.DirEntry, walkErr error) error {
-			if walkErr != nil || d.IsDir() {
-				return nil
-			}
-			data, err := os.ReadFile(p)
-			if err != nil {
-				return nil
-			}
-			content := string(data)
-			if !strings.Contains(strings.ToLower(content), query) && !strings.Contains(strings.ToLower(filepath.Base(p)), query) {
-				return nil
-			}
-			rel, err := filepath.Rel(filepath.Join(m.root, string(sc)), p)
-			if err != nil {
-				return nil
-			}
-			out = append(out, ab.MemoryEntry{
-				Path:    filepath.ToSlash(rel),
-				Scope:   sc,
-				Content: content,
-			})
-			return nil
-		})
-	}
-
-	sort.Slice(out, func(i, j int) bool {
-		if out[i].Scope == out[j].Scope {
-			return out[i].Path < out[j].Path
-		}
-		return out[i].Scope < out[j].Scope
-	})
-	return out, nil
-}
-
-func (m *fsMemoryProvider) resolve(scope ab.Scope, p string) (string, error) {
-	if scope != ab.ScopeUser && scope != ab.ScopeProject {
-		return "", fmt.Errorf("invalid memory scope: %s", scope)
-	}
-
-	clean := filepath.Clean(strings.TrimSpace(p))
-	if clean == "" {
-		clean = "."
-	}
-	base := filepath.Join(m.root, string(scope))
-	target := filepath.Join(base, clean)
-	absTarget, err := filepath.Abs(target)
-	if err != nil {
-		return "", err
-	}
-	absBase, err := filepath.Abs(base)
-	if err != nil {
-		return "", err
-	}
-	if absTarget != absBase && !strings.HasPrefix(absTarget, absBase+string(os.PathSeparator)) {
-		return "", fmt.Errorf("invalid memory path: %s", p)
-	}
-	return absTarget, nil
+	return "memory"
 }
