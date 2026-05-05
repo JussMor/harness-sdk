@@ -380,9 +380,30 @@ export function ChatMain({
       if (event.type === "error") {
         const errorMessage = event.data.error || "Unknown stream error"
         pushTimeline(`Stream error: ${errorMessage}`, "error")
+        return
+      }
+
+      if (event.type === "done") {
+        const messageId = event.data.messageId
+        if (!messageId || !chatID) return
+
+        // Fetch the persisted message from the backend and replace the local
+        // in-memory message with it. This ensures tool traces from metadata
+        // are correctly restored and nothing is lost after stream ends.
+        api.listMessages(chatID).then((msgs) => {
+          const saved = msgs.find((m) => m.id === messageId)
+          if (!saved) return
+          const restored = toChatMessage(saved)
+          setMessages((prev) =>
+            prev.map((m) => (m.id === pendingAssistantId ? restored : m))
+          )
+        }).catch(() => {
+          // Non-fatal — in-memory message already has the content
+        })
+        return
       }
     },
-    [pushTimeline]
+    [pushTimeline, api, chatID]
   )
 
   const ensureChat = useCallback(async (): Promise<number> => {
@@ -731,12 +752,25 @@ export function ChatMain({
 }
 
 function toChatMessage(message: BackendMessage): ChatMessage {
+  // Restore tool traces from persisted metadata
+  const traces: Array<ToolTrace> = (message.metadata?.toolCalls ?? []).map(
+    (tc, i) => ({
+      id: `restored-${message.id}-${i}`,
+      name: tc.name,
+      args: tc.args,
+      result: tc.result,
+      error: tc.error,
+      status: tc.error ? ("error" as const) : ("success" as const),
+    })
+  )
+
   return {
     id: String(message.id),
     role: message.role,
     content: message.content,
     model: message.model,
     pending: false,
+    traces: traces.length > 0 ? traces : undefined,
   }
 }
 
