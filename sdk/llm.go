@@ -23,6 +23,22 @@ type ChatMessage struct {
 	Name       string          `json:"name,omitempty"`        // tool name when Role == RoleTool
 	ToolCallID string          `json:"tool_call_id,omitempty"` // links a tool result to a request
 	ToolCalls  []ToolCallEntry `json:"tool_calls,omitempty"`   // assistant requesting tool calls
+	Images     []ImageContent  `json:"images,omitempty"`       // attached images (vision-enabled models)
+}
+
+// ImageContent represents an image attached to a chat message.
+// The provider decides how to encode it for the underlying API.
+// Either Source (base64) or URL must be set.
+type ImageContent struct {
+	// Source is the base64-encoded image data (without the data: prefix).
+	Source string `json:"source,omitempty"`
+
+	// MediaType is the MIME type (e.g. "image/jpeg", "image/png", "image/webp", "image/gif").
+	MediaType string `json:"media_type,omitempty"`
+
+	// URL is an alternative to Source for providers that accept URL inputs.
+	// Anthropic supports URL-based images via type=url; OpenAI supports image_url.
+	URL string `json:"url,omitempty"`
 }
 
 // ToolCallEntry represents a single tool call requested by the LLM.

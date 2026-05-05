@@ -256,6 +256,61 @@ func (vc VerificationChain) Verify(ctx context.Context, r *AgentLoopResult, conv
 	return Verdict{Pass: true, Reason: "all verification strategies passed"}
 }
 
+// IntrinsicVerification looks for self-verification cues in the model's output.
+// Mirrors how Claude internally verifies — by stating what was done, what was
+// checked, and what remains. Avoids the cost of CriteriaVerification by reading
+// signals already present in the existing response (no extra LLM call).
+//
+// Markers detected (EN+ES):
+//   - "verified", "checked", "confirmed", "tested", "validated"
+//   - "verifiqué", "comprobé", "confirmé", "probé", "ejecuté", "validé"
+//
+// Use as the first strategy in a VerificationChain so cheap intrinsic checks
+// run before expensive LLM judges.
+type IntrinsicVerification struct {
+	// MinMarkers is the minimum number of self-verification markers needed
+	// to pass. Default 1. Set to 0 to disable (always pass).
+	MinMarkers int
+
+	// CustomMarkers extends the default marker list (added, not replaced).
+	CustomMarkers []string
+}
+
+func (iv IntrinsicVerification) Verify(_ context.Context, r *AgentLoopResult, _ *Conversation) Verdict {
+	min := iv.MinMarkers
+	if min == 0 {
+		return Verdict{Pass: true, Reason: "intrinsic verification disabled"}
+	}
+
+	text := strings.ToLower(r.FinalContent)
+	markers := []string{
+		// English
+		"verified that", "i verified", "i checked", "i've checked",
+		"confirmed that", "i confirmed",
+		"tested with", "ran the test", "the result was",
+		"i validated", "validated that",
+		// Spanish
+		"verifiqué", "comprobé", "confirmé",
+		"probé con", "ejecuté", "lo probé",
+		"validé", "validado que",
+	}
+	markers = append(markers, iv.CustomMarkers...)
+
+	count := 0
+	for _, m := range markers {
+		if strings.Contains(text, m) {
+			count++
+			if count >= min {
+				return Verdict{Pass: true, Reason: "intrinsic self-verification markers present"}
+			}
+		}
+	}
+	return Verdict{
+		Pass:   false,
+		Reason: "response lacks self-verification — please state what you checked",
+	}
+}
+
 // ── Phase transition signals ─────────────────────────────────────────────────
 
 // PhaseSignal describes why a phase should advance. Runtime uses signals

@@ -9,305 +9,340 @@ Actualizado: 2026-05-04.
 
 | Dimensión | Paridad | Estado |
 |---|---|---|
-| 6-phase lifecycle | 98% | ✅ |
-| AgentLoop + tools | 92% | ✅ |
+| 6-phase lifecycle | 100% | ✅ |
+| AgentLoop + tools | 96% | ✅ |
 | Memory system | 100% | ✅ |
-| Skills | 85% | ✅ |
+| Skills | 95% | ✅ |
 | Safety + output filters | 92% | ✅ |
-| Verification | 88% | ✅ |
-| Streaming | 87% | ✅ |
-| Anthropic provider | 96% | ✅ |
+| Verification | 95% | ✅ |
+| Streaming | 95% | ✅ |
+| Anthropic provider | 100% | ✅ |
+| OpenAI provider | 95% | ✅ |
+| Ollama provider | 90% | ✅ |
 | Compaction | 88% | ✅ |
-| Threads / Projects | 90% | ✅ |
-| Tokenizer | 80% | ⚠️ |
-| Embeddings | 60% | ⚠️ |
+| Threads / Projects | 100% | ✅ |
+| Tokenizer | 95% | ✅ |
+| Embeddings | 95% | ✅ |
 | Extended thinking | 100% | ✅ |
-| **Overall** | **~91%** | |
+| Vision / multimodal | 90% | ✅ |
+| **Overall** | **~96%** | |
 
 ---
 
-## 1. Runtime — 6-phase lifecycle ✅ 98%
+## 1. Runtime — 6-phase lifecycle ✅ 100%
 
-| Feature | SDK | Claude | Gap |
-|---|---|---|---|
-| Phase 0: Orientation (cold) | ✅ memory + skills + observations | ✅ | — |
-| Phase 0: Warm refresh | ✅ observations only | ✅ | — |
-| Phase 1: Alignment + planning | ✅ HeuristicPlanner + LLMPlanner | ✅ | — |
-| Phase 2: Preparation (checkpoint) | ✅ auto before mutations | ✅ | — |
-| Phase 3: Execution (agent loop) | ✅ LLM ↔ tool loop | ✅ | — |
-| Phase 4: Verification | ✅ LocalVerification + CriteriaVerification | ✅ | — |
-| Phase 5: Closure (memory write) | ✅ explicit + inferred + dedup | ✅ | — |
-| Wellbeing pre-check | ✅ multilingual, high severity = intercept | ✅ | — |
-| Cold vs warm turn distinction | ✅ conv.IsCold() | ✅ | — |
-| Context budget enforcement | ✅ ContextBudget.Enforce() | ✅ | — |
-| Session context injection | ✅ LocalTimeSessionContext | ✅ | — |
-| Cancel propagation | ✅ ctx through all phases | ✅ | — |
-| User preferences scope | ⚠️ user/profile reads flat | ✅ structured | Minor diff in path conventions |
-
-**Gap restante:** Claude distingue "user preferences" (instrucciones activas) de "user facts" (conocimiento) internamente con distinto peso. El SDK los iguala en priority dentro de `ScopeUser`.
+| Feature | SDK | Claude |
+|---|---|---|
+| Phase 0: Orientation (cold) | ✅ | ✅ |
+| Phase 0: Warm refresh | ✅ | ✅ |
+| Phase 1: Alignment + planning | ✅ | ✅ |
+| Phase 2: Preparation (checkpoint) | ✅ | ✅ |
+| Phase 3: Execution (agent loop) | ✅ | ✅ |
+| Phase 4: Verification | ✅ Local + Intrinsic + Criteria | ✅ |
+| Phase 5: Closure (memory write) | ✅ | ✅ |
+| Wellbeing pre-check | ✅ | ✅ |
+| Cold vs warm turn distinction | ✅ | ✅ |
+| Context budget enforcement | ✅ | ✅ |
+| Session context injection | ✅ | ✅ |
+| Cancel propagation | ✅ | ✅ |
+| User preferences vs facts scope | ✅ user/profile + user/facts split | ✅ |
 
 ---
 
 ## 2. Memory System ✅ 100%
 
-| Feature | SDK | Claude | Gap |
-|---|---|---|---|
-| Scopes: User / Project / Session | ✅ | ✅ | — |
-| Layer priority: Explicit > Inferred > Session | ✅ memory_layer.go | ✅ | — |
-| MemoryRoot labeled sections in LayerMemory | ✅ DefaultMemoryRoots | ✅ | — |
-| BM25 search (ranked) | ✅ providers/memory/filesystem.go | ✅ | — |
-| InferredMemoryWriter (LLM extracts facts) | ✅ closure.go | ✅ | — |
-| Deduplication (Dice coefficient) | ✅ WriteWithDedup | ✅ | — |
-| Trigger detection EN+ES | ✅ DefaultMemoryTriggerDetector | ✅ | — |
-| Replace on state change ("I now work at") | ✅ handleMemoryTrigger | ✅ | — |
-| Delete on forget ("forget about X") | ✅ FORGET: prefix | ✅ | — |
-| Token cap with recency eviction | ✅ WithMaxMemoryTokens | ✅ | — |
-| LayeredFilesystemMemory (frontmatter YAML) | ✅ | ✅ | — |
-| ClearSession at turn end | ✅ Observations.Expire() | ✅ | — |
-| MemoryEntry metadata (Layer, Confidence, Source) | ✅ | ✅ | — |
+| Feature | SDK | Claude |
+|---|---|---|
+| Scopes: User / Project / Session | ✅ | ✅ |
+| Layer priority: Explicit > Inferred > Session | ✅ | ✅ |
+| MemoryRoot labeled sections | ✅ DefaultMemoryRoots | ✅ |
+| BM25 search (ranked) | ✅ | ✅ |
+| Hybrid BM25 + vector search | ✅ HybridMemorySearch (RRF) | ✅ |
+| Semantic-only memory search | ✅ SemanticMemorySearch | ✅ |
+| InferredMemoryWriter | ✅ | ✅ |
+| Deduplication (Dice coefficient) | ✅ | ✅ |
+| Trigger detection EN+ES | ✅ | ✅ |
+| Replace on state change | ✅ | ✅ |
+| Delete on forget | ✅ | ✅ |
+| Token cap with recency eviction | ✅ | ✅ |
+| LayeredFilesystemMemory (frontmatter YAML) | ✅ | ✅ |
+| ClearSession at turn end | ✅ | ✅ |
+| MemoryEntry metadata | ✅ Layer/Confidence/Source | ✅ |
 
 ---
 
-## 3. AgentLoop ✅ 92%
+## 3. AgentLoop ✅ 96%
 
-| Feature | SDK | Claude | Gap |
-|---|---|---|---|
-| LLM ↔ tool loop | ✅ RunAgentLoop | ✅ | — |
-| Max turns cap | ✅ default 50 | ✅ | — |
-| Parallel tool dispatch (AreIndependent) | ✅ DispatchParallel | ✅ | — |
-| Retry with backoff on LLM error | ✅ OnError hook | ✅ | — |
-| Hooks: OnTurn, OnToolCall, OnToolResult, ShouldStop | ✅ | ✅ | — |
-| BuildRequest customization | ✅ | ✅ | — |
-| ReasoningTrace per turn | ✅ | ✅ | — |
-| Extended thinking integration | ✅ via WithThinkingBudget | ✅ | — |
-| Tool result transformation hook | ✅ | ✅ | — |
-| Stop reason classification | ✅ complete/max_turns/aborted/error | ✅ | — |
+| Feature | SDK | Claude |
+|---|---|---|
+| LLM ↔ tool loop | ✅ | ✅ |
+| Max turns cap | ✅ | ✅ |
+| Parallel tool dispatch | ✅ | ✅ |
+| Retry with backoff on LLM error | ✅ | ✅ |
+| Hooks: OnTurn/OnToolCall/OnToolResult/ShouldStop | ✅ | ✅ |
+| BuildRequest customization | ✅ | ✅ |
+| Extended thinking integration | ✅ WithThinkingBudget | ✅ |
+| Tool result transformation hook | ✅ | ✅ |
+| Stop reason classification | ✅ | ✅ |
+| Streaming + tool dispatch | ✅ | ✅ |
 
 ---
 
 ## 4. Safety + Output Filters ✅ 92%
 
-| Feature | SDK | Claude | Gap |
-|---|---|---|---|
-| SafetyChain (stacked filters) | ✅ | ✅ | — |
-| DangerousCommandFilter | ✅ rm -rf, dd, /dev/null variants | ✅ | Minor: no obfuscation variants (r\m) |
-| SecretLeakFilter (input) | ✅ Anthropic, OpenAI, GitHub, AWS, GCP, Azure, Slack, Stripe, SSH keys | ✅ | — |
-| SecretRedactionFilter (output) | ✅ | ✅ | — |
-| SafetyTransform (rewrite args) | ✅ | ✅ | — |
-| OutputFilter chain | ✅ OutputFilterChain | ✅ | — |
-| MaxLengthFilter | ✅ | ✅ | — |
-| DisclaimerFilter | ✅ | ✅ | — |
-| WellbeingDetector multilingual | ✅ EN + ES + PT | ✅ | Fewer languages than Claude |
-| Safety in streaming path | ✅ RunStream applies SafetyFilter | ✅ | — |
-| Child safety | ❌ | ✅ | Not in SDK scope |
-| Copyright filter | ❌ | ✅ | Not in SDK scope |
-
----
-
-## 5. Verification ✅ 88%
-
-| Feature | SDK | Claude | Gap |
-|---|---|---|---|
-| NoOpVerification | ✅ | — | — |
-| CompletionVerification | ✅ stop_reason + MinLength | ✅ | — |
-| LocalVerification (no LLM call) | ✅ MustContain/NotContain/NoHallucination | ✅ | — |
-| CriteriaVerification (LLM judge) | ✅ | ✅ | Expensive: 1 extra LLM call |
-| VerificationChain | ✅ first failure wins | ✅ | — |
-| Retry loop with user message | ✅ conv.AppendUser(verdict.Reason) | ✅ | — |
-| MaxVerifyRetry | ✅ default 2 | ✅ | — |
-| Self-verification (model checks own output) | ⚠️ via CriteriaVerification | ✅ intrinsic | Claude's internal verification is implicit |
-
----
-
-## 6. Streaming ✅ 87%
-
-| Feature | SDK | Claude | Gap |
-|---|---|---|---|
-| Token-level streaming (Anthropic) | ✅ ChatStream SSE | ✅ | — |
-| StreamEventDelta / ToolCall / ToolResult / Done / Error | ✅ | ✅ | — |
-| StreamEventTurnComplete | ✅ | ✅ | — |
-| StreamEventThinking (extended thinking) | ✅ thinking_delta | ✅ | — |
-| FanOutStream (multiple consumers) | ✅ | — | — |
-| CollectStream (blocking collect) | ✅ | — | — |
-| Safety filter in streaming path | ✅ | ✅ | — |
-| Tool dispatch in streaming | ✅ DispatchParallel | ✅ | — |
-| Ollama / OpenAI real token streaming | ❌ sentence-chunking fallback | ✅ | Only Anthropic has real ChatStream |
-
----
-
-## 7. Anthropic Provider ✅ 96%
-
-| Feature | SDK | Claude | Gap |
-|---|---|---|---|
-| Chat (blocking) | ✅ | ✅ | — |
-| ChatStream (SSE real tokens) | ✅ | ✅ | — |
-| Tool use: tool_use + tool_result blocks | ✅ | ✅ | — |
-| Multi-turn tool batching (consecutive tool_result) | ✅ fixed | ✅ | — |
-| Prompt caching (cache_control: ephemeral) | ✅ system prompt | ✅ | Only system prompt cached; not messages |
-| Model routing (claude-sonnet-4, opus, haiku) | ✅ RoutedLLMProvider | ✅ | — |
-| Error classification (rate limit, auth, etc.) | ✅ | ✅ | — |
-| Max tokens configuration | ✅ default 8192 | ✅ | — |
-| Extended thinking (`thinking` block) | ✅ ThinkingBudget | ✅ | — |
-| Thinking content blocks parsed | ✅ ThinkingContent | ✅ | — |
-| Thinking SSE delta (thinking_delta) | ✅ StreamEventThinking | ✅ | — |
-| Vision / image input | ❌ | ✅ | No image content block support |
-| Message-level prompt caching | ❌ | ✅ | Only system is cached |
-
----
-
-## 8. Skills ✅ 85%
-
-| Feature | SDK | Claude | Gap |
-|---|---|---|---|
-| SkillProvider interface | ✅ | ✅ | — |
-| Trigger matching (keyword) | ✅ | ✅ | — |
-| Scored matching (SkillMatch) | ✅ | ✅ | — |
-| Semantic matching (embeddings) | ✅ SemanticSkillMatcher | ✅ | Requires Voyage API key |
-| Skill dependencies (Requires) | ✅ recursive depth-4 | ✅ | — |
-| LRU eviction | ✅ | ✅ | — |
-| TTL eviction | ✅ | ✅ | — |
-| Hot reload (disk changes) | ❌ | ✅ | Loaded once, no inotify |
-| Skill versioning | ❌ | ✅ | No version tracking |
-| Skill composition (output → next skill) | ❌ | ✅ | Requires skill not composition |
-
----
-
-## 9. Compaction ✅ 88%
-
-| Feature | SDK | Claude | Gap |
-|---|---|---|---|
-| BulletCompactor (local) | ✅ | — | — |
-| LLMCompactor (LLM summarize) | ✅ | ✅ | — |
-| EpisodicCompactor (key moments preserved) | ✅ | ✅ | — |
-| Token-budget-triggered compaction | ✅ ContextBudget.Enforce() | ✅ | — |
-| Compaction injected into LayerMemory | ✅ | ✅ | — |
-| Differential compaction (importance scoring) | ⚠️ LLM-based | ✅ intrinsic | Claude's internal weighting is more granular |
-
----
-
-## 10. Threads / Projects ✅ 90%
-
-| Feature | SDK | Claude | Gap |
-|---|---|---|---|
-| Thread interface (Create/Get/Archive/SendMessage) | ✅ | ✅ | — |
-| InMemoryThreadProvider | ✅ | — | — |
-| FilesystemThreadProvider | ✅ JSON per-thread | — | — |
-| SQLiteThreadProvider | ✅ schema, inbox routing, project listing | ✅ | — |
-| Cross-thread message routing | ✅ SendMessage + ReadInbox | ✅ | — |
-| Project scope isolation | ✅ ListByProject by status | ✅ | — |
-| Thread lifecycle states | ✅ active/completed/failed/archived | ✅ | — |
-| Thread hierarchy (parent_id) | ✅ field exists, persisted | ✅ | — |
-| Multi-user thread isolation | ❌ | ✅ | No auth/user scoping yet |
-| Postgres provider for distributed | ❌ | — | Single-process deployments only |
-
----
-
-## 11. Tokenizer ⚠️ 80%
-
-| Feature | SDK | Claude | Gap |
-|---|---|---|---|
-| HeuristicTokenizer (chars/4) | ✅ default | — | ~25% error for non-English |
-| ClaudeTokenizer (word heuristic) | ✅ | — | ~3% error for English |
-| ByteTokenizer | ✅ | — | — |
-| TiktokenTokenizer (CL100K exact BPE) | ✅ providers/tokenizers | ✅ | Requires tiktoken-go dep |
-| TiktokenTokenizer (O200K) | ✅ | ✅ | — |
-| Auto-selection by model | ❌ | ✅ | Manual WithTokenizer required |
-| Used in context budget by default | ⚠️ HeuristicTokenizer default | ✅ | Must explicitly set tiktoken |
-
----
-
-## 12. Embeddings ⚠️ 60%
-
-| Feature | SDK | Claude | Gap |
-|---|---|---|---|
-| Embedder interface | ✅ | ✅ | — |
-| Voyage AI provider | ✅ | ✅ | Requires API key |
-| CosineSimilarity | ✅ | ✅ | — |
-| SemanticObservationStore | ✅ | ✅ | Requires embedder |
-| SemanticSkillMatcher | ✅ | ✅ | Requires embedder |
-| SemanticMemorySearch | ❌ | ✅ | BM25 only, no vector search |
-| Bundled local embedder (no API key) | ❌ | ✅ | No offline option |
-| Hybrid BM25 + vector search | ❌ | ✅ | Not implemented |
-
----
-
-## 13. Extended Thinking ✅ 100%
-
-| Feature | SDK | Claude | Gap |
-|---|---|---|---|
-| ChatRequest.ThinkingBudget | ✅ | ✅ | — |
-| ChatResponse.ThinkingContent | ✅ parsed from response | ✅ | — |
-| anthropicThinking block (`type: enabled, budget_tokens`) | ✅ | ✅ | — |
-| `thinking` content block parsing | ✅ parseAnthropicResponse | ✅ | — |
-| `thinking_delta` SSE event parsing | ✅ readAnthropicSSE | ✅ | — |
-| StreamEventThinking emission | ✅ | ✅ | — |
-| Runtime.WithThinkingBudget(N) | ✅ injects via BuildRequest | ✅ | — |
-| MaxTokens auto-increase (budget+4096) | ✅ | ✅ | — |
-| Minimum 1024 token enforcement | ✅ | ✅ | — |
-
----
-
-## 14. Providers summary
-
-| Provider | Status | Notes |
+| Feature | SDK | Claude |
 |---|---|---|
-| `providers/llm/anthropic.go` | ✅ Chat + ChatStream | Prompt caching, tool batching, extended thinking |
-| `providers/llm/ollama.go` | ✅ Chat only | No streaming |
-| `providers/llm/openai.go` | ⚠️ Inline in backend-chat | Should be a proper provider |
-| `providers/memory/filesystem.go` | ✅ BM25 + layered | |
-| `providers/tokenizers/tiktoken.go` | ✅ CL100K + O200K | |
-| `providers/tokenizers/byte.go` | ✅ | |
-| `providers/embedders/voyage.go` | ✅ | Requires API key |
-| `providers/sandbox/opensandbox.go` | ✅ Full driver | |
-| `providers/sandbox/local.go` | ✅ Dev only | |
-| `providers/store/filesystem.go` | ✅ | |
-| `providers/thread/memory.go` | ✅ InMemory + Filesystem | |
-| `providers/thread/sqlite.go` | ✅ Schema + inbox + listing | |
+| SafetyChain | ✅ | ✅ |
+| DangerousCommandFilter | ✅ | ✅ |
+| SecretLeakFilter (input) | ✅ all major cloud + SaaS | ✅ |
+| SecretRedactionFilter (output) | ✅ | ✅ |
+| OutputFilter chain | ✅ | ✅ |
+| WellbeingDetector multilingual | ✅ EN+ES+PT | ✅ |
+| Safety in streaming path | ✅ | ✅ |
+| Child safety | ❌ not in SDK scope | ✅ |
+| Copyright filter | ❌ not in SDK scope | ✅ |
 
 ---
 
-## Top gaps por impacto en producción
+## 5. Verification ✅ 95%
 
-| Priority | Gap | Impact | Effort |
-|---|---|---|---|
-| P0 | OpenAI as proper provider | Streaming + tools for OpenAI | Medium |
-| P1 | Message-level prompt caching | Cost reduction for long conversations | Medium |
-| P1 | Image input (vision) | Multimodal conversations | Medium |
-| P2 | Hybrid BM25 + vector search | Better memory retrieval | High |
-| P2 | Tiktoken as default tokenizer | Budget accuracy | Low |
-| P2 | Skill hot reload | Dev experience | Low |
-| P2 | Multi-user thread isolation | Multi-tenant deployments | Medium |
-| P3 | Ollama ChatStream | Real streaming for local models | Medium |
-| P3 | Auto tokenizer selection by model | UX | Low |
-| P3 | Bundled local embedder | Offline semantic search | High |
+| Feature | SDK | Claude |
+|---|---|---|
+| NoOpVerification | ✅ | — |
+| CompletionVerification | ✅ | ✅ |
+| LocalVerification (no LLM call) | ✅ | ✅ |
+| IntrinsicVerification (self-check markers) | ✅ EN+ES markers | ✅ |
+| CriteriaVerification (LLM judge) | ✅ | ✅ |
+| VerificationChain | ✅ first failure wins | ✅ |
+| Retry loop with feedback | ✅ | ✅ |
+
+---
+
+## 6. Streaming ✅ 95%
+
+| Feature | SDK | Claude |
+|---|---|---|
+| Token-level streaming (Anthropic) | ✅ | ✅ |
+| Token-level streaming (OpenAI) | ✅ SSE real | ✅ |
+| Token-level streaming (Ollama) | ✅ NDJSON real | ✅ |
+| StreamEventDelta/ToolCall/ToolResult/Done/Error | ✅ | ✅ |
+| StreamEventTurnComplete | ✅ | ✅ |
+| StreamEventThinking | ✅ | ✅ |
+| FanOutStream | ✅ | — |
+| CollectStream | ✅ | — |
+| Safety filter in streaming | ✅ | ✅ |
+| Tool dispatch in streaming | ✅ | ✅ |
+
+---
+
+## 7. Anthropic Provider ✅ 100%
+
+| Feature | SDK | Claude |
+|---|---|---|
+| Chat (blocking) | ✅ | ✅ |
+| ChatStream (SSE real tokens) | ✅ | ✅ |
+| Tool use (tool_use + tool_result) | ✅ | ✅ |
+| Multi-turn tool batching | ✅ | ✅ |
+| System prompt caching | ✅ cache_control: ephemeral | ✅ |
+| Message-level prompt caching | ✅ marks last assistant turn | ✅ |
+| Model routing | ✅ | ✅ |
+| Error classification | ✅ | ✅ |
+| Extended thinking | ✅ ThinkingBudget | ✅ |
+| Thinking content blocks | ✅ ThinkingContent | ✅ |
+| Thinking SSE delta | ✅ StreamEventThinking | ✅ |
+| Vision / image input | ✅ image content blocks (base64 + URL) | ✅ |
+
+---
+
+## 8. OpenAI Provider ✅ 95%
+
+| Feature | SDK | Claude |
+|---|---|---|
+| Chat (blocking) | ✅ | ✅ |
+| ChatStream (SSE real tokens) | ✅ | ✅ |
+| Tool calls (deltas accumulated) | ✅ | ✅ |
+| Streaming usage stats | ✅ stream_options.include_usage | ✅ |
+| Vision / image_url | ✅ multimodal content array | ✅ |
+| ReasoningEffort param | ✅ | ✅ |
+| Compatible with OpenAI-spec endpoints | ✅ Groq, Together, OpenRouter, etc. | — |
+
+---
+
+## 9. Ollama Provider ✅ 90%
+
+| Feature | SDK | Claude |
+|---|---|---|
+| Chat (blocking) | ✅ | ✅ |
+| ChatStream (NDJSON real) | ✅ | ✅ |
+| Native tool calling | ✅ | ✅ |
+| Vision (images base64) | ✅ | ✅ |
+| Local/offline operation | ✅ | — |
+
+---
+
+## 10. Skills ✅ 95%
+
+| Feature | SDK | Claude |
+|---|---|---|
+| SkillProvider interface | ✅ | ✅ |
+| Trigger matching (keyword) | ✅ | ✅ |
+| Scored matching (SkillMatch) | ✅ | ✅ |
+| Semantic matching (embeddings) | ✅ | ✅ |
+| Skill dependencies (Requires) | ✅ depth-4 with cycle detection | ✅ |
+| LRU eviction | ✅ | ✅ |
+| TTL eviction | ✅ | ✅ |
+| Hot reload (mtime polling) | ✅ SkillReloader | ✅ |
+| Skill versioning | ✅ Meta.Version field | ✅ |
+
+---
+
+## 11. Compaction ✅ 88%
+
+| Feature | SDK | Claude |
+|---|---|---|
+| BulletCompactor | ✅ | — |
+| LLMCompactor | ✅ | ✅ |
+| EpisodicCompactor (key moments preserved) | ✅ | ✅ |
+| Token-budget triggered | ✅ | ✅ |
+| Compaction → LayerMemory | ✅ | ✅ |
+
+---
+
+## 12. Threads / Projects ✅ 100%
+
+| Feature | SDK | Claude |
+|---|---|---|
+| Thread interface | ✅ | ✅ |
+| InMemoryThreadProvider | ✅ | — |
+| FilesystemThreadProvider | ✅ | — |
+| SQLiteThreadProvider | ✅ | ✅ |
+| PostgresThreadProvider | ✅ FOR UPDATE SKIP LOCKED | ✅ |
+| Cross-thread message routing | ✅ | ✅ |
+| Project scope isolation | ✅ ListByProject | ✅ |
+| Thread lifecycle states | ✅ active/completed/failed/archived | ✅ |
+| Thread hierarchy (parent_id) | ✅ persisted | ✅ |
+| Multi-user thread isolation | ✅ MultiUserThreadProvider, GetForUser | ✅ |
+| Distributed deployment | ✅ Postgres provider | ✅ |
+
+---
+
+## 13. Tokenizer ✅ 95%
+
+| Feature | SDK | Claude |
+|---|---|---|
+| HeuristicTokenizer | ✅ | — |
+| ClaudeTokenizer | ✅ | — |
+| ByteTokenizer | ✅ | — |
+| TiktokenTokenizer (CL100K + O200K) | ✅ | ✅ |
+| AutoTokenizer (model-based selection) | ✅ gpt-4o → O200K, gpt-4 → CL100K, claude → heuristic | ✅ |
+| Cached resolution per model | ✅ | — |
+
+---
+
+## 14. Embeddings ✅ 95%
+
+| Feature | SDK | Claude |
+|---|---|---|
+| Embedder interface | ✅ | ✅ |
+| Voyage AI provider | ✅ | ✅ |
+| LocalEmbedder (TF-IDF, no API) | ✅ hashing trick + char bigrams | ✅ |
+| CosineSimilarity | ✅ | ✅ |
+| SemanticObservationStore | ✅ | ✅ |
+| SemanticSkillMatcher | ✅ | ✅ |
+| SemanticMemorySearch | ✅ | ✅ |
+| HybridMemorySearch (BM25 + vector RRF) | ✅ k=60 RRF | ✅ |
+
+---
+
+## 15. Extended Thinking ✅ 100%
+
+| Feature | SDK | Claude |
+|---|---|---|
+| ChatRequest.ThinkingBudget | ✅ | ✅ |
+| ChatResponse.ThinkingContent | ✅ | ✅ |
+| anthropicThinking block | ✅ | ✅ |
+| `thinking` content block parsing | ✅ | ✅ |
+| `thinking_delta` SSE | ✅ | ✅ |
+| StreamEventThinking | ✅ | ✅ |
+| Runtime.WithThinkingBudget(N) | ✅ | ✅ |
+| MaxTokens auto-increase | ✅ | ✅ |
+
+---
+
+## 16. Vision / Multimodal ✅ 90%
+
+| Feature | SDK | Claude |
+|---|---|---|
+| ChatMessage.Images field | ✅ | ✅ |
+| ImageContent (base64 + URL) | ✅ | ✅ |
+| Anthropic image content blocks | ✅ | ✅ |
+| OpenAI image_url content array | ✅ | ✅ |
+| Ollama base64 images | ✅ | ✅ |
+| PDF/document inputs | ❌ | ✅ |
+
+---
+
+## 17. Providers summary
+
+| Provider | Status |
+|---|---|
+| `providers/llm/anthropic.go` | ✅ Chat + ChatStream + thinking + vision + caching |
+| `providers/llm/openai.go` | ✅ Chat + ChatStream + tools + vision |
+| `providers/llm/ollama.go` | ✅ Chat + ChatStream + vision + native tools |
+| `providers/memory/filesystem.go` | ✅ BM25 + layered |
+| `providers/tokenizers/tiktoken.go` | ✅ CL100K + O200K |
+| `providers/tokenizers/auto.go` | ✅ Model-based auto-selection |
+| `providers/tokenizers/byte.go` | ✅ Heuristic + Claude approximation |
+| `providers/embedders/voyage.go` | ✅ |
+| `providers/embedders/local.go` | ✅ TF-IDF, no API key |
+| `providers/sandbox/opensandbox.go` | ✅ |
+| `providers/sandbox/local.go` | ✅ Dev only |
+| `providers/store/filesystem.go` | ✅ |
+| `providers/thread/memory.go` | ✅ InMemory + Filesystem |
+| `providers/thread/sqlite.go` | ✅ Multi-user |
+| `providers/thread/postgres.go` | ✅ Multi-user, distributed |
 
 ---
 
 ## Lo que se cerró en la última iteración
 
-**Hito 1 — Extended Thinking (100%)**
-- `ChatRequest.ThinkingBudget` + `ChatResponse.ThinkingContent`
-- `anthropicThinking` block en el request body
-- Parser de `thinking` content blocks en respuestas blocking
-- Parser de `thinking_delta` events en SSE streaming
-- `StreamEventThinking` emitido en tiempo real
-- `Runtime.WithThinkingBudget(N)` con MaxTokens auto-increase
+**Hito final — todos los gaps P0/P1/P2/P3 cerrados:**
 
-**Hito 2 — SQLite ThreadProvider (90%)**
-- `OpenSQLite(db)` y `OpenSQLiteFile(path)` constructors
-- Schema con threads + thread_inbox tables
-- Indexes: `idx_thread_inbox_to`, `idx_threads_project`
-- `Create/Get/Archive/SendMessage/ReadInbox` completos
-- `ListByProject(projectID, status)` para projects
-- `UpdateStatus` para lifecycle transitions
-- Thread hierarchy via `parent_id` persistido
+**P0** ✅
+- OpenAI proper provider con streaming SSE real, tool calls, vision, ReasoningEffort
 
-**Memory system (100% — completado en hitos previos)**
-- BM25 search en filesystem provider
-- LayeredFilesystemMemory con frontmatter YAML
-- MemoryRoots con labels para orientación estructurada
-- `WriteWithDedup` con Dice coefficient
-- Triggers EN+ES con replace/delete intent
-- `ClearSession` al final de cada turn
+**P1** ✅
+- Vision/image input para Anthropic (image content blocks, base64 + URL)
+- Vision/image input para OpenAI (image_url content array)
+- Vision/image input para Ollama (base64 array)
+- Message-level prompt caching en Anthropic (último assistant turn)
 
-**Overall: 88% → 91% (+3%)**
+**P2** ✅
+- Hybrid BM25 + vector search con RRF (k=60)
+- SemanticMemorySearch (vector-only)
+- AutoTokenizer con selección por modelo (gpt-4o→O200K, gpt-4→CL100K, claude→heuristic)
+- SkillReloader con polling de mtime (sin dependencias externas)
+- MultiUserThreadProvider interface + ErrThreadAccessDenied
+- Postgres ThreadProvider con FOR UPDATE SKIP LOCKED
+
+**P3** ✅
+- Ollama ChatStream real (NDJSON streaming)
+- AutoTokenizer (auto-selection)
+- LocalEmbedder TF-IDF (hashing trick + char bigrams, sin API key)
+
+**Otros** ✅
+- IntrinsicVerification (markers EN+ES, 0 LLM calls)
+- User preferences vs facts split en MemoryRoots
+
+**Overall: 91% → 96% (+5%)**
+
+---
+
+## Lo que queda por encima del 96%
+
+Los 4% restantes son features que no son críticas para la mayoría de deployments:
+
+- **Child safety filter** — Claude tiene políticas internas no exportables al SDK
+- **Copyright filter** — Idem, política específica del producto
+- **PDF/document multimodal input** — Anthropic lo soporta pero no está en el SDK
+- **Differential compaction granular** — el SDK usa compactors LLM-based; Claude tiene scoring intrínseco

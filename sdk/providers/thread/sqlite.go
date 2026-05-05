@@ -29,6 +29,7 @@ type SQLiteThreadProvider struct {
 const sqliteSchema = `
 CREATE TABLE IF NOT EXISTS threads (
 	id         TEXT PRIMARY KEY,
+	user_id    TEXT NOT NULL DEFAULT '',
 	project_id TEXT NOT NULL DEFAULT '',
 	mode_id    TEXT NOT NULL DEFAULT '',
 	status     TEXT NOT NULL DEFAULT 'active',
@@ -51,6 +52,7 @@ CREATE TABLE IF NOT EXISTS thread_inbox (
 
 CREATE INDEX IF NOT EXISTS idx_thread_inbox_to     ON thread_inbox(to_thread_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_threads_project     ON threads(project_id, status);
+CREATE INDEX IF NOT EXISTS idx_threads_user        ON threads(user_id, status);
 `
 
 // OpenSQLite initializes a SQLiteThreadProvider using an existing *sql.DB.
@@ -73,19 +75,29 @@ func OpenSQLiteFile(path string) (*SQLiteThreadProvider, error) {
 	return OpenSQLite(db)
 }
 
-// Create inserts a new active thread and returns it.
+// Create inserts a new active thread (single-user, no UserID) and returns it.
 func (p *SQLiteThreadProvider) Create(_ context.Context, projectID, modeID string) (*autobuild.Thread, error) {
+	return p.createWithUser("", projectID, modeID)
+}
+
+// CreateForUser creates a thread owned by userID.
+func (p *SQLiteThreadProvider) CreateForUser(_ context.Context, userID, projectID, modeID string) (*autobuild.Thread, error) {
+	return p.createWithUser(userID, projectID, modeID)
+}
+
+func (p *SQLiteThreadProvider) createWithUser(userID, projectID, modeID string) (*autobuild.Thread, error) {
 	t := &autobuild.Thread{
 		ID:        newID("th"),
+		UserID:    strings.TrimSpace(userID),
 		ProjectID: strings.TrimSpace(projectID),
 		ModeID:    strings.TrimSpace(modeID),
 		Status:    autobuild.ThreadStatusActive,
 	}
 	now := time.Now().UnixNano()
 	_, err := p.db.Exec(
-		`INSERT INTO threads(id, project_id, mode_id, status, parent_id, created_at, updated_at)
-		 VALUES (?, ?, ?, ?, ?, ?, ?)`,
-		t.ID, t.ProjectID, t.ModeID, string(t.Status), t.ParentID, now, now,
+		`INSERT INTO threads(id, user_id, project_id, mode_id, status, parent_id, created_at, updated_at)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+		t.ID, t.UserID, t.ProjectID, t.ModeID, string(t.Status), t.ParentID, now, now,
 	)
 	if err != nil {
 		return nil, fmt.Errorf("thread: create: %w", err)
@@ -96,12 +108,12 @@ func (p *SQLiteThreadProvider) Create(_ context.Context, projectID, modeID strin
 // Get returns thread metadata by ID. Returns nil, nil if not found.
 func (p *SQLiteThreadProvider) Get(_ context.Context, threadID string) (*autobuild.Thread, error) {
 	row := p.db.QueryRow(
-		`SELECT id, project_id, mode_id, status, parent_id FROM threads WHERE id = ?`,
+		`SELECT id, user_id, project_id, mode_id, status, parent_id FROM threads WHERE id = ?`,
 		threadID,
 	)
 	var t autobuild.Thread
 	var status string
-	err := row.Scan(&t.ID, &t.ProjectID, &t.ModeID, &status, &t.ParentID)
+	err := row.Scan(&t.ID, &t.UserID, &t.ProjectID, &t.ModeID, &status, &t.ParentID)
 	if err == sql.ErrNoRows {
 		return nil, nil
 	}
@@ -110,6 +122,49 @@ func (p *SQLiteThreadProvider) Get(_ context.Context, threadID string) (*autobui
 	}
 	t.Status = autobuild.ThreadStatus(status)
 	return &t, nil
+}
+
+// GetForUser returns a thread only if it belongs to userID.
+// Returns ErrThreadAccessDenied if the thread exists but belongs to another user.
+func (p *SQLiteThreadProvider) GetForUser(ctx context.Context, userID, threadID string) (*autobuild.Thread, error) {
+	t, err := p.Get(ctx, threadID)
+	if err != nil || t == nil {
+		return t, err
+	}
+	if t.UserID != userID {
+		return nil, autobuild.ErrThreadAccessDenied
+	}
+	return t, nil
+}
+
+// ListByUser returns all threads owned by userID, optionally filtered by status.
+// Newest first.
+func (p *SQLiteThreadProvider) ListByUser(ctx context.Context, userID string, status autobuild.ThreadStatus) ([]*autobuild.Thread, error) {
+	query := `SELECT id, user_id, project_id, mode_id, status, parent_id FROM threads WHERE user_id = ?`
+	args := []any{userID}
+	if status != "" {
+		query += " AND status = ?"
+		args = append(args, string(status))
+	}
+	query += " ORDER BY created_at DESC"
+
+	rows, err := p.db.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, fmt.Errorf("thread: list user %s: %w", userID, err)
+	}
+	defer rows.Close()
+
+	var threads []*autobuild.Thread
+	for rows.Next() {
+		var t autobuild.Thread
+		var s string
+		if err := rows.Scan(&t.ID, &t.UserID, &t.ProjectID, &t.ModeID, &s, &t.ParentID); err != nil {
+			return nil, err
+		}
+		t.Status = autobuild.ThreadStatus(s)
+		threads = append(threads, &t)
+	}
+	return threads, rows.Err()
 }
 
 // Archive marks a thread as archived.
@@ -208,7 +263,7 @@ func (p *SQLiteThreadProvider) ReadInbox(ctx context.Context, threadID string) (
 // ListByProject returns all threads for a project, newest first.
 // status="" returns threads in any status.
 func (p *SQLiteThreadProvider) ListByProject(ctx context.Context, projectID string, status autobuild.ThreadStatus) ([]*autobuild.Thread, error) {
-	query := `SELECT id, project_id, mode_id, status, parent_id FROM threads WHERE project_id = ?`
+	query := `SELECT id, user_id, project_id, mode_id, status, parent_id FROM threads WHERE project_id = ?`
 	args := []any{projectID}
 	if status != "" {
 		query += " AND status = ?"
@@ -226,7 +281,7 @@ func (p *SQLiteThreadProvider) ListByProject(ctx context.Context, projectID stri
 	for rows.Next() {
 		var t autobuild.Thread
 		var s string
-		if err := rows.Scan(&t.ID, &t.ProjectID, &t.ModeID, &s, &t.ParentID); err != nil {
+		if err := rows.Scan(&t.ID, &t.UserID, &t.ProjectID, &t.ModeID, &s, &t.ParentID); err != nil {
 			return nil, err
 		}
 		t.Status = autobuild.ThreadStatus(s)
@@ -250,5 +305,8 @@ func (p *SQLiteThreadProvider) Close() error {
 	return p.db.Close()
 }
 
-// Compile-time check
-var _ autobuild.ThreadProvider = (*SQLiteThreadProvider)(nil)
+// Compile-time checks
+var (
+	_ autobuild.ThreadProvider          = (*SQLiteThreadProvider)(nil)
+	_ autobuild.MultiUserThreadProvider = (*SQLiteThreadProvider)(nil)
+)
