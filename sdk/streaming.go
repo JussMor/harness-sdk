@@ -15,6 +15,10 @@ type StreamEvent struct {
 	// Delta is the incremental text chunk for Type=StreamEventDelta.
 	Delta string `json:"delta,omitempty"`
 
+	// Thinking is an incremental chunk of extended thinking content.
+	// Only set for Type=StreamEventThinking.
+	Thinking string `json:"thinking,omitempty"`
+
 	// ToolCall is set when Type=StreamEventToolCall.
 	ToolCall *ToolCallEntry `json:"tool_call,omitempty"`
 
@@ -34,6 +38,12 @@ type StreamEventType string
 const (
 	// StreamEventDelta is an incremental text chunk from the LLM.
 	StreamEventDelta StreamEventType = "delta"
+
+	// StreamEventThinking is an incremental chunk of extended thinking content.
+	// Only emitted when ThinkingBudget > 0 and the provider supports it.
+	// Thinking content is the model's internal reasoning — not shown to users
+	// by default. Use for debugging, tracing, or advanced UX.
+	StreamEventThinking StreamEventType = "thinking"
 
 	// StreamEventToolCall is emitted when the LLM decides to call a tool.
 	// Tool execution happens between this event and the next StreamEventToolResult.

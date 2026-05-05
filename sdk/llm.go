@@ -55,6 +55,13 @@ type ChatRequest struct {
 	// Supported values: "low", "medium", "high". Not all providers honor this.
 	ReasoningEffort string `json:"reasoning_effort,omitempty"`
 
+	// ThinkingBudget is the maximum number of tokens the model can spend
+	// on internal reasoning before producing a response.
+	// Only honored by models that support extended thinking (Claude 3.7+).
+	// When > 0, the Anthropic provider adds a "thinking" block to the request.
+	// MaxTokens must be greater than ThinkingBudget.
+	ThinkingBudget int `json:"thinking_budget,omitempty"`
+
 	// Stop sequences that terminate generation.
 	Stop []string `json:"stop,omitempty"`
 }
@@ -67,6 +74,12 @@ type ChatResponse struct {
 	// Reasoning is optional provider-exposed reasoning content when the vendor
 	// explicitly returns it. This is not synthesized by the SDK.
 	Reasoning string `json:"reasoning,omitempty"`
+
+	// ThinkingContent holds the model's internal extended thinking content,
+	// if the request enabled ThinkingBudget. This is the raw thinking text
+	// returned in "thinking" content blocks by the Anthropic API.
+	// Not shown to users by default — use for debugging and tracing only.
+	ThinkingContent string `json:"thinking_content,omitempty"`
 
 	// ToolCalls are tool invocations the LLM wants to execute.
 	ToolCalls []ToolCallEntry `json:"tool_calls,omitempty"`

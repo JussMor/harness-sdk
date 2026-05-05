@@ -129,6 +129,7 @@ type anthropicMessage struct {
 type anthropicContent struct {
 	Type      string          `json:"type"`
 	Text      *string         `json:"text,omitempty"`
+	Thinking  *string         `json:"thinking,omitempty"`  // extended thinking block
 	ID        string          `json:"id,omitempty"`          // tool_use
 	Name      string          `json:"name,omitempty"`        // tool_use
 	Input     json.RawMessage `json:"input,omitempty"`       // tool_use
@@ -151,6 +152,15 @@ type anthropicRequest struct {
 	SystemBlocks []anthropicSystemBlock `json:"system,omitempty"`
 	Messages     []anthropicMessage     `json:"messages"`
 	Tools        []anthropicTool        `json:"tools,omitempty"`
+	Thinking     *anthropicThinking     `json:"thinking,omitempty"`
+}
+
+// anthropicThinking enables extended thinking mode.
+// Only supported by Claude 3.7+ models.
+// BudgetTokens must be at least 1024 and less than MaxTokens.
+type anthropicThinking struct {
+	Type         string `json:"type"`          // always "enabled"
+	BudgetTokens int    `json:"budget_tokens"` // how many tokens the model can spend thinking
 }
 
 type anthropicSystemBlock struct {
@@ -180,6 +190,22 @@ func buildAnthropicRequest(model string, maxTokens int, req autobuild.ChatReques
 	out := anthropicRequest{
 		Model:     model,
 		MaxTokens: maxTokens,
+	}
+
+	// Extended thinking: when ThinkingBudget is set, enable the thinking block.
+	// MaxTokens must exceed ThinkingBudget — enforce minimum here.
+	if req.ThinkingBudget > 0 {
+		budget := req.ThinkingBudget
+		if budget < 1024 {
+			budget = 1024 // Anthropic minimum
+		}
+		if out.MaxTokens <= budget {
+			out.MaxTokens = budget + 4096 // ensure room for response
+		}
+		out.Thinking = &anthropicThinking{
+			Type:         "enabled",
+			BudgetTokens: budget,
+		}
 	}
 
 	// Prompt caching: mark the system prompt for caching so Anthropic can
@@ -309,6 +335,15 @@ func parseAnthropicResponse(body []byte) (*autobuild.ChatResponse, error) {
 
 	for _, c := range raw.Content {
 		switch c.Type {
+		case "thinking":
+			// Extended thinking content — internal model reasoning.
+			// Stored separately from Content, not shown to users by default.
+			if c.Thinking != nil {
+				if out.ThinkingContent != "" {
+					out.ThinkingContent += "\n"
+				}
+				out.ThinkingContent += *c.Thinking
+			}
 		case "text":
 			if c.Text != nil {
 				if out.Content != "" {
@@ -470,6 +505,14 @@ func readAnthropicSSE(ctx context.Context, body io.Reader, out chan<- autobuild.
 						Delta: event.Delta.Text,
 					}
 				}
+			case "thinking_delta":
+				// Extended thinking — internal model reasoning streamed in real time.
+				if event.Delta.Thinking != "" {
+					out <- autobuild.StreamEvent{
+						Type:     autobuild.StreamEventThinking,
+						Thinking: event.Delta.Thinking,
+					}
+				}
 			case "input_json_delta":
 				// Accumulate tool call arguments
 				toolArgsBuf.WriteString(event.Delta.PartialJSON)
@@ -548,9 +591,10 @@ type sseEvent struct {
 
 	// content_block_delta
 	Delta *struct {
-		Type        string `json:"type"`
-		Text        string `json:"text,omitempty"`
-		PartialJSON string `json:"partial_json,omitempty"`
+		Type         string `json:"type"`
+		Text         string `json:"text,omitempty"`
+		Thinking     string `json:"thinking,omitempty"`      // thinking_delta
+		PartialJSON  string `json:"partial_json,omitempty"`
 	} `json:"delta,omitempty"`
 
 	// message_delta

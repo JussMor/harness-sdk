@@ -55,6 +55,7 @@ type Runtime struct {
 	compactor       Compactor
 	maxMemoryTokens int        // 0 = unlimited
 	memoryRootsV2   []MemoryRoot // nil = use DefaultMemoryRoots
+	thinkingBudget  int          // 0 = disabled; >0 enables extended thinking
 }
 
 // Tokenizer estimates token count for a string. Replace the default heuristic
@@ -160,6 +161,16 @@ func (r *Runtime) WithMaxMemoryTokens(n int) *Runtime {
 //	})
 func (r *Runtime) WithMemoryRoots(roots ...MemoryRoot) *Runtime {
 	r.memoryRootsV2 = roots
+	return r
+}
+
+// WithThinkingBudget enables extended thinking for Claude 3.7+ models.
+// budgetTokens is the maximum tokens the model can spend reasoning internally
+// before producing a response. Minimum enforced by Anthropic API: 1024.
+// MaxTokens in each request is automatically increased when needed.
+// Default 0 = disabled.
+func (r *Runtime) WithThinkingBudget(budgetTokens int) *Runtime {
+	r.thinkingBudget = budgetTokens
 	return r
 }
 
@@ -648,6 +659,21 @@ func (r *Runtime) execution(ctx context.Context, conv *Conversation, rr *Runtime
 			}
 			return result
 		},
+	}
+
+	// Inject ThinkingBudget into every ChatRequest if extended thinking is enabled.
+	if r.thinkingBudget > 0 {
+		thinkingBudget := r.thinkingBudget
+		cfg.BuildRequest = func(systemPrompt string, messages []ChatMessage, tools *ToolRegistry) ChatRequest {
+			// Build a minimal config to pass to defaultBuildRequest
+			innerCfg := AgentLoopConfig{
+				SystemPrompt: systemPrompt,
+				Tools:        tools,
+			}
+			req := defaultBuildRequest(innerCfg, messages)
+			req.ThinkingBudget = thinkingBudget
+			return req
+		}
 	}
 
 	// Single point of prompt assembly: apply mode → LayerMode, then Build once.
