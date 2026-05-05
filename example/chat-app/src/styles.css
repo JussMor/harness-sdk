@@ -873,3 +873,127 @@
   font-variant-numeric: tabular-nums;
   white-space: nowrap;
 }
+
+/* ── Message content (markdown) ─────────────────────────────────────────────── */
+
+.chat-bubble-text {
+  @apply text-sm leading-relaxed whitespace-pre-wrap;
+}
+
+.chat-bubble-pending {
+  @apply text-sm text-zinc-400 animate-pulse;
+}
+
+.chat-bubble-markdown {
+  @apply text-sm leading-relaxed;
+}
+
+.chat-bubble-markdown p {
+  @apply my-2 first:mt-0 last:mb-0;
+}
+
+.chat-bubble-markdown h1,
+.chat-bubble-markdown h2,
+.chat-bubble-markdown h3,
+.chat-bubble-markdown h4 {
+  @apply font-semibold mt-4 mb-2 first:mt-0;
+}
+
+.chat-bubble-markdown h1 { @apply text-lg; }
+.chat-bubble-markdown h2 { @apply text-base; }
+.chat-bubble-markdown h3 { @apply text-sm; }
+
+.chat-bubble-markdown ul {
+  @apply list-disc pl-5 my-2 space-y-0.5;
+}
+
+.chat-bubble-markdown ol {
+  @apply list-decimal pl-5 my-2 space-y-0.5;
+}
+
+.chat-bubble-markdown li {
+  @apply text-sm leading-relaxed;
+}
+
+.chat-bubble-markdown blockquote {
+  @apply border-l-2 border-zinc-300 pl-3 my-2 text-zinc-500 italic;
+}
+
+.chat-bubble-markdown table {
+  @apply w-full text-xs border-collapse my-3;
+}
+
+.chat-bubble-markdown th,
+.chat-bubble-markdown td {
+  @apply border border-zinc-200 px-2 py-1 text-left;
+}
+
+.chat-bubble-markdown th {
+  @apply bg-zinc-50 font-semibold;
+}
+
+.chat-bubble-markdown a {
+  @apply text-blue-600 underline underline-offset-2 hover:text-blue-800;
+}
+
+.chat-bubble-markdown strong {
+  @apply font-semibold;
+}
+
+.chat-bubble-markdown em {
+  @apply italic;
+}
+
+.chat-bubble-markdown hr {
+  @apply border-zinc-200 my-3;
+}
+
+/* Inline code */
+.chat-inline-code {
+  @apply font-mono text-xs bg-zinc-100 text-zinc-800 px-1 py-0.5 rounded;
+}
+
+/* ── Code block ───────────────────────────────────────────────────────────────── */
+
+.chat-code-block {
+  @apply my-3 rounded-lg border border-zinc-200 overflow-hidden text-xs;
+}
+
+.chat-code-block__header {
+  @apply flex items-center justify-between px-3 py-1.5 bg-zinc-50 border-b border-zinc-200;
+}
+
+.chat-code-block__lang {
+  @apply text-xs font-mono text-zinc-500 font-medium;
+}
+
+.chat-code-block__copy {
+  @apply flex items-center gap-1 text-xs text-zinc-500 hover:text-zinc-800 transition-colors cursor-pointer border-none bg-transparent;
+}
+
+.chat-code-block__pre {
+  @apply overflow-x-auto p-3 bg-white font-mono text-xs leading-relaxed text-zinc-800 m-0;
+}
+
+/* ── Message actions ─────────────────────────────────────────────────────────── */
+
+.chat-message-actions {
+  @apply flex items-center gap-0.5 mt-2 pt-2 border-t border-zinc-100;
+}
+
+.chat-action-btn {
+  @apply flex items-center justify-center w-7 h-7 rounded-md text-zinc-400
+    hover:text-zinc-700 hover:bg-zinc-100 transition-colors cursor-pointer border-none bg-transparent;
+}
+
+.chat-action-btn--active-good {
+  @apply text-emerald-600 bg-emerald-50 hover:text-emerald-700 hover:bg-emerald-100;
+}
+
+.chat-action-btn--active-bad {
+  @apply text-rose-500 bg-rose-50 hover:text-rose-600 hover:bg-rose-100;
+}
+
+.chat-action-divider {
+  @apply w-px h-4 bg-zinc-200 mx-1;
+}
