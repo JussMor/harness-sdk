@@ -48,9 +48,48 @@ type MemoryProvider interface {
 	Search(ctx context.Context, scope Scope, query string) ([]MemoryEntry, error)
 }
 
+// MemoryUpdateIntent describes what a memory trigger wants to do.
+// Beyond simple Create, the trigger can request Replace or Delete —
+// this is how "I no longer work at X" becomes a delete, not a new fact.
+type MemoryUpdateIntent struct {
+	Layer      MemoryLayer // Explicit/Inferred/Session
+	Content    string      // new fact content
+	Op         string      // "create", "replace", "delete"
+	OldContent string      // for "replace" ops — used with StrReplace
+	Path       string      // for "delete" and "replace"; runtime assigns for "create"
+	Scope      Scope       // user or project; defaults to ScopeUser
+}
+
+// MemoryRoot is one directory read during orientation.
+// Having multiple labeled roots mirrors how Claude separates
+// user preferences, facts, and project context.
+type MemoryRoot struct {
+	Scope Scope
+	Path  string
+	Label string // injected as a header before the content in LayerMemory
+}
+
+// DefaultMemoryRoots mirrors Claude's memory structure:
+// user profile/preferences, user facts, and project context read separately.
+var DefaultMemoryRoots = []MemoryRoot{
+	{Scope: ScopeUser, Path: "/profile", Label: "User profile & preferences"},
+	{Scope: ScopeUser, Path: "/facts", Label: "Remembered facts"},
+	{Scope: ScopeProject, Path: "/", Label: "Project context"},
+}
+
 // MemoryEntry represents a single memory file with its metadata.
 type MemoryEntry struct {
-	Path    string `json:"path"`
-	Scope   Scope  `json:"scope"`
-	Content string `json:"content,omitempty"`
+	Path       string      `json:"path"`
+	Scope      Scope       `json:"scope"`
+	Content    string      `json:"content,omitempty"`
+	Layer      MemoryLayer `json:"layer,omitempty"`      // Explicit/Inferred/Session
+	Confidence float64     `json:"confidence,omitempty"` // 0-1, 0 = unknown
+	Source     string      `json:"source,omitempty"`     // "user", "inferred", "tool"
+	UpdatedAt  int64       `json:"updated_at,omitempty"` // Unix nano
+}
+
+// MemorySearchResult is a ranked result from a memory search.
+type MemorySearchResult struct {
+	MemoryEntry
+	Score float64 `json:"score"` // relevance 0-1
 }

@@ -39,7 +39,6 @@ type Runtime struct {
 	maxSkills       int
 	skillThreshold  float64
 	autoCheckpoint  bool
-	memoryRoots     []string
 	maxVerifyRetry  int
 	observationFilt ObservationFilter
 	memoryTrigger   MemoryTriggerDetector
@@ -54,7 +53,8 @@ type Runtime struct {
 	sessionContext  SessionContextProvider
 	outputFilter    OutputFilter
 	compactor       Compactor
-	maxMemoryTokens int // 0 = unlimited
+	maxMemoryTokens int        // 0 = unlimited
+	memoryRootsV2   []MemoryRoot // nil = use DefaultMemoryRoots
 }
 
 // Tokenizer estimates token count for a string. Replace the default heuristic
@@ -83,7 +83,6 @@ func NewRuntime(engine *Engine) *Runtime {
 		maxSkills:       3,
 		skillThreshold:  0.3,
 		autoCheckpoint:  true,
-		memoryRoots:     []string{"/"},
 		maxVerifyRetry:  2,
 		observationFilt: DefaultObservationFilter,
 		memoryTrigger:   DefaultMemoryTriggerDetector,
@@ -147,6 +146,20 @@ func (r *Runtime) WithCompactor(c Compactor) *Runtime {
 // Default 0 = no cap (load everything).
 func (r *Runtime) WithMaxMemoryTokens(n int) *Runtime {
 	r.maxMemoryTokens = n
+	return r
+}
+
+// WithMemoryRoots replaces the default memory roots with a custom set.
+// Use this to read different directories per scope during orientation.
+// Default: DefaultMemoryRoots (user/profile, user/facts, project/).
+//
+// Example — add a project-specific knowledge base:
+//
+//	runtime.WithMemoryRoots(autobuild.DefaultMemoryRoots..., autobuild.MemoryRoot{
+//	    Scope: autobuild.ScopeProject, Path: "/knowledge", Label: "Domain knowledge",
+//	})
+func (r *Runtime) WithMemoryRoots(roots ...MemoryRoot) *Runtime {
+	r.memoryRootsV2 = roots
 	return r
 }
 
@@ -393,22 +406,28 @@ func (r *Runtime) orientation(ctx context.Context, userMessage string, conv *Con
 		}
 	}
 
-	// Read memory → LayerMemory
+	// Read memory → LayerMemory using labeled roots
 	if r.engine.HasMemory() && r.engine.HasPrompt() {
+		roots := r.memoryRootsV2
+		if len(roots) == 0 {
+			roots = DefaultMemoryRoots
+		}
 		var memContent strings.Builder
-		for _, root := range r.memoryRoots {
-			if content, err := r.engine.Memory.View(ctx, ScopeUser, root); err == nil && content != "" {
-				memContent.WriteString(content)
+		for _, root := range roots {
+			content, err := r.engine.Memory.View(ctx, root.Scope, root.Path)
+			if err != nil || strings.TrimSpace(content) == "" {
+				continue
+			}
+			if root.Label != "" {
+				memContent.WriteString("## ")
+				memContent.WriteString(root.Label)
 				memContent.WriteString("\n\n")
 			}
-			if content, err := r.engine.Memory.View(ctx, ScopeProject, root); err == nil && content != "" {
-				memContent.WriteString(content)
-				memContent.WriteString("\n\n")
-			}
+			memContent.WriteString(strings.TrimSpace(content))
+			memContent.WriteString("\n\n")
 		}
 		if memContent.Len() > 0 {
 			memStr := memContent.String()
-			// Evict by token cap if configured
 			if r.maxMemoryTokens > 0 && r.tokenizer.Count(memStr) > r.maxMemoryTokens {
 				memStr = evictMemoryToTokenBudget(memStr, r.maxMemoryTokens, r.tokenizer)
 			}
@@ -682,7 +701,7 @@ func (r *Runtime) execution(ctx context.Context, conv *Conversation, rr *Runtime
 // ── Phase 5: Closure ─────────────────────────────────────────────────────────
 
 func (r *Runtime) closure(ctx context.Context, userMessage string, loopResult *AgentLoopResult, conv *Conversation, rr *RuntimeResult) error {
-	// Explicit memory triggers
+	// Explicit memory triggers — supports create, replace, delete
 	if r.engine.HasMemory() && r.memoryTrigger != nil {
 		layer, content, detected := r.memoryTrigger(userMessage)
 		if detected && content != "" {
@@ -694,15 +713,12 @@ func (r *Runtime) closure(ctx context.Context, userMessage string, loopResult *A
 					CreatedAt: time.Now(),
 				})
 			} else {
-				path := fmt.Sprintf("/facts/%d.md", time.Now().UnixNano())
-				if err := r.engine.Memory.Create(ctx, ScopeUser, path, content); err == nil {
-					rr.MemoryWritten = append(rr.MemoryWritten, path)
-				}
+				r.handleMemoryTrigger(ctx, layer, content, rr)
 			}
 		}
 	}
 
-	// Inferred memory writes with deduplication
+	// Inferred memory writes with deduplication and layer metadata
 	if r.memoryWriter != nil && loopResult != nil && r.engine.HasMemory() {
 		facts, err := r.memoryWriter.Extract(ctx, conv, loopResult.FinalContent)
 		if err == nil && len(facts) > 0 {
@@ -715,7 +731,58 @@ func (r *Runtime) closure(ctx context.Context, userMessage string, loopResult *A
 			}
 		}
 	}
+
+	// Clear expired session observations so they don't bleed into the next turn.
+	// Explicit and Inferred memory is persistent — only Session is ephemeral.
+	if r.engine.HasObservations() {
+		_ = r.engine.Observations.Expire(ctx)
+	}
+
 	return nil
+}
+
+// handleMemoryTrigger writes, replaces, or deletes a memory entry.
+// Before creating, it searches for an existing similar entry to update — this
+// prevents "I work at Acme" and "I now work at Beta" coexisting as duplicates.
+// "FORGET: X" triggers search-and-delete of entries matching X.
+func (r *Runtime) handleMemoryTrigger(ctx context.Context, layer MemoryLayer, content string, rr *RuntimeResult) {
+	// Forget intent: delete matching entries
+	if strings.HasPrefix(content, "FORGET: ") {
+		query := strings.TrimPrefix(content, "FORGET: ")
+		existing, _ := r.engine.Memory.Search(ctx, ScopeUser, query)
+		for _, entry := range existing {
+			if entry.Path == "" {
+				continue
+			}
+			if stringSimilarity(entry.Content, query) >= 0.4 {
+				if err := r.engine.Memory.Delete(ctx, ScopeUser, entry.Path); err == nil {
+					rr.MemoryWritten = append(rr.MemoryWritten, "deleted:"+entry.Path)
+				}
+			}
+		}
+		return
+	}
+
+	// Update intent: find similar existing entry and replace
+	existing, _ := r.engine.Memory.Search(ctx, ScopeUser, content)
+	for _, entry := range existing {
+		if entry.Content == "" || entry.Path == "" {
+			continue
+		}
+		if stringSimilarity(entry.Content, content) >= 0.5 {
+			if err := r.engine.Memory.StrReplace(ctx, ScopeUser, entry.Path, entry.Content, content); err == nil {
+				rr.MemoryWritten = append(rr.MemoryWritten, entry.Path)
+				return
+			}
+		}
+	}
+
+	// No similar entry found — create new
+	path := fmt.Sprintf("/facts/%d.md", time.Now().UnixNano())
+	if err := r.engine.Memory.Create(ctx, ScopeUser, path, content); err == nil {
+		rr.MemoryWritten = append(rr.MemoryWritten, path)
+	}
+	_ = layer
 }
 
 // ── RuntimeResult ────────────────────────────────────────────────────────────
