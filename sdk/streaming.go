@@ -274,13 +274,40 @@ func (r *Runtime) runStreamInternal(
 			break
 		}
 
-		// Dispatch tool calls and append results
+		// Dispatch tool calls — apply safety filter before each call
 		var sandboxID string
-		results := dispatcher.DispatchParallel(ctx, turnToolCalls, sandboxID)
+		// Filter tool calls through safety
+		var allowedCalls []ToolCallEntry
+		for _, call := range turnToolCalls {
+			if r.safety != nil {
+				verdict := r.safety.Inspect(ctx, call)
+				if verdict.Decision == SafetyBlock {
+					// Emit blocked result as tool_result to the consumer
+					blocked := ToolResult{
+						Name:       call.Name,
+						ToolCallID: call.ID,
+						Content:    "[blocked by safety filter: " + verdict.Reason + "]",
+					}
+					out <- StreamEvent{Type: StreamEventToolResult, ToolResult: &blocked}
+					messages = append(messages, ChatMessage{
+						Role:       RoleTool,
+						Content:    blocked.Content,
+						ToolCallID: blocked.ToolCallID,
+					})
+					continue
+				}
+				if verdict.Decision == SafetyTransform {
+					call.Arguments = verdict.NewArgs
+				}
+			}
+			allowedCalls = append(allowedCalls, call)
+		}
+
+		results := dispatcher.DispatchParallel(ctx, allowedCalls, sandboxID)
 		for i, result := range results {
-			// Apply output filter observation recording
-			if r.engine.HasObservations() && r.observationFilt != nil {
-				obs := r.observationFilt(turnToolCalls[i], result)
+			// Apply observation recording
+			if r.engine.HasObservations() && r.observationFilt != nil && i < len(allowedCalls) {
+				obs := r.observationFilt(allowedCalls[i], result)
 				if obs.Content != "" {
 					_ = r.engine.Observations.Record(ctx, obs)
 				}

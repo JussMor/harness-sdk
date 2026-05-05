@@ -198,3 +198,70 @@ func EnforceWithCompaction(
 	result.Summary = summary
 	return result
 }
+
+// ── EpisodicCompactor ─────────────────────────────────────────────────────────
+
+// EpisodicCompactor preserves "episodic memory" from dropped turns:
+// instead of summarizing everything equally, it identifies the most important
+// moments (decisions, breakthroughs, errors, user corrections) and preserves
+// those verbatim while summarizing the rest.
+//
+// This mirrors Claude's episodic memory — events that mattered stay accessible
+// even when the surrounding context scrolls out.
+type EpisodicCompactor struct {
+	Provider LLMProvider
+	Model    string
+	MaxWords int // target total length. Default 300 words
+}
+
+func (c *EpisodicCompactor) Compact(ctx context.Context, dropped []ChatMessage) (string, error) {
+	if c.Provider == nil || len(dropped) == 0 {
+		return "", nil
+	}
+	maxWords := c.MaxWords
+	if maxWords <= 0 {
+		maxWords = 300
+	}
+
+	var transcript strings.Builder
+	for _, m := range dropped {
+		if m.Role == RoleSystem {
+			continue
+		}
+		transcript.WriteString(string(m.Role))
+		transcript.WriteString(": ")
+		transcript.WriteString(truncate(m.Content, 600))
+		transcript.WriteString("\n\n")
+	}
+	if transcript.Len() == 0 {
+		return "", nil
+	}
+
+	prompt := fmt.Sprintf(`You are building an episodic memory from a conversation excerpt.
+
+Your output has two parts:
+1. KEY MOMENTS (verbatim quotes, ≤3 sentences each): decisions made, errors encountered, user corrections, breakthroughs. Mark each with [EPISODE].
+2. CONTEXT SUMMARY (prose, ≤%d words total): background facts and state needed to understand future turns.
+
+Format:
+[EPISODE] <verbatim moment>
+[EPISODE] <verbatim moment>
+CONTEXT: <prose summary>
+
+--- Excerpt ---
+%s
+--- End ---`, maxWords, transcript.String())
+
+	resp, err := c.Provider.Chat(ctx, ChatRequest{
+		Model: c.Model,
+		Messages: []ChatMessage{
+			{Role: RoleUser, Content: prompt},
+		},
+	})
+	if err != nil {
+		// Fall back to BulletCompactor on error
+		bc := &BulletCompactor{MaxChars: maxWords * 6}
+		return bc.Compact(ctx, dropped)
+	}
+	return strings.TrimSpace(resp.Content), nil
+}

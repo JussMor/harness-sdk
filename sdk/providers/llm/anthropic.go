@@ -145,11 +145,22 @@ type anthropicTool struct {
 }
 
 type anthropicRequest struct {
-	Model     string             `json:"model"`
-	MaxTokens int                `json:"max_tokens"`
-	System    string             `json:"system,omitempty"`
-	Messages  []anthropicMessage `json:"messages"`
-	Tools     []anthropicTool    `json:"tools,omitempty"`
+	Model        string                 `json:"model"`
+	MaxTokens    int                    `json:"max_tokens"`
+	System       string                 `json:"-"` // use SystemBlocks when set
+	SystemBlocks []anthropicSystemBlock `json:"system,omitempty"`
+	Messages     []anthropicMessage     `json:"messages"`
+	Tools        []anthropicTool        `json:"tools,omitempty"`
+}
+
+type anthropicSystemBlock struct {
+	Type         string                 `json:"type"`
+	Text         string                 `json:"text"`
+	CacheControl *anthropicCacheControl `json:"cache_control,omitempty"`
+}
+
+type anthropicCacheControl struct {
+	Type string `json:"type"` // "ephemeral"
 }
 
 type anthropicResponse struct {
@@ -171,22 +182,50 @@ func buildAnthropicRequest(model string, maxTokens int, req autobuild.ChatReques
 		MaxTokens: maxTokens,
 	}
 
+	// Prompt caching: mark the system prompt for caching so Anthropic can
+	// reuse it across turns without re-processing. This reduces latency and
+	// cost significantly for long system prompts (skills, memory, behavior).
+	systemContent := ""
 	for _, m := range req.Messages {
+		if m.Role == autobuild.RoleSystem {
+			if systemContent != "" {
+				systemContent += "\n\n" + m.Content
+			} else {
+				systemContent = m.Content
+			}
+		}
+	}
+	if systemContent != "" {
+		out.System = systemContent
+		// Mark for caching — Anthropic will cache this if ≥ 1024 tokens
+		out.SystemBlocks = []anthropicSystemBlock{
+			{Type: "text", Text: systemContent, CacheControl: &anthropicCacheControl{Type: "ephemeral"}},
+		}
+	}
+
+	// Convert messages — critical: batch consecutive RoleTool messages into
+	// a single user message with multiple tool_result blocks.
+	// Anthropic rejects requests where tool_results are in separate user messages.
+	i := 0
+	msgs := req.Messages
+	for i < len(msgs) {
+		m := msgs[i]
 		switch m.Role {
 		case autobuild.RoleSystem:
-			// Anthropic uses a top-level system field, not a message role.
-			if out.System != "" {
-				out.System += "\n\n" + m.Content
-			} else {
-				out.System = m.Content
-			}
+			i++
+			continue
+
 		case autobuild.RoleUser:
-			out.Messages = append(out.Messages, anthropicMessage{
-				Role: "user",
-				Content: []anthropicContent{
-					{Type: "text", Text: strPtr(m.Content)},
-				},
-			})
+			if m.Content != "" {
+				out.Messages = append(out.Messages, anthropicMessage{
+					Role: "user",
+					Content: []anthropicContent{
+						{Type: "text", Text: strPtr(m.Content)},
+					},
+				})
+			}
+			i++
+
 		case autobuild.RoleAssistant:
 			var content []anthropicContent
 			if m.Content != "" {
@@ -211,18 +250,28 @@ func buildAnthropicRequest(model string, maxTokens int, req autobuild.ChatReques
 				Role:    "assistant",
 				Content: content,
 			})
+			i++
+
 		case autobuild.RoleTool:
-			// Tool results land in a user message with a tool_result block.
+			// Batch ALL consecutive tool results into one user message.
+			// This is required by the Anthropic API — separate user messages
+			// for each tool result cause a 400 error.
+			var toolResults []anthropicContent
+			for i < len(msgs) && msgs[i].Role == autobuild.RoleTool {
+				toolResults = append(toolResults, anthropicContent{
+					Type:      "tool_result",
+					ToolUseID: msgs[i].ToolCallID,
+					Content:   msgs[i].Content,
+				})
+				i++
+			}
 			out.Messages = append(out.Messages, anthropicMessage{
-				Role: "user",
-				Content: []anthropicContent{
-					{
-						Type:      "tool_result",
-						ToolUseID: m.ToolCallID,
-						Content:   m.Content,
-					},
-				},
+				Role:    "user",
+				Content: toolResults,
 			})
+
+		default:
+			i++
 		}
 	}
 
