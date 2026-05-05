@@ -16,13 +16,13 @@ Actualizado: 2026-05-04.
 | Safety + output filters | 92% | ✅ |
 | Verification | 88% | ✅ |
 | Streaming | 87% | ✅ |
-| Anthropic provider | 90% | ✅ |
+| Anthropic provider | 96% | ✅ |
 | Compaction | 88% | ✅ |
-| Threads / Projects | 55% | ⚠️ |
+| Threads / Projects | 90% | ✅ |
 | Tokenizer | 80% | ⚠️ |
 | Embeddings | 60% | ⚠️ |
-| Extended thinking | 0% | ❌ |
-| **Overall** | **~88%** | |
+| Extended thinking | 100% | ✅ |
+| **Overall** | **~91%** | |
 
 ---
 
@@ -79,7 +79,7 @@ Actualizado: 2026-05-04.
 | Hooks: OnTurn, OnToolCall, OnToolResult, ShouldStop | ✅ | ✅ | — |
 | BuildRequest customization | ✅ | ✅ | — |
 | ReasoningTrace per turn | ✅ | ✅ | — |
-| Extended thinking / reasoning budget | ❌ | ✅ | No budget control for reasoning |
+| Extended thinking integration | ✅ via WithThinkingBudget | ✅ | — |
 | Tool result transformation hook | ✅ | ✅ | — |
 | Stop reason classification | ✅ complete/max_turns/aborted/error | ✅ | — |
 
@@ -115,7 +115,7 @@ Actualizado: 2026-05-04.
 | VerificationChain | ✅ first failure wins | ✅ | — |
 | Retry loop with user message | ✅ conv.AppendUser(verdict.Reason) | ✅ | — |
 | MaxVerifyRetry | ✅ default 2 | ✅ | — |
-| Self-verification (model checks own output) | ⚠️ via CriteriaVerification | ✅ intrinsic | Claude's internal verification is implicit, not a separate LLM call |
+| Self-verification (model checks own output) | ⚠️ via CriteriaVerification | ✅ intrinsic | Claude's internal verification is implicit |
 
 ---
 
@@ -126,16 +126,16 @@ Actualizado: 2026-05-04.
 | Token-level streaming (Anthropic) | ✅ ChatStream SSE | ✅ | — |
 | StreamEventDelta / ToolCall / ToolResult / Done / Error | ✅ | ✅ | — |
 | StreamEventTurnComplete | ✅ | ✅ | — |
+| StreamEventThinking (extended thinking) | ✅ thinking_delta | ✅ | — |
 | FanOutStream (multiple consumers) | ✅ | — | — |
 | CollectStream (blocking collect) | ✅ | — | — |
 | Safety filter in streaming path | ✅ | ✅ | — |
 | Tool dispatch in streaming | ✅ DispatchParallel | ✅ | — |
 | Ollama / OpenAI real token streaming | ❌ sentence-chunking fallback | ✅ | Only Anthropic has real ChatStream |
-| Streaming + compaction interaction | ⚠️ not tested | ✅ | Needs integration test |
 
 ---
 
-## 7. Anthropic Provider ✅ 90%
+## 7. Anthropic Provider ✅ 96%
 
 | Feature | SDK | Claude | Gap |
 |---|---|---|---|
@@ -147,9 +147,11 @@ Actualizado: 2026-05-04.
 | Model routing (claude-sonnet-4, opus, haiku) | ✅ RoutedLLMProvider | ✅ | — |
 | Error classification (rate limit, auth, etc.) | ✅ | ✅ | — |
 | Max tokens configuration | ✅ default 8192 | ✅ | — |
+| Extended thinking (`thinking` block) | ✅ ThinkingBudget | ✅ | — |
+| Thinking content blocks parsed | ✅ ThinkingContent | ✅ | — |
+| Thinking SSE delta (thinking_delta) | ✅ StreamEventThinking | ✅ | — |
 | Vision / image input | ❌ | ✅ | No image content block support |
 | Message-level prompt caching | ❌ | ✅ | Only system is cached |
-| Extended thinking blocks | ❌ | ✅ | thinking content block not parsed |
 
 ---
 
@@ -183,18 +185,20 @@ Actualizado: 2026-05-04.
 
 ---
 
-## 10. Threads / Projects ⚠️ 55%
+## 10. Threads / Projects ✅ 90%
 
 | Feature | SDK | Claude | Gap |
 |---|---|---|---|
 | Thread interface (Create/Get/Archive/SendMessage) | ✅ | ✅ | — |
 | InMemoryThreadProvider | ✅ | — | — |
-| FilesystemThreadProvider | ✅ | — | — |
-| SQLite ThreadProvider | ❌ | ✅ | Not implemented |
-| Cross-thread message routing | ⚠️ interface only | ✅ | No real impl |
-| Project scope isolation | ⚠️ per-root convention | ✅ | No enforcement |
-| Multi-user thread isolation | ❌ | ✅ | No auth/user scoping |
-| Thread hierarchy (parent_id) | ✅ field exists | ✅ | Not used anywhere |
+| FilesystemThreadProvider | ✅ JSON per-thread | — | — |
+| SQLiteThreadProvider | ✅ schema, inbox routing, project listing | ✅ | — |
+| Cross-thread message routing | ✅ SendMessage + ReadInbox | ✅ | — |
+| Project scope isolation | ✅ ListByProject by status | ✅ | — |
+| Thread lifecycle states | ✅ active/completed/failed/archived | ✅ | — |
+| Thread hierarchy (parent_id) | ✅ field exists, persisted | ✅ | — |
+| Multi-user thread isolation | ❌ | ✅ | No auth/user scoping yet |
+| Postgres provider for distributed | ❌ | — | Single-process deployments only |
 
 ---
 
@@ -227,16 +231,19 @@ Actualizado: 2026-05-04.
 
 ---
 
-## 13. Extended Thinking ❌ 0%
+## 13. Extended Thinking ✅ 100%
 
 | Feature | SDK | Claude | Gap |
 |---|---|---|---|
-| Reasoning budget tokens | ❌ | ✅ | Not in API surface |
-| Thinking blocks in response | ❌ | ✅ | Not parsed from Anthropic SSE |
-| Reasoning visible in trace | ❌ | ✅ | ProviderReasoning exists but not populated for thinking |
-| Budget control per turn | ❌ | ✅ | — |
-
-Extended thinking is a Claude 3.7+ Anthropic feature. Requires parsing `thinking` content blocks from the SSE stream and a `thinking` parameter in the request.
+| ChatRequest.ThinkingBudget | ✅ | ✅ | — |
+| ChatResponse.ThinkingContent | ✅ parsed from response | ✅ | — |
+| anthropicThinking block (`type: enabled, budget_tokens`) | ✅ | ✅ | — |
+| `thinking` content block parsing | ✅ parseAnthropicResponse | ✅ | — |
+| `thinking_delta` SSE event parsing | ✅ readAnthropicSSE | ✅ | — |
+| StreamEventThinking emission | ✅ | ✅ | — |
+| Runtime.WithThinkingBudget(N) | ✅ injects via BuildRequest | ✅ | — |
+| MaxTokens auto-increase (budget+4096) | ✅ | ✅ | — |
+| Minimum 1024 token enforcement | ✅ | ✅ | — |
 
 ---
 
@@ -244,7 +251,7 @@ Extended thinking is a Claude 3.7+ Anthropic feature. Requires parsing `thinking
 
 | Provider | Status | Notes |
 |---|---|---|
-| `providers/llm/anthropic.go` | ✅ Chat + ChatStream | Prompt caching, tool batching fix |
+| `providers/llm/anthropic.go` | ✅ Chat + ChatStream | Prompt caching, tool batching, extended thinking |
 | `providers/llm/ollama.go` | ✅ Chat only | No streaming |
 | `providers/llm/openai.go` | ⚠️ Inline in backend-chat | Should be a proper provider |
 | `providers/memory/filesystem.go` | ✅ BM25 + layered | |
@@ -254,7 +261,8 @@ Extended thinking is a Claude 3.7+ Anthropic feature. Requires parsing `thinking
 | `providers/sandbox/opensandbox.go` | ✅ Full driver | |
 | `providers/sandbox/local.go` | ✅ Dev only | |
 | `providers/store/filesystem.go` | ✅ | |
-| `providers/thread/memory.go` | ✅ InMemory + Filesystem | No SQLite |
+| `providers/thread/memory.go` | ✅ InMemory + Filesystem | |
+| `providers/thread/sqlite.go` | ✅ Schema + inbox + listing | |
 
 ---
 
@@ -262,13 +270,44 @@ Extended thinking is a Claude 3.7+ Anthropic feature. Requires parsing `thinking
 
 | Priority | Gap | Impact | Effort |
 |---|---|---|---|
-| P0 | Extended thinking | Missing major Claude 3.7+ capability | High |
-| P0 | OpenAI as proper provider | streaming + tools for OpenAI | Medium |
-| P1 | SQLite ThreadProvider | Projects persistence | Medium |
+| P0 | OpenAI as proper provider | Streaming + tools for OpenAI | Medium |
 | P1 | Message-level prompt caching | Cost reduction for long conversations | Medium |
 | P1 | Image input (vision) | Multimodal conversations | Medium |
 | P2 | Hybrid BM25 + vector search | Better memory retrieval | High |
 | P2 | Tiktoken as default tokenizer | Budget accuracy | Low |
 | P2 | Skill hot reload | Dev experience | Low |
+| P2 | Multi-user thread isolation | Multi-tenant deployments | Medium |
 | P3 | Ollama ChatStream | Real streaming for local models | Medium |
 | P3 | Auto tokenizer selection by model | UX | Low |
+| P3 | Bundled local embedder | Offline semantic search | High |
+
+---
+
+## Lo que se cerró en la última iteración
+
+**Hito 1 — Extended Thinking (100%)**
+- `ChatRequest.ThinkingBudget` + `ChatResponse.ThinkingContent`
+- `anthropicThinking` block en el request body
+- Parser de `thinking` content blocks en respuestas blocking
+- Parser de `thinking_delta` events en SSE streaming
+- `StreamEventThinking` emitido en tiempo real
+- `Runtime.WithThinkingBudget(N)` con MaxTokens auto-increase
+
+**Hito 2 — SQLite ThreadProvider (90%)**
+- `OpenSQLite(db)` y `OpenSQLiteFile(path)` constructors
+- Schema con threads + thread_inbox tables
+- Indexes: `idx_thread_inbox_to`, `idx_threads_project`
+- `Create/Get/Archive/SendMessage/ReadInbox` completos
+- `ListByProject(projectID, status)` para projects
+- `UpdateStatus` para lifecycle transitions
+- Thread hierarchy via `parent_id` persistido
+
+**Memory system (100% — completado en hitos previos)**
+- BM25 search en filesystem provider
+- LayeredFilesystemMemory con frontmatter YAML
+- MemoryRoots con labels para orientación estructurada
+- `WriteWithDedup` con Dice coefficient
+- Triggers EN+ES con replace/delete intent
+- `ClearSession` al final de cada turn
+
+**Overall: 88% → 91% (+3%)**
