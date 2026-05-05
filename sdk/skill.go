@@ -32,6 +32,11 @@ type SkillMeta struct {
 	// Optional fields
 	RequiredFeatureFlag string   `json:"requiredFeatureFlag,omitempty"`
 	GrantedTools        []string `json:"grantedTools,omitempty"`
+
+	// Requires lists skills that must be loaded before this one.
+	// When this skill is loaded, each dependency is automatically loaded too.
+	// Circular dependencies are detected and skipped.
+	Requires []string `json:"requires,omitempty"`
 }
 
 // Skill is a package of domain-specific knowledge that the agent loads

@@ -151,6 +151,111 @@ func (cv CriteriaVerification) Verify(ctx context.Context, r *AgentLoopResult, _
 	}
 }
 
+// ── LocalVerification — zero extra LLM calls ──────────────────────────────────
+
+// LocalVerification checks the response against rules that can be evaluated
+// without calling the LLM. Use this as a cheap pre-filter before CriteriaVerification.
+//
+// Rules are evaluated in order. First failure stops evaluation and triggers retry.
+type LocalVerification struct {
+	// MinLength rejects responses shorter than this (in characters). Default 0 (disabled).
+	MinLength int
+
+	// MaxLength rejects responses longer than this. Default 0 (disabled).
+	MaxLength int
+
+	// MustContain is a list of substrings that MUST appear in the response.
+	MustContain []string
+
+	// MustNotContain is a list of substrings that MUST NOT appear.
+	MustNotContain []string
+
+	// MustNotBeEmpty rejects empty or whitespace-only responses.
+	MustNotBeEmpty bool
+
+	// NoHallucination checks that the response doesn't contain known hallucination
+	// markers ("I don't have access to", "as an AI", "I cannot access the internet")
+	// that indicate the LLM failed to use its tools.
+	NoHallucination bool
+}
+
+func (v LocalVerification) Verify(_ context.Context, r *AgentLoopResult, _ *Conversation) Verdict {
+	resp := strings.TrimSpace(r.FinalContent)
+
+	if v.MustNotBeEmpty && resp == "" {
+		return Verdict{Pass: false, Reason: "response is empty", Retry: true}
+	}
+	if v.MinLength > 0 && len(resp) < v.MinLength {
+		return Verdict{
+			Pass:   false,
+			Reason: fmt.Sprintf("response too short: %d < %d chars", len(resp), v.MinLength),
+			Retry:  true,
+		}
+	}
+	if v.MaxLength > 0 && len(resp) > v.MaxLength {
+		return Verdict{
+			Pass:   false,
+			Reason: fmt.Sprintf("response too long: %d > %d chars", len(resp), v.MaxLength),
+			Retry:  false,
+		}
+	}
+	lower := strings.ToLower(resp)
+	for _, s := range v.MustContain {
+		if !strings.Contains(lower, strings.ToLower(s)) {
+			return Verdict{
+				Pass:   false,
+				Reason: fmt.Sprintf("response missing required content: %q", s),
+				Retry:  true,
+			}
+		}
+	}
+	for _, s := range v.MustNotContain {
+		if strings.Contains(lower, strings.ToLower(s)) {
+			return Verdict{
+				Pass:   false,
+				Reason: fmt.Sprintf("response contains forbidden content: %q", s),
+				Retry:  true,
+			}
+		}
+	}
+	if v.NoHallucination {
+		markers := []string{
+			"i don't have access to real-time",
+			"i cannot access the internet",
+			"as an ai language model",
+			"i don't have the ability to browse",
+			"no puedo acceder a internet",
+			"como modelo de lenguaje",
+		}
+		for _, m := range markers {
+			if strings.Contains(lower, m) {
+				return Verdict{
+					Pass:   false,
+					Reason: "response contains hallucination marker — LLM may not have used available tools",
+					Retry:  true,
+				}
+			}
+		}
+	}
+	return Verdict{Pass: true, Reason: "local verification passed"}
+}
+
+// VerificationChain runs multiple strategies in order.
+// First failure returns immediately. All must pass for the chain to pass.
+type VerificationChain struct {
+	Strategies []VerificationStrategy
+}
+
+func (vc VerificationChain) Verify(ctx context.Context, r *AgentLoopResult, conv *Conversation) Verdict {
+	for _, s := range vc.Strategies {
+		v := s.Verify(ctx, r, conv)
+		if !v.Pass {
+			return v
+		}
+	}
+	return Verdict{Pass: true, Reason: "all verification strategies passed"}
+}
+
 // ── Phase transition signals ─────────────────────────────────────────────────
 
 // PhaseSignal describes why a phase should advance. Runtime uses signals

@@ -28,7 +28,11 @@ func newModeEngine(provider ab.LLMProvider, model string, logContext RuntimeLogC
 
 func newModeEngineWithDB(provider ab.LLMProvider, model string, logContext RuntimeLogContext, db *sql.DB) (*ab.Engine, *agentRuntime, error) {
 	skills, _ := loadBackendSkills()
-	memory, _ := loadBackendMemory()
+	memory, memRoots, err := loadBackendMemory()
+	if err != nil {
+		memory = nil
+		memRoots = ab.DefaultMemoryRoots
+	}
 
 	rt := &agentRuntime{
 		chatID:      logContext.ChatID,
@@ -88,6 +92,10 @@ func newModeEngineWithDB(provider ab.LLMProvider, model string, logContext Runti
 	// ── Runtime with every capability wired ──
 	runtime := ab.NewRuntime(engine).
 		WithMode(logContext.Mode).
+		// Memory roots: labeled dirs matching Claude's profile/facts/project structure
+		WithMemoryRoots(memRoots...).
+		// Memory token cap: prevent enormous memory from overflowing context
+		WithMaxMemoryTokens(8_000).
 		// Safety: tool call inspection
 		WithSafety(ab.NewSafetyChain(
 			ab.DefaultDangerousCommandFilter(),
@@ -97,24 +105,32 @@ func newModeEngineWithDB(provider ab.LLMProvider, model string, logContext Runti
 		WithOutputFilter(ab.NewOutputFilterChain(
 			ab.DefaultSecretRedactionFilter(),
 		)).
-		// Verification: ensure response is non-empty and complete
-		WithVerification(ab.CompletionVerification{MinLength: 5}).
+		// Verification: lightweight local check (no extra LLM call)
+		WithVerification(ab.VerificationChain{Strategies: []ab.VerificationStrategy{
+			ab.LocalVerification{MustNotBeEmpty: true, MinLength: 5, NoHallucination: true},
+			ab.CompletionVerification{MinLength: 5},
+		}}).
 		WithMaxVerifyRetry(1).
-		// Compaction: summarize dropped history instead of silently discarding
-		WithCompactor(&ab.BulletCompactor{MaxChars: 600}).
-		// Memory inference: extract persistent facts from conversation
+		// Compaction: episodic — preserves key decisions, summarizes the rest
+		WithCompactor(&ab.EpisodicCompactor{
+			Provider: provider,
+			Model:    model,
+			MaxWords: 400,
+		}).
+		// Memory inference: extract persistent facts, deduplicated
 		WithMemoryWriter(&ab.InferredMemoryWriter{
-			Provider:      provider,
-			Model:         model,
-			MaxFacts:      3,
-			MinConfidence: 0.75,
+			Provider:        provider,
+			Model:           model,
+			MaxFacts:        3,
+			MinConfidence:   0.75,
+			DedupeThreshold: 0.6,
 		}).
 		// Planning: LLM-driven decision + executable DAG proposal
 		WithPlanner(&ab.LLMPlanner{Provider: provider, Model: model, MaxExecutables: 6}).
 		WithAutoApprovePlan(true).
 		// Session context: inject time every turn
 		WithSessionContext(ab.LocalTimeSessionContext()).
-		// Tokenizer: Claude-tuned heuristic
+		// Tokenizer: Claude-tuned heuristic (swap for tiktoken in production)
 		WithTokenizer(&claudeTokenizerAdapter{}).
 		// Persistence: SQLite conversation store
 		WithConversationStore(convStore).
@@ -246,12 +262,21 @@ func buildBehaviorPrompt() string {
 
 ## Memory discipline (backend-specific)
 
-You have access to persistent memory scoped to the user and to the current project. Use it:
-- Write user preferences, decisions, and recurring context that will matter in future sessions
-- Write project state: what was built, what was decided, what is pending
-- Do NOT write ephemeral facts like "user is currently debugging X" — those go in observations
-- Use str_replace to update existing entries rather than creating duplicates
-- Before writing, check if a similar entry already exists (use list or search first)
+You have access to persistent memory with the following structure:
+
+**User scope** (persists across all projects):
+- ` + "`/profile/`" + ` — your identity, preferences, working style
+- ` + "`/facts/`" + ` — things you've told me worth remembering
+
+**Project scope** (specific to this project):
+- ` + "`/`" + ` — project decisions, architecture, workflow state
+
+Rules:
+- Write preferences and recurring context that matters in future sessions
+- Use ` + "`str_replace`" + ` to update existing entries — never create duplicates
+- Search before writing to check if a similar entry already exists
+- Do NOT write ephemeral facts (currently debugging X, in a hurry) — those are session-only
+- "I no longer work at X" → delete or replace the old entry, don't add a new one
 
 ## Tool call discipline
 

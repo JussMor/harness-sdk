@@ -145,15 +145,30 @@ type SecretLeakFilter struct {
 func DefaultSecretLeakFilter() *SecretLeakFilter {
 	return &SecretLeakFilter{
 		Patterns: []string{
-			"sk-ant-",     // Anthropic
-			"sk-proj-",    // OpenAI project
-			"sk-",         // OpenAI
-			"ghp_",        // GitHub classic PAT
-			"github_pat_", // GitHub fine-grained PAT
-			"AKIA",        // AWS access key
-			"AIza",        // Google API key
-			"xoxb-",       // Slack bot token
-			"xoxp-",       // Slack user token
+			// Anthropic
+			"sk-ant-",
+			// OpenAI
+			"sk-proj-", "sk-",
+			// GitHub
+			"ghp_", "github_pat_", "ghs_", "gho_",
+			// AWS
+			"AKIA", "ASIA", "AROA",
+			// Google / GCP
+			"AIza", "ya29.",
+			// Azure
+			"DefaultEndpointsProtocol=", "AccountKey=",
+			// Slack
+			"xoxb-", "xoxp-", "xoxa-",
+			// Stripe
+			"sk_live_", "rk_live_", "sk_test_",
+			// Cloudflare
+			"eyJhbGciOiJSUzI1NiIsImtpZCI6Ikp", // Cloudflare JWT prefix
+			// SendGrid / Twilio / other SaaS
+			"SG.", "AC", "SK",
+			// Generic high-entropy patterns
+			"-----BEGIN RSA PRIVATE KEY-----",
+			"-----BEGIN OPENSSH PRIVATE KEY-----",
+			"-----BEGIN EC PRIVATE KEY-----",
 		},
 	}
 }

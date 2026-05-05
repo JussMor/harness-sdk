@@ -14,13 +14,20 @@ import type {
 } from "@/features/chat/types"
 import {
   Bot,
+  Check,
+  Copy,
   LoaderCircle,
+  RefreshCw,
   SendHorizontal,
   Sparkles,
   Square,
+  ThumbsDown,
+  ThumbsUp,
   User,
 } from "lucide-react"
 import { useCallback, useEffect, useMemo, useRef, useState } from "react"
+import ReactMarkdown from "react-markdown"
+import remarkGfm from "remark-gfm"
 import type { SubagentTrace, ToolTrace } from "./tool-trace"
 import { ToolTraceCard } from "./tool-trace"
 
@@ -373,9 +380,30 @@ export function ChatMain({
       if (event.type === "error") {
         const errorMessage = event.data.error || "Unknown stream error"
         pushTimeline(`Stream error: ${errorMessage}`, "error")
+        return
+      }
+
+      if (event.type === "done") {
+        const messageId = event.data.messageId
+        if (!messageId || !chatID) return
+
+        // Fetch the persisted message from the backend and replace the local
+        // in-memory message with it. This ensures tool traces from metadata
+        // are correctly restored and nothing is lost after stream ends.
+        api.listMessages(chatID).then((msgs) => {
+          const saved = msgs.find((m) => m.id === messageId)
+          if (!saved) return
+          const restored = toChatMessage(saved)
+          setMessages((prev) =>
+            prev.map((m) => (m.id === pendingAssistantId ? restored : m))
+          )
+        }).catch(() => {
+          // Non-fatal — in-memory message already has the content
+        })
+        return
       }
     },
-    [pushTimeline]
+    [pushTimeline, api, chatID]
   )
 
   const ensureChat = useCallback(async (): Promise<number> => {
@@ -597,7 +625,18 @@ export function ChatMain({
                     ))}
                   </div>
                 )}
-                <p>{message.content || (message.pending ? "..." : "")}</p>
+                <MessageContent message={message} />
+                {/* Actions row — only for complete assistant messages */}
+                {message.role === "assistant" && !message.pending && !isStreaming && (
+                  <MessageActions content={message.content} onRetry={() => {
+                    const idx = messages.findIndex(m => m.id === message.id)
+                    const prev = messages.slice(0, idx).reverse().find(m => m.role === "user")
+                    if (prev) {
+                      setInput(prev.content)
+                      setTimeout(() => void sendPrompt(), 0)
+                    }
+                  }} />
+                )}
               </article>
             ))}
             <div ref={listEndRef} />
@@ -693,7 +732,8 @@ export function ChatMain({
             setActiveArtifact(null)
             setIsArtifactStreaming(false)
           }}
-          onContentChange={(artifactId, newContent) => {
+          onSaveVersion={async (artifactId, newContent) => {
+            // Update local state immediately
             setAllArtifacts((prev) =>
               prev.map((a) =>
                 a.id === artifactId ? { ...a, content: newContent } : a
@@ -712,12 +752,25 @@ export function ChatMain({
 }
 
 function toChatMessage(message: BackendMessage): ChatMessage {
+  // Restore tool traces from persisted metadata
+  const traces: Array<ToolTrace> = (message.metadata?.toolCalls ?? []).map(
+    (tc, i) => ({
+      id: `restored-${message.id}-${i}`,
+      name: tc.name,
+      args: tc.args,
+      result: tc.result,
+      error: tc.error,
+      status: tc.error ? ("error" as const) : ("success" as const),
+    })
+  )
+
   return {
     id: String(message.id),
     role: message.role,
     content: message.content,
     model: message.model,
     pending: false,
+    traces: traces.length > 0 ? traces : undefined,
   }
 }
 
@@ -775,4 +828,142 @@ function inferLanguageFromPath(filePath: string): string {
     toml: "toml",
   }
   return map[ext] || "text"
+}
+
+// ── MessageContent ────────────────────────────────────────────────────────────
+// Renders message text as markdown for assistant, plain for user.
+
+function MessageContent({ message }: { message: ChatMessage }) {
+  if (!message.content && message.pending) {
+    return <p className="chat-bubble-pending">...</p>
+  }
+  if (!message.content) return null
+
+  if (message.role === "user") {
+    return <p className="chat-bubble-text">{message.content}</p>
+  }
+
+  // Assistant: render as markdown
+  return (
+    <div className="chat-bubble-markdown">
+      <ReactMarkdown
+        remarkPlugins={[remarkGfm]}
+        components={{
+          // Code blocks — with copy button
+          code({ node, className, children, ...props }) {
+            const match = /language-(\w+)/.exec(className || "")
+            const lang = match?.[1] || ""
+            const code = String(children).replace(/\n$/, "")
+            const isBlock = code.includes("\n") || !!lang
+
+            if (!isBlock) {
+              return <code className="chat-inline-code" {...props}>{children}</code>
+            }
+            return (
+              <CodeBlock lang={lang} code={code} />
+            )
+          },
+          // Links open in new tab
+          a({ href, children }) {
+            return (
+              <a href={href} target="_blank" rel="noopener noreferrer">
+                {children}
+              </a>
+            )
+          },
+        }}
+      >
+        {message.content}
+      </ReactMarkdown>
+    </div>
+  )
+}
+
+// ── CodeBlock ─────────────────────────────────────────────────────────────────
+
+function CodeBlock({ lang, code }: { lang: string; code: string }) {
+  const [copied, setCopied] = useState(false)
+
+  const handleCopy = async () => {
+    await navigator.clipboard.writeText(code)
+    setCopied(true)
+    setTimeout(() => setCopied(false), 1500)
+  }
+
+  return (
+    <div className="chat-code-block">
+      <div className="chat-code-block__header">
+        {lang && <span className="chat-code-block__lang">{lang}</span>}
+        <button
+          type="button"
+          className="chat-code-block__copy"
+          onClick={handleCopy}
+          title="Copy code"
+        >
+          {copied ? <Check size={12} /> : <Copy size={12} />}
+          <span>{copied ? "Copied" : "Copy"}</span>
+        </button>
+      </div>
+      <pre className="chat-code-block__pre">
+        <code>{code}</code>
+      </pre>
+    </div>
+  )
+}
+
+// ── MessageActions ────────────────────────────────────────────────────────────
+
+function MessageActions({
+  content,
+  onRetry,
+}: {
+  content: string
+  onRetry: () => void
+}) {
+  const [copied, setCopied] = useState(false)
+  const [feedback, setFeedback] = useState<"up" | "down" | null>(null)
+
+  const handleCopy = async () => {
+    await navigator.clipboard.writeText(content)
+    setCopied(true)
+    setTimeout(() => setCopied(false), 1500)
+  }
+
+  return (
+    <div className="chat-message-actions">
+      <button
+        type="button"
+        className="chat-action-btn"
+        onClick={handleCopy}
+        title="Copy response"
+      >
+        {copied ? <Check size={13} /> : <Copy size={13} />}
+      </button>
+      <button
+        type="button"
+        className="chat-action-btn"
+        onClick={onRetry}
+        title="Retry"
+      >
+        <RefreshCw size={13} />
+      </button>
+      <div className="chat-action-divider" />
+      <button
+        type="button"
+        className={`chat-action-btn ${feedback === "up" ? "chat-action-btn--active-good" : ""}`}
+        onClick={() => setFeedback(feedback === "up" ? null : "up")}
+        title="Good response"
+      >
+        <ThumbsUp size={13} />
+      </button>
+      <button
+        type="button"
+        className={`chat-action-btn ${feedback === "down" ? "chat-action-btn--active-bad" : ""}`}
+        onClick={() => setFeedback(feedback === "down" ? null : "down")}
+        title="Bad response"
+      >
+        <ThumbsDown size={13} />
+      </button>
+    </div>
+  )
 }

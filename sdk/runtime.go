@@ -39,7 +39,6 @@ type Runtime struct {
 	maxSkills       int
 	skillThreshold  float64
 	autoCheckpoint  bool
-	memoryRoots     []string
 	maxVerifyRetry  int
 	observationFilt ObservationFilter
 	memoryTrigger   MemoryTriggerDetector
@@ -54,6 +53,9 @@ type Runtime struct {
 	sessionContext  SessionContextProvider
 	outputFilter    OutputFilter
 	compactor       Compactor
+	maxMemoryTokens int        // 0 = unlimited
+	memoryRootsV2   []MemoryRoot // nil = use DefaultMemoryRoots
+	thinkingBudget  int          // 0 = disabled; >0 enables extended thinking
 }
 
 // Tokenizer estimates token count for a string. Replace the default heuristic
@@ -82,7 +84,6 @@ func NewRuntime(engine *Engine) *Runtime {
 		maxSkills:       3,
 		skillThreshold:  0.3,
 		autoCheckpoint:  true,
-		memoryRoots:     []string{"/"},
 		maxVerifyRetry:  2,
 		observationFilt: DefaultObservationFilter,
 		memoryTrigger:   DefaultMemoryTriggerDetector,
@@ -137,6 +138,39 @@ func (r *Runtime) WithOutputFilter(f OutputFilter) *Runtime {
 // messages are silently lost. With it, a summary is injected into LayerMemory.
 func (r *Runtime) WithCompactor(c Compactor) *Runtime {
 	r.compactor = c
+	return r
+}
+
+// WithMaxMemoryTokens caps how many tokens of memory can be injected into
+// LayerMemory. When the full memory exceeds this, the most recent/relevant
+// entries are prioritized and the rest truncated.
+// Default 0 = no cap (load everything).
+func (r *Runtime) WithMaxMemoryTokens(n int) *Runtime {
+	r.maxMemoryTokens = n
+	return r
+}
+
+// WithMemoryRoots replaces the default memory roots with a custom set.
+// Use this to read different directories per scope during orientation.
+// Default: DefaultMemoryRoots (user/profile, user/facts, project/).
+//
+// Example — add a project-specific knowledge base:
+//
+//	runtime.WithMemoryRoots(autobuild.DefaultMemoryRoots..., autobuild.MemoryRoot{
+//	    Scope: autobuild.ScopeProject, Path: "/knowledge", Label: "Domain knowledge",
+//	})
+func (r *Runtime) WithMemoryRoots(roots ...MemoryRoot) *Runtime {
+	r.memoryRootsV2 = roots
+	return r
+}
+
+// WithThinkingBudget enables extended thinking for Claude 3.7+ models.
+// budgetTokens is the maximum tokens the model can spend reasoning internally
+// before producing a response. Minimum enforced by Anthropic API: 1024.
+// MaxTokens in each request is automatically increased when needed.
+// Default 0 = disabled.
+func (r *Runtime) WithThinkingBudget(budgetTokens int) *Runtime {
+	r.thinkingBudget = budgetTokens
 	return r
 }
 
@@ -383,21 +417,32 @@ func (r *Runtime) orientation(ctx context.Context, userMessage string, conv *Con
 		}
 	}
 
-	// Read memory → LayerMemory
+	// Read memory → LayerMemory using labeled roots
 	if r.engine.HasMemory() && r.engine.HasPrompt() {
+		roots := r.memoryRootsV2
+		if len(roots) == 0 {
+			roots = DefaultMemoryRoots
+		}
 		var memContent strings.Builder
-		for _, root := range r.memoryRoots {
-			if content, err := r.engine.Memory.View(ctx, ScopeUser, root); err == nil && content != "" {
-				memContent.WriteString(content)
+		for _, root := range roots {
+			content, err := r.engine.Memory.View(ctx, root.Scope, root.Path)
+			if err != nil || strings.TrimSpace(content) == "" {
+				continue
+			}
+			if root.Label != "" {
+				memContent.WriteString("## ")
+				memContent.WriteString(root.Label)
 				memContent.WriteString("\n\n")
 			}
-			if content, err := r.engine.Memory.View(ctx, ScopeProject, root); err == nil && content != "" {
-				memContent.WriteString(content)
-				memContent.WriteString("\n\n")
-			}
+			memContent.WriteString(strings.TrimSpace(content))
+			memContent.WriteString("\n\n")
 		}
 		if memContent.Len() > 0 {
-			r.engine.Prompt.Set(LayerMemory, memContent.String())
+			memStr := memContent.String()
+			if r.maxMemoryTokens > 0 && r.tokenizer.Count(memStr) > r.maxMemoryTokens {
+				memStr = evictMemoryToTokenBudget(memStr, r.maxMemoryTokens, r.tokenizer)
+			}
+			r.engine.Prompt.Set(LayerMemory, memStr)
 			rr.MemoryRead = true
 			conv.MemoryRead = true
 		}
@@ -455,6 +500,35 @@ func (r *Runtime) matchAndLoadSkills(ctx context.Context, userMessage string, co
 	}
 	var skillContent strings.Builder
 	loaded := 0
+	seen := make(map[string]bool) // dedup within this load cycle
+
+	var loadSkill func(name string, depth int) *Skill
+	loadSkill = func(name string, depth int) *Skill {
+		if depth > 4 || seen[name] || conv.IsSkillLoaded(name) || loaded >= r.maxSkills {
+			return nil
+		}
+		seen[name] = true
+		skill, err := r.engine.Skills.Load(ctx, name)
+		if err != nil {
+			return nil
+		}
+		// Load required dependencies first (recursive, depth-limited)
+		for _, dep := range skill.Meta.Requires {
+			if dep != "" && dep != name {
+				loadSkill(dep, depth+1)
+			}
+		}
+		skillContent.WriteString("# Skill: ")
+		skillContent.WriteString(skill.Name)
+		skillContent.WriteString("\n\n")
+		skillContent.WriteString(skill.Content)
+		skillContent.WriteString("\n\n")
+		conv.MarkSkillLoaded(skill.Name, 1.0, r.tokenizer.Count(skill.Content))
+		rr.SkillsLoaded = append(rr.SkillsLoaded, skill.Name)
+		loaded++
+		return skill
+	}
+
 	for _, m := range matches {
 		if loaded >= r.maxSkills {
 			break
@@ -462,18 +536,7 @@ func (r *Runtime) matchAndLoadSkills(ctx context.Context, userMessage string, co
 		if m.Score < r.skillThreshold {
 			break
 		}
-		skill, err := r.engine.Skills.Load(ctx, m.Skill.Name)
-		if err != nil {
-			continue
-		}
-		skillContent.WriteString("# Skill: ")
-		skillContent.WriteString(skill.Name)
-		skillContent.WriteString("\n\n")
-		skillContent.WriteString(skill.Content)
-		skillContent.WriteString("\n\n")
-		conv.MarkSkillLoaded(skill.Name, m.Score, r.tokenizer.Count(skill.Content))
-		rr.SkillsLoaded = append(rr.SkillsLoaded, skill.Name)
-		loaded++
+		loadSkill(m.Skill.Name, 0)
 	}
 	if skillContent.Len() > 0 {
 		r.engine.Prompt.Set(LayerSkills, skillContent.String())
@@ -598,6 +661,21 @@ func (r *Runtime) execution(ctx context.Context, conv *Conversation, rr *Runtime
 		},
 	}
 
+	// Inject ThinkingBudget into every ChatRequest if extended thinking is enabled.
+	if r.thinkingBudget > 0 {
+		thinkingBudget := r.thinkingBudget
+		cfg.BuildRequest = func(systemPrompt string, messages []ChatMessage, tools *ToolRegistry) ChatRequest {
+			// Build a minimal config to pass to defaultBuildRequest
+			innerCfg := AgentLoopConfig{
+				SystemPrompt: systemPrompt,
+				Tools:        tools,
+			}
+			req := defaultBuildRequest(innerCfg, messages)
+			req.ThinkingBudget = thinkingBudget
+			return req
+		}
+	}
+
 	// Single point of prompt assembly: apply mode → LayerMode, then Build once.
 	// Pass as cfg.SystemPrompt so RunAgentLoopWithEngine treats it as caller-supplied
 	// and skips its own Build path.
@@ -649,7 +727,7 @@ func (r *Runtime) execution(ctx context.Context, conv *Conversation, rr *Runtime
 // ── Phase 5: Closure ─────────────────────────────────────────────────────────
 
 func (r *Runtime) closure(ctx context.Context, userMessage string, loopResult *AgentLoopResult, conv *Conversation, rr *RuntimeResult) error {
-	// Explicit memory triggers
+	// Explicit memory triggers — supports create, replace, delete
 	if r.engine.HasMemory() && r.memoryTrigger != nil {
 		layer, content, detected := r.memoryTrigger(userMessage)
 		if detected && content != "" {
@@ -661,28 +739,76 @@ func (r *Runtime) closure(ctx context.Context, userMessage string, loopResult *A
 					CreatedAt: time.Now(),
 				})
 			} else {
-				path := fmt.Sprintf("/facts/%d.md", time.Now().UnixNano())
-				if err := r.engine.Memory.Create(ctx, ScopeUser, path, content); err == nil {
-					rr.MemoryWritten = append(rr.MemoryWritten, path)
-				}
+				r.handleMemoryTrigger(ctx, layer, content, rr)
 			}
 		}
 	}
 
-	// Inferred memory writes (LLM identifies persistent facts)
+	// Inferred memory writes with deduplication and layer metadata
 	if r.memoryWriter != nil && loopResult != nil && r.engine.HasMemory() {
 		facts, err := r.memoryWriter.Extract(ctx, conv, loopResult.FinalContent)
-		if err == nil {
-			for _, fact := range facts {
-				path := fmt.Sprintf("/facts/inferred-%d.md", time.Now().UnixNano())
-				if err := r.engine.Memory.Create(ctx, fact.Scope, path, fact.Content); err == nil {
-					rr.MemoryWritten = append(rr.MemoryWritten, path)
-					rr.InferredFacts = append(rr.InferredFacts, fact)
+		if err == nil && len(facts) > 0 {
+			written, _ := r.memoryWriter.WriteWithDedup(ctx, r.engine.Memory, facts)
+			for _, fact := range written {
+				if fact.Path != "" {
+					rr.MemoryWritten = append(rr.MemoryWritten, fact.Path)
 				}
+				rr.InferredFacts = append(rr.InferredFacts, fact)
 			}
 		}
 	}
+
+	// Clear expired session observations so they don't bleed into the next turn.
+	// Explicit and Inferred memory is persistent — only Session is ephemeral.
+	if r.engine.HasObservations() {
+		_ = r.engine.Observations.Expire(ctx)
+	}
+
 	return nil
+}
+
+// handleMemoryTrigger writes, replaces, or deletes a memory entry.
+// Before creating, it searches for an existing similar entry to update — this
+// prevents "I work at Acme" and "I now work at Beta" coexisting as duplicates.
+// "FORGET: X" triggers search-and-delete of entries matching X.
+func (r *Runtime) handleMemoryTrigger(ctx context.Context, layer MemoryLayer, content string, rr *RuntimeResult) {
+	// Forget intent: delete matching entries
+	if strings.HasPrefix(content, "FORGET: ") {
+		query := strings.TrimPrefix(content, "FORGET: ")
+		existing, _ := r.engine.Memory.Search(ctx, ScopeUser, query)
+		for _, entry := range existing {
+			if entry.Path == "" {
+				continue
+			}
+			if stringSimilarity(entry.Content, query) >= 0.4 {
+				if err := r.engine.Memory.Delete(ctx, ScopeUser, entry.Path); err == nil {
+					rr.MemoryWritten = append(rr.MemoryWritten, "deleted:"+entry.Path)
+				}
+			}
+		}
+		return
+	}
+
+	// Update intent: find similar existing entry and replace
+	existing, _ := r.engine.Memory.Search(ctx, ScopeUser, content)
+	for _, entry := range existing {
+		if entry.Content == "" || entry.Path == "" {
+			continue
+		}
+		if stringSimilarity(entry.Content, content) >= 0.5 {
+			if err := r.engine.Memory.StrReplace(ctx, ScopeUser, entry.Path, entry.Content, content); err == nil {
+				rr.MemoryWritten = append(rr.MemoryWritten, entry.Path)
+				return
+			}
+		}
+	}
+
+	// No similar entry found — create new
+	path := fmt.Sprintf("/facts/%d.md", time.Now().UnixNano())
+	if err := r.engine.Memory.Create(ctx, ScopeUser, path, content); err == nil {
+		rr.MemoryWritten = append(rr.MemoryWritten, path)
+	}
+	_ = layer
 }
 
 // ── RuntimeResult ────────────────────────────────────────────────────────────
@@ -801,4 +927,41 @@ func wellbeingResponse(s WellbeingSignal) string {
 	default:
 		return "It sounds like you're going through something hard. I'm happy to keep talking, but I want you to know that talking to someone you trust — a friend, family member, or professional — can help in ways I can't."
 	}
+}
+
+// evictMemoryToTokenBudget truncates memory content to fit within maxTokens.
+// Strategy: prefer keeping the most recent entries (bottom of file) and
+// truncate from the top. This mirrors how Claude handles long memory:
+// recent facts are more relevant than old ones.
+func evictMemoryToTokenBudget(content string, maxTokens int, tok Tokenizer) string {
+	paragraphs := strings.Split(strings.TrimSpace(content), "\n\n")
+	if len(paragraphs) == 0 {
+		return content
+	}
+
+	// Work backwards (most recent first), accumulate until budget exhausted
+	var kept []string
+	used := 0
+	for i := len(paragraphs) - 1; i >= 0; i-- {
+		p := strings.TrimSpace(paragraphs[i])
+		if p == "" {
+			continue
+		}
+		tokens := tok.Count(p)
+		if used+tokens > maxTokens {
+			break
+		}
+		kept = append([]string{p}, kept...)
+		used += tokens
+	}
+
+	if len(kept) == 0 {
+		// Nothing fits — take the last paragraph and truncate it
+		last := strings.TrimSpace(paragraphs[len(paragraphs)-1])
+		return last
+	}
+	if len(kept) < len(paragraphs) {
+		kept = append([]string{"[Earlier memory entries omitted — token budget exceeded]"}, kept...)
+	}
+	return strings.Join(kept, "\n\n")
 }

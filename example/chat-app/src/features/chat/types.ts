@@ -88,8 +88,45 @@ export type StreamEvent =
   | { type: "tool_call"; data: StreamToolCall }
   | { type: "tool_result"; data: StreamToolResult }
   | { type: "sandbox_output"; data: StreamSandboxOutput }
+  | { type: "artifact"; data: StreamArtifact }
   | { type: "done"; data: StreamDone }
   | { type: "error"; data: { error?: string } }
+
+export interface StreamArtifact {
+  id: string
+  language: string
+  title: string
+  version: number
+  content: string
+  r2Url?: string
+}
+
+// ── Artifact API types ──────────────────────────────────────────────────────
+
+export interface ArtifactVersion {
+  id: number
+  artifactId: string
+  version: number
+  content: string
+  r2Url?: string
+  createdAt: string
+}
+
+export interface ArtifactRecord {
+  id: string
+  chatId: number
+  messageId?: number
+  language: string
+  title: string
+  createdAt: string
+  versions?: ArtifactVersion[]
+}
+
+export interface ArtifactStorageResponse {
+  artifactId: string
+  shared: boolean
+  data: Record<string, unknown>
+}
 
 export interface StreamCallbacks {
   onEvent: (event: StreamEvent) => void

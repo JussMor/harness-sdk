@@ -1,2 +1,8 @@
 github.com/alibaba/OpenSandbox/sdks/sandbox/go v1.0.0 h1:oqsi+3TwN7qQX1XHgk/io+fIr4KUKC6izLjah+D40q4=
 github.com/alibaba/OpenSandbox/sdks/sandbox/go v1.0.0/go.mod h1:RUNXUZnKDUAN/gIkfWcZZ1HNRJ0G6NIjGca0uMDex6I=
+github.com/dlclark/regexp2 v1.9.0 h1:pTK/l/3qYIKaRXuHnEnIf7Y5NxfRPfpb7dis6/gdlVI=
+github.com/dlclark/regexp2 v1.9.0/go.mod h1:DHkYz0B9wPfa6wondMfaivmHpzrQ3v9q8cnmRbL6yW8=
+github.com/mattn/go-sqlite3 v1.14.44 h1:3VSe+xafpbzsLbdr2AWlAZk9yRHiBhTBakioXaCKTF8=
+github.com/mattn/go-sqlite3 v1.14.44/go.mod h1:pjEuOr8IwzLJP2MfGeTb0A35jauH+C2kbHKBr7yXKVQ=
+github.com/tiktoken-go/tokenizer v0.3.0 h1:t8aeiXWRClTOBHohuOKurqnqG79hXbwsJmOtxp+AWJ8=
+github.com/tiktoken-go/tokenizer v0.3.0/go.mod h1:7SZW3pZUKWLJRilTvWCa86TOVIiiJhYj3FQ5V3alWcg=

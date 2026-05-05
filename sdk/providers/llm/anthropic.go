@@ -129,6 +129,7 @@ type anthropicMessage struct {
 type anthropicContent struct {
 	Type      string          `json:"type"`
 	Text      *string         `json:"text,omitempty"`
+	Thinking  *string         `json:"thinking,omitempty"`  // extended thinking block
 	ID        string          `json:"id,omitempty"`          // tool_use
 	Name      string          `json:"name,omitempty"`        // tool_use
 	Input     json.RawMessage `json:"input,omitempty"`       // tool_use
@@ -145,11 +146,31 @@ type anthropicTool struct {
 }
 
 type anthropicRequest struct {
-	Model     string             `json:"model"`
-	MaxTokens int                `json:"max_tokens"`
-	System    string             `json:"system,omitempty"`
-	Messages  []anthropicMessage `json:"messages"`
-	Tools     []anthropicTool    `json:"tools,omitempty"`
+	Model        string                 `json:"model"`
+	MaxTokens    int                    `json:"max_tokens"`
+	System       string                 `json:"-"` // use SystemBlocks when set
+	SystemBlocks []anthropicSystemBlock `json:"system,omitempty"`
+	Messages     []anthropicMessage     `json:"messages"`
+	Tools        []anthropicTool        `json:"tools,omitempty"`
+	Thinking     *anthropicThinking     `json:"thinking,omitempty"`
+}
+
+// anthropicThinking enables extended thinking mode.
+// Only supported by Claude 3.7+ models.
+// BudgetTokens must be at least 1024 and less than MaxTokens.
+type anthropicThinking struct {
+	Type         string `json:"type"`          // always "enabled"
+	BudgetTokens int    `json:"budget_tokens"` // how many tokens the model can spend thinking
+}
+
+type anthropicSystemBlock struct {
+	Type         string                 `json:"type"`
+	Text         string                 `json:"text"`
+	CacheControl *anthropicCacheControl `json:"cache_control,omitempty"`
+}
+
+type anthropicCacheControl struct {
+	Type string `json:"type"` // "ephemeral"
 }
 
 type anthropicResponse struct {
@@ -171,22 +192,66 @@ func buildAnthropicRequest(model string, maxTokens int, req autobuild.ChatReques
 		MaxTokens: maxTokens,
 	}
 
+	// Extended thinking: when ThinkingBudget is set, enable the thinking block.
+	// MaxTokens must exceed ThinkingBudget — enforce minimum here.
+	if req.ThinkingBudget > 0 {
+		budget := req.ThinkingBudget
+		if budget < 1024 {
+			budget = 1024 // Anthropic minimum
+		}
+		if out.MaxTokens <= budget {
+			out.MaxTokens = budget + 4096 // ensure room for response
+		}
+		out.Thinking = &anthropicThinking{
+			Type:         "enabled",
+			BudgetTokens: budget,
+		}
+	}
+
+	// Prompt caching: mark the system prompt for caching so Anthropic can
+	// reuse it across turns without re-processing. This reduces latency and
+	// cost significantly for long system prompts (skills, memory, behavior).
+	systemContent := ""
 	for _, m := range req.Messages {
+		if m.Role == autobuild.RoleSystem {
+			if systemContent != "" {
+				systemContent += "\n\n" + m.Content
+			} else {
+				systemContent = m.Content
+			}
+		}
+	}
+	if systemContent != "" {
+		out.System = systemContent
+		// Mark for caching — Anthropic will cache this if ≥ 1024 tokens
+		out.SystemBlocks = []anthropicSystemBlock{
+			{Type: "text", Text: systemContent, CacheControl: &anthropicCacheControl{Type: "ephemeral"}},
+		}
+	}
+
+	// Convert messages — critical: batch consecutive RoleTool messages into
+	// a single user message with multiple tool_result blocks.
+	// Anthropic rejects requests where tool_results are in separate user messages.
+	i := 0
+	msgs := req.Messages
+	for i < len(msgs) {
+		m := msgs[i]
 		switch m.Role {
 		case autobuild.RoleSystem:
-			// Anthropic uses a top-level system field, not a message role.
-			if out.System != "" {
-				out.System += "\n\n" + m.Content
-			} else {
-				out.System = m.Content
-			}
+			i++
+			continue
+
 		case autobuild.RoleUser:
-			out.Messages = append(out.Messages, anthropicMessage{
-				Role: "user",
-				Content: []anthropicContent{
-					{Type: "text", Text: strPtr(m.Content)},
-				},
-			})
+			if m.Content != "" {
+				out.Messages = append(out.Messages, anthropicMessage{
+					Role: "user",
+					Content: []anthropicContent{
+						{Type: "text", Text: strPtr(m.Content)},
+					},
+				})
+			}
+			i++
+
 		case autobuild.RoleAssistant:
 			var content []anthropicContent
 			if m.Content != "" {
@@ -211,18 +276,28 @@ func buildAnthropicRequest(model string, maxTokens int, req autobuild.ChatReques
 				Role:    "assistant",
 				Content: content,
 			})
+			i++
+
 		case autobuild.RoleTool:
-			// Tool results land in a user message with a tool_result block.
+			// Batch ALL consecutive tool results into one user message.
+			// This is required by the Anthropic API — separate user messages
+			// for each tool result cause a 400 error.
+			var toolResults []anthropicContent
+			for i < len(msgs) && msgs[i].Role == autobuild.RoleTool {
+				toolResults = append(toolResults, anthropicContent{
+					Type:      "tool_result",
+					ToolUseID: msgs[i].ToolCallID,
+					Content:   msgs[i].Content,
+				})
+				i++
+			}
 			out.Messages = append(out.Messages, anthropicMessage{
-				Role: "user",
-				Content: []anthropicContent{
-					{
-						Type:      "tool_result",
-						ToolUseID: m.ToolCallID,
-						Content:   m.Content,
-					},
-				},
+				Role:    "user",
+				Content: toolResults,
 			})
+
+		default:
+			i++
 		}
 	}
 
@@ -260,6 +335,15 @@ func parseAnthropicResponse(body []byte) (*autobuild.ChatResponse, error) {
 
 	for _, c := range raw.Content {
 		switch c.Type {
+		case "thinking":
+			// Extended thinking content — internal model reasoning.
+			// Stored separately from Content, not shown to users by default.
+			if c.Thinking != nil {
+				if out.ThinkingContent != "" {
+					out.ThinkingContent += "\n"
+				}
+				out.ThinkingContent += *c.Thinking
+			}
 		case "text":
 			if c.Text != nil {
 				if out.Content != "" {
@@ -421,6 +505,14 @@ func readAnthropicSSE(ctx context.Context, body io.Reader, out chan<- autobuild.
 						Delta: event.Delta.Text,
 					}
 				}
+			case "thinking_delta":
+				// Extended thinking — internal model reasoning streamed in real time.
+				if event.Delta.Thinking != "" {
+					out <- autobuild.StreamEvent{
+						Type:     autobuild.StreamEventThinking,
+						Thinking: event.Delta.Thinking,
+					}
+				}
 			case "input_json_delta":
 				// Accumulate tool call arguments
 				toolArgsBuf.WriteString(event.Delta.PartialJSON)
@@ -499,9 +591,10 @@ type sseEvent struct {
 
 	// content_block_delta
 	Delta *struct {
-		Type        string `json:"type"`
-		Text        string `json:"text,omitempty"`
-		PartialJSON string `json:"partial_json,omitempty"`
+		Type         string `json:"type"`
+		Text         string `json:"text,omitempty"`
+		Thinking     string `json:"thinking,omitempty"`      // thinking_delta
+		PartialJSON  string `json:"partial_json,omitempty"`
 	} `json:"delta,omitempty"`
 
 	// message_delta

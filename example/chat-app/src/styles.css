@@ -641,3 +641,359 @@
   border: none;
   background: white;
 }
+/* ── Markdown editor styles ───────────────────────────────────────────────── */
+
+.artifact-canvas__view-toggle {
+  display: flex;
+  gap: 1px;
+  background: var(--border);
+  border-radius: 6px;
+  overflow: hidden;
+  margin-right: 4px;
+}
+
+.artifact-canvas__toggle-btn {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 3px 7px;
+  border: none;
+  background: var(--background);
+  color: var(--muted-foreground);
+  cursor: pointer;
+  font-size: 11px;
+  transition: background 0.15s, color 0.15s;
+  min-width: 28px;
+  height: 24px;
+}
+
+.artifact-canvas__toggle-btn:hover {
+  background: var(--accent);
+  color: var(--accent-foreground);
+}
+
+.artifact-canvas__toggle-btn--active {
+  background: var(--primary);
+  color: var(--primary-foreground);
+}
+
+.artifact-canvas__dirty-badge {
+  font-size: 10px;
+  padding: 1px 5px;
+  border-radius: 4px;
+  background: #fef3c7;
+  color: #92400e;
+  font-weight: 500;
+}
+
+.artifact-canvas__saving-badge {
+  font-size: 10px;
+  padding: 1px 5px;
+  border-radius: 4px;
+  background: #dbeafe;
+  color: #1e40af;
+  font-weight: 500;
+}
+
+.artifact-canvas__loading {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  height: 100%;
+  color: var(--muted-foreground);
+  font-size: 0.85rem;
+}
+
+/* MD Editor — fill the content area */
+.artifact-canvas__md-editor {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+.artifact-canvas__md-editor .w-md-editor {
+  flex: 1;
+  min-height: 0;
+  border: none !important;
+  box-shadow: none !important;
+  border-radius: 0 !important;
+  background: var(--background) !important;
+}
+
+.artifact-canvas__md-editor .w-md-editor-toolbar {
+  border-bottom: 1px solid var(--border) !important;
+  background: var(--card) !important;
+  padding: 4px 8px !important;
+}
+
+.artifact-canvas__md-editor .w-md-editor-content {
+  flex: 1;
+  min-height: 0;
+}
+
+.artifact-canvas__md-editor .w-md-editor-text-pre,
+.artifact-canvas__md-editor .w-md-editor-text-input,
+.artifact-canvas__md-editor .w-md-editor-text-pre > code {
+  font-family: "JetBrains Mono", "Fira Code", monospace !important;
+  font-size: 0.82rem !important;
+  line-height: 1.6 !important;
+}
+
+/* MD Preview — rendered markdown */
+.artifact-canvas__md-preview {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  padding: 20px 24px;
+  font-size: 0.9rem;
+  line-height: 1.7;
+  color: var(--foreground);
+}
+
+.artifact-canvas__md-preview .wmde-markdown {
+  background: transparent !important;
+  font-size: inherit !important;
+  line-height: inherit !important;
+  color: inherit !important;
+}
+
+.artifact-canvas__md-preview h1,
+.artifact-canvas__md-preview h2,
+.artifact-canvas__md-preview h3,
+.artifact-canvas__md-preview h4 {
+  font-weight: 600;
+  margin-top: 1.5em;
+  margin-bottom: 0.5em;
+  line-height: 1.3;
+}
+
+.artifact-canvas__md-preview h1 { font-size: 1.5em; }
+.artifact-canvas__md-preview h2 { font-size: 1.25em; }
+.artifact-canvas__md-preview h3 { font-size: 1.1em; }
+
+.artifact-canvas__md-preview p { margin: 0.75em 0; }
+
+.artifact-canvas__md-preview code {
+  font-family: "JetBrains Mono", "Fira Code", monospace;
+  font-size: 0.85em;
+  background: var(--muted);
+  padding: 2px 5px;
+  border-radius: 4px;
+}
+
+.artifact-canvas__md-preview pre code {
+  background: transparent;
+  padding: 0;
+}
+
+.artifact-canvas__md-preview pre {
+  background: var(--muted);
+  padding: 12px 16px;
+  border-radius: 8px;
+  overflow-x: auto;
+  font-size: 0.82rem;
+  line-height: 1.6;
+}
+
+.artifact-canvas__md-preview blockquote {
+  border-left: 3px solid var(--border);
+  padding-left: 12px;
+  margin-left: 0;
+  color: var(--muted-foreground);
+}
+
+.artifact-canvas__md-preview table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 0.88em;
+  margin: 1em 0;
+}
+
+.artifact-canvas__md-preview th,
+.artifact-canvas__md-preview td {
+  border: 1px solid var(--border);
+  padding: 6px 12px;
+  text-align: left;
+}
+
+.artifact-canvas__md-preview th {
+  background: var(--muted);
+  font-weight: 600;
+}
+
+.artifact-canvas__md-preview ul,
+.artifact-canvas__md-preview ol {
+  padding-left: 1.5em;
+  margin: 0.75em 0;
+}
+
+.artifact-canvas__md-preview li { margin: 0.25em 0; }
+
+.artifact-canvas__md-preview input[type="checkbox"] {
+  margin-right: 6px;
+}
+
+/* Version navigator */
+.artifact-canvas__versions {
+  display: flex;
+  align-items: center;
+  gap: 3px;
+  margin-left: auto;
+}
+
+.artifact-canvas__version-btn {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 20px;
+  height: 20px;
+  border: none;
+  background: transparent;
+  color: var(--muted-foreground);
+  cursor: pointer;
+  border-radius: 4px;
+  padding: 0;
+}
+
+.artifact-canvas__version-btn:hover:not(:disabled) {
+  background: var(--accent);
+  color: var(--accent-foreground);
+}
+
+.artifact-canvas__version-btn:disabled {
+  opacity: 0.35;
+  cursor: default;
+}
+
+.artifact-canvas__version-label {
+  font-size: 10px;
+  color: var(--muted-foreground);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+/* ── Message content (markdown) ─────────────────────────────────────────────── */
+
+.chat-bubble-text {
+  @apply text-sm leading-relaxed whitespace-pre-wrap;
+}
+
+.chat-bubble-pending {
+  @apply text-sm text-zinc-400 animate-pulse;
+}
+
+.chat-bubble-markdown {
+  @apply text-sm leading-relaxed;
+}
+
+.chat-bubble-markdown p {
+  @apply my-2 first:mt-0 last:mb-0;
+}
+
+.chat-bubble-markdown h1,
+.chat-bubble-markdown h2,
+.chat-bubble-markdown h3,
+.chat-bubble-markdown h4 {
+  @apply font-semibold mt-4 mb-2 first:mt-0;
+}
+
+.chat-bubble-markdown h1 { @apply text-lg; }
+.chat-bubble-markdown h2 { @apply text-base; }
+.chat-bubble-markdown h3 { @apply text-sm; }
+
+.chat-bubble-markdown ul {
+  @apply list-disc pl-5 my-2 space-y-0.5;
+}
+
+.chat-bubble-markdown ol {
+  @apply list-decimal pl-5 my-2 space-y-0.5;
+}
+
+.chat-bubble-markdown li {
+  @apply text-sm leading-relaxed;
+}
+
+.chat-bubble-markdown blockquote {
+  @apply border-l-2 border-zinc-300 pl-3 my-2 text-zinc-500 italic;
+}
+
+.chat-bubble-markdown table {
+  @apply w-full text-xs border-collapse my-3;
+}
+
+.chat-bubble-markdown th,
+.chat-bubble-markdown td {
+  @apply border border-zinc-200 px-2 py-1 text-left;
+}
+
+.chat-bubble-markdown th {
+  @apply bg-zinc-50 font-semibold;
+}
+
+.chat-bubble-markdown a {
+  @apply text-blue-600 underline underline-offset-2 hover:text-blue-800;
+}
+
+.chat-bubble-markdown strong {
+  @apply font-semibold;
+}
+
+.chat-bubble-markdown em {
+  @apply italic;
+}
+
+.chat-bubble-markdown hr {
+  @apply border-zinc-200 my-3;
+}
+
+/* Inline code */
+.chat-inline-code {
+  @apply font-mono text-xs bg-zinc-100 text-zinc-800 px-1 py-0.5 rounded;
+}
+
+/* ── Code block ───────────────────────────────────────────────────────────────── */
+
+.chat-code-block {
+  @apply my-3 rounded-lg border border-zinc-200 overflow-hidden text-xs;
+}
+
+.chat-code-block__header {
+  @apply flex items-center justify-between px-3 py-1.5 bg-zinc-50 border-b border-zinc-200;
+}
+
+.chat-code-block__lang {
+  @apply text-xs font-mono text-zinc-500 font-medium;
+}
+
+.chat-code-block__copy {
+  @apply flex items-center gap-1 text-xs text-zinc-500 hover:text-zinc-800 transition-colors cursor-pointer border-none bg-transparent;
+}
+
+.chat-code-block__pre {
+  @apply overflow-x-auto p-3 bg-white font-mono text-xs leading-relaxed text-zinc-800 m-0;
+}
+
+/* ── Message actions ─────────────────────────────────────────────────────────── */
+
+.chat-message-actions {
+  @apply flex items-center gap-0.5 mt-2 pt-2 border-t border-zinc-100;
+}
+
+.chat-action-btn {
+  @apply flex items-center justify-center w-7 h-7 rounded-md text-zinc-400
+    hover:text-zinc-700 hover:bg-zinc-100 transition-colors cursor-pointer border-none bg-transparent;
+}
+
+.chat-action-btn--active-good {
+  @apply text-emerald-600 bg-emerald-50 hover:text-emerald-700 hover:bg-emerald-100;
+}
+
+.chat-action-btn--active-bad {
+  @apply text-rose-500 bg-rose-50 hover:text-rose-600 hover:bg-rose-100;
+}
+
+.chat-action-divider {
+  @apply w-px h-4 bg-zinc-200 mx-1;
+}

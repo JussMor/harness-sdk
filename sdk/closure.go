@@ -8,40 +8,28 @@ import (
 	"time"
 )
 
-// InferredMemoryWriter asks the LLM, after a conversation turn, to identify
-// facts worth remembering for future sessions. Unlike DefaultMemoryTriggerDetector
-// which only catches explicit phrases ("remember that..."), this captures
-// implicit facts the agent learned during the turn.
-//
-// This mirrors how Claude updates memory: most writes are inferences, not
-// explicit user commands.
+// InferredMemoryWriter asks the LLM to identify facts worth remembering
+// after each turn. Deduplication prevents near-identical entries accumulating.
 type InferredMemoryWriter struct {
-	// Provider is the LLM used to extract facts. If nil, no inference happens.
-	Provider LLMProvider
-
-	// Model is the model identifier for the extraction call.
-	// A small model is fine — extraction is cheap.
-	Model string
-
-	// MaxFacts caps how many facts can be extracted per turn. Default 3.
-	MaxFacts int
-
-	// MinConfidence is the threshold for the LLM's self-reported confidence.
-	// Range 0-1. Default 0.7.
-	MinConfidence float64
+	Provider        LLMProvider
+	Model           string
+	MaxFacts        int
+	MinConfidence   float64
+	DedupeThreshold float64 // 0-1, default 0.6
 }
 
-// InferredFact is a single memorable fact extracted from a turn.
+// InferredFact is one memorable fact extracted from a turn.
 type InferredFact struct {
 	Content    string      `json:"content"`
-	Layer      MemoryLayer `json:"layer"`      // always Inferred from this writer
-	Scope      Scope       `json:"scope"`      // User or Project
-	Confidence float64     `json:"confidence"` // 0-1
+	Layer      MemoryLayer `json:"layer"`
+	Scope      Scope       `json:"scope"`
+	Confidence float64     `json:"confidence"`
 	Reason     string      `json:"reason"`
+	Path       string      `json:"path,omitempty"`
+	Merged     bool        `json:"merged,omitempty"`
 }
 
-// Extract runs the inference and returns facts above MinConfidence.
-// Returns empty slice if Provider is nil or extraction fails.
+// Extract runs inference and returns facts above MinConfidence.
 func (w *InferredMemoryWriter) Extract(ctx context.Context, conv *Conversation, finalResponse string) ([]InferredFact, error) {
 	if w.Provider == nil {
 		return nil, nil
@@ -55,7 +43,6 @@ func (w *InferredMemoryWriter) Extract(ctx context.Context, conv *Conversation, 
 		minConf = 0.7
 	}
 
-	// Build a compact summary of the turn — last user message + assistant response
 	var lastUser string
 	for i := len(conv.Messages) - 1; i >= 0; i-- {
 		if conv.Messages[i].Role == RoleUser {
@@ -64,25 +51,28 @@ func (w *InferredMemoryWriter) Extract(ctx context.Context, conv *Conversation, 
 		}
 	}
 
-	prompt := fmt.Sprintf(`Identify up to %d facts from this conversation turn that are worth remembering across future sessions. Only include facts that:
-- Reveal user preferences, workflow, or persistent context
-- Affect how to respond in future conversations
-- Are NOT ephemeral (i.e. not "currently debugging X")
+	userSnip := truncate(lastUser, 500)
+	respSnip := truncate(finalResponse, 1000)
 
-For each fact, output a JSON object on its own line:
-{"content": "...", "scope": "user" or "project", "confidence": 0.0-1.0, "reason": "..."}
+	promptText := "Identify up to " + fmt.Sprintf("%d", maxFacts) + ` persistent facts from this turn.
 
-Output only JSON lines. No prose.
+Only include facts that:
+- Reveal stable user preferences, identity, or workflow patterns
+- Represent decisions/constraints affecting future sessions
+- Are NOT ephemeral (not task-specific, not "currently doing X")
+- Are NOT already obvious general knowledge
 
-User message: %s
+Output one JSON per line, no prose:
+{"content":"...","scope":"user|project","confidence":0.0-1.0,"reason":"..."}
 
-Assistant response: %s`, maxFacts, truncate(lastUser, 500), truncate(finalResponse, 1000))
+scope=user for personal prefs; scope=project for project-specific facts.
+Output nothing if there are no persistent facts.
+
+User: ` + userSnip + "\nAssistant: " + respSnip
 
 	resp, err := w.Provider.Chat(ctx, ChatRequest{
-		Model: w.Model,
-		Messages: []ChatMessage{
-			{Role: RoleUser, Content: prompt},
-		},
+		Model:    w.Model,
+		Messages: []ChatMessage{{Role: RoleUser, Content: promptText}},
 	})
 	if err != nil {
 		return nil, fmt.Errorf("extract facts: %w", err)
@@ -124,23 +114,130 @@ Assistant response: %s`, maxFacts, truncate(lastUser, 500), truncate(finalRespon
 	return facts, nil
 }
 
-// ── Skill eviction ───────────────────────────────────────────────────────────
+// WriteWithDedup writes facts to memory, merging into existing entries
+// when content is sufficiently similar (avoids duplication).
+// This must be called explicitly from the closure phase with access to MemoryProvider.
+func (w *InferredMemoryWriter) WriteWithDedup(
+	ctx context.Context,
+	provider MemoryProvider,
+	facts []InferredFact,
+) ([]InferredFact, error) {
+	threshold := w.DedupeThreshold
+	if threshold <= 0 {
+		threshold = 0.6
+	}
 
-// SkillEvictionPolicy decides which loaded skills to remove when budget is tight.
+	var written []InferredFact
+	for i := range facts {
+		fact := &facts[i]
+
+		// Search for existing similar entries
+		existing, err := provider.Search(ctx, fact.Scope, fact.Content)
+		if err != nil {
+			existing = nil
+		}
+
+		merged := false
+		for _, entry := range existing {
+			if entry.Content == "" {
+				continue
+			}
+			if stringSimilarity(entry.Content, fact.Content) >= threshold {
+				// Merge: replace old content with new (StrReplace the whole content)
+				oldContent := entry.Content
+				newContent := fact.Content
+				if err := provider.StrReplace(ctx, fact.Scope, entry.Path, oldContent, newContent); err == nil {
+					fact.Path = entry.Path
+					fact.Merged = true
+					merged = true
+					break
+				}
+			}
+		}
+
+		if !merged {
+			// Create new entry
+			path := fmt.Sprintf("/facts/inferred-%d.md", time.Now().UnixNano())
+			if err := provider.Create(ctx, fact.Scope, path, fact.Content); err == nil {
+				fact.Path = path
+			}
+		}
+		written = append(written, *fact)
+	}
+	return written, nil
+}
+
+// stringSimilarity returns a rough Dice coefficient between two strings.
+// Range 0 (no overlap) to 1 (identical). Uses word-level bigrams.
+func stringSimilarity(a, b string) float64 {
+	if a == b {
+		return 1.0
+	}
+	aWords := strings.Fields(strings.ToLower(a))
+	bWords := strings.Fields(strings.ToLower(b))
+	if len(aWords) == 0 || len(bWords) == 0 {
+		return 0
+	}
+
+	// Build bigram sets
+	aBigrams := bigrams(aWords)
+	bBigrams := bigrams(bWords)
+
+	if len(aBigrams) == 0 || len(bBigrams) == 0 {
+		// Fall back to word-level Jaccard
+		return jaccardWords(aWords, bWords)
+	}
+
+	// Count intersection
+	var intersection int
+	for bg := range aBigrams {
+		if bBigrams[bg] {
+			intersection++
+		}
+	}
+	return float64(2*intersection) / float64(len(aBigrams)+len(bBigrams))
+}
+
+func bigrams(words []string) map[string]bool {
+	out := make(map[string]bool, len(words))
+	for i := 0; i+1 < len(words); i++ {
+		out[words[i]+" "+words[i+1]] = true
+	}
+	return out
+}
+
+func jaccardWords(a, b []string) float64 {
+	sa := make(map[string]bool, len(a))
+	for _, w := range a {
+		sa[w] = true
+	}
+	var intersection int
+	union := len(sa)
+	for _, w := range b {
+		if sa[w] {
+			intersection++
+		} else {
+			union++
+		}
+	}
+	if union == 0 {
+		return 0
+	}
+	return float64(intersection) / float64(union)
+}
+
+// ── Skill eviction ────────────────────────────────────────────────────────────
+
 type SkillEvictionPolicy interface {
-	// Evict returns the names of skills to unload, given the current set
-	// and how many tokens need to be freed.
 	Evict(loaded []LoadedSkill, tokensToFree int) []string
 }
 
-// LRUEvictionPolicy unloads the least-recently-used skills first.
 type LRUEvictionPolicy struct{}
 
 func (LRUEvictionPolicy) Evict(loaded []LoadedSkill, tokensToFree int) []string {
 	if tokensToFree <= 0 || len(loaded) == 0 {
 		return nil
 	}
-	// loaded is assumed sorted oldest-used first by SkillsByLastUsed
 	var freed int
 	var names []string
 	for _, s := range loaded {
@@ -153,7 +250,6 @@ func (LRUEvictionPolicy) Evict(loaded []LoadedSkill, tokensToFree int) []string 
 	return names
 }
 
-// TTLEvictionPolicy unloads skills that haven't been used in the given duration.
 type TTLEvictionPolicy struct {
 	MaxIdle time.Duration
 }
@@ -168,8 +264,6 @@ func (p TTLEvictionPolicy) Evict(loaded []LoadedSkill, _ int) []string {
 	}
 	return names
 }
-
-// ── helpers ──────────────────────────────────────────────────────────────────
 
 func truncate(s string, max int) string {
 	if len(s) <= max {

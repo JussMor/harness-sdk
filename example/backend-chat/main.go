@@ -35,9 +35,18 @@ func main() {
 	if err := EnsureConversationSchema(ctx, db); err != nil {
 		log.Fatalf("ensure conversation schema: %v", err)
 	}
+	if err := EnsureArtifactSchema(ctx, db); err != nil {
+		log.Fatalf("ensure artifact schema: %v", err)
+	}
+
+	r2 := NewR2Client()
+	if r2.IsAvailable() {
+		log.Printf("backend-chat R2 storage enabled (bucket: %s)", getenv("R2_BUCKET", "artifacts"))
+	}
 
 	app := &BackendChatApp{
 		db:        db,
+		r2:        r2,
 		pub:       NewCentrifugoClient(getenv("CENTRIFUGO_API_URL", "http://localhost:8000/api"), getenv("CENTRIFUGO_API_KEY", "backend-chat-dev-api-key")),
 		llm:       BuildLLMFromEnv(),
 		modelName: getenv("BACKEND_MODEL", "anthropic/claude-sonnet-4-20250514"),
@@ -58,6 +67,7 @@ func main() {
 	mux.HandleFunc("/api/chats", app.handleChats)
 	mux.HandleFunc("/api/chats/", app.handleChatRoutes)
 	mux.HandleFunc("/admin/eval", app.handleEval)
+	app.registerArtifactRoutes(mux)
 
 	log.Printf("backend-chat listening on %s", addr)
 	if err := http.ListenAndServe(addr, withRequestLog(withCORS(mux))); err != nil {
@@ -67,6 +77,7 @@ func main() {
 
 type BackendChatApp struct {
 	db        *sql.DB
+	r2        *R2Client
 	pub       *CentrifugoClient
 	llm       ab.LLMProvider
 	multi     *ab.RoutedLLMProvider
@@ -307,6 +318,8 @@ func (a *BackendChatApp) handleChatRoutes(w http.ResponseWriter, r *http.Request
 		a.handleMessages(w, r, chatID)
 	case "stream":
 		a.handleStream(w, r, chatID)
+	case "artifacts":
+		a.handleChatArtifacts(w, r, chatID)
 	default:
 		w.WriteHeader(http.StatusNotFound)
 	}
@@ -580,9 +593,31 @@ func (a *BackendChatApp) handleStream(w http.ResponseWriter, r *http.Request, ch
 			}
 			assistantMsg, _ := InsertMessage(ctx, a.db, chatID, "assistant", fullResponse.String(), effectiveModel, metaOpt...)
 			_ = a.pub.PublishChatMessage(ctx, chatID, assistantMsg)
+
+			// Auto-persist artifacts detected from stream (file_write tool calls)
+			// and emit artifact SSE events so the frontend canvas can show them.
+			for _, metaArt := range streamMeta.Artifacts {
+				art, ver, err := CreateArtifact(ctx, a.db, a.r2,
+					chatID, &assistantMsg.ID,
+					metaArt.Language, metaArt.Path, metaArt.Content,
+				)
+				if err == nil {
+					d, _ := json.Marshal(map[string]any{
+						"id":       art.ID,
+						"language": art.Language,
+						"title":    art.Title,
+						"version":  ver.Version,
+						"content":  ver.Content,
+						"r2Url":    ver.R2URL,
+					})
+					sseWrite("artifact", string(d))
+				}
+			}
+
 			d, _ := json.Marshal(map[string]any{"runId": runID, "messageId": assistantMsg.ID})
 			sseWrite("done", string(d))
-			log.Printf("stream.done chat_id=%d run_id=%s chars=%d", chatID, runID, fullResponse.Len())
+			log.Printf("stream.done chat_id=%d run_id=%s chars=%d artifacts=%d",
+				chatID, runID, fullResponse.Len(), len(streamMeta.Artifacts))
 
 		case ab.StreamEventError:
 			msg := "unknown error"
