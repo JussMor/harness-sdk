@@ -368,35 +368,13 @@ func (a *BackendChatApp) handleMessages(w http.ResponseWriter, r *http.Request, 
 	}
 }
 
-func payloadString(payload map[string]any, key string) string {
-	if payload == nil {
-		return ""
-	}
-	value, ok := payload[key]
-	if !ok || value == nil {
-		return ""
-	}
-	text := strings.TrimSpace(fmt.Sprintf("%v", value))
-	if text == "" || text == "<nil>" {
-		return ""
-	}
-	return text
-}
 
-func firstNonEmpty(values ...string) string {
-	for _, value := range values {
-		if strings.TrimSpace(value) != "" {
-			return value
-		}
-	}
-	return ""
-}
 
 func newRunID() string {
 	return fmt.Sprintf("run_%d", time.Now().UnixNano())
 }
 
-// handleStream is the real-time streaming counterpart of handleRun.
+// handleStream is the real-time streaming endpoint for LLM generation.
 // Uses Server-Sent Events to push token deltas as the LLM generates them.
 //
 // POST /api/chats/:id/stream
@@ -494,7 +472,7 @@ func (a *BackendChatApp) handleStream(w http.ResponseWriter, r *http.Request, ch
 	logContext := RuntimeLogContext{ChatID: chatID, RunID: runID, Mode: strings.TrimSpace(req.Mode)}
 	log.Printf("stream.start chat_id=%d run_id=%s model=%s", chatID, runID, effectiveModel)
 
-	_, agentRT, err := newModeEngineWithDB(a.llm, effectiveModel, logContext, a.db)
+	_, agentRT, err := newModeEngineWithDB(a.llm, effectiveModel, logContext, a.db, a.threads)
 	if err != nil {
 		d, _ := json.Marshal(map[string]string{"error": err.Error()})
 		sseWrite("error", string(d))
@@ -655,7 +633,7 @@ func withCORS(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Access-Control-Allow-Origin", "*")
 		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
-		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS")
 		if r.Method == http.MethodOptions {
 			w.WriteHeader(http.StatusNoContent)
 			return
@@ -697,7 +675,11 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 
 func writeErr(w http.ResponseWriter, status int, err error) {
 	log.Printf("request failed status=%d error=%v", status, err)
-	writeJSON(w, status, map[string]any{"error": err.Error()})
+	message := "request failed"
+	if err != nil {
+		message = err.Error()
+	}
+	writeJSON(w, status, map[string]any{"error": message})
 }
 
 func getenv(key, fallback string) string {

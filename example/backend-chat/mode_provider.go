@@ -8,9 +8,17 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 
 	ab "github.com/everfaz/autobuild-sdk"
 	sdktokenizers "github.com/everfaz/autobuild-sdk/providers/tokenizers"
+)
+
+var (
+	backendSkillsOnce     sync.Once
+	backendSkillsProvider ab.SkillProvider
+	backendSkillsErr      error
+	skillReloaderOnce     sync.Once
 )
 
 // newModeEngine builds a fully-wired agentRuntime using the SDK Runtime.
@@ -27,11 +35,14 @@ import (
 //   - CheckpointProvider (auto before execution)
 //   - SessionContext (time injection every turn)
 func newModeEngine(provider ab.LLMProvider, model string, logContext RuntimeLogContext) (*ab.Engine, *agentRuntime, error) {
-	return newModeEngineWithDB(provider, model, logContext, nil)
+	return newModeEngineWithDB(provider, model, logContext, nil, nil)
 }
 
-func newModeEngineWithDB(provider ab.LLMProvider, model string, logContext RuntimeLogContext, db *sql.DB) (*ab.Engine, *agentRuntime, error) {
-	skills, _ := loadBackendSkills()
+func newModeEngineWithDB(provider ab.LLMProvider, model string, logContext RuntimeLogContext, db *sql.DB, threads ab.ThreadProvider) (*ab.Engine, *agentRuntime, error) {
+	backendSkillsOnce.Do(func() {
+		backendSkillsProvider, backendSkillsErr = loadBackendSkills()
+	})
+	skills := backendSkillsProvider
 	memory, memRoots, err := loadBackendMemory()
 	if err != nil {
 		memory = nil
@@ -62,6 +73,7 @@ func newModeEngineWithDB(provider ab.LLMProvider, model string, logContext Runti
 	engine.Memory = memory
 	engine.Execution = execCtx
 	engine.Tools = rt.tools
+	engine.Threads = threads
 	if checkpointsEnabledForMode(logContext.Mode) {
 		engine.Checkpoints = checkpointProv
 	}
@@ -146,13 +158,17 @@ func newModeEngineWithDB(provider ab.LLMProvider, model string, logContext Runti
 
 	rt.runtime = runtime
 
-	// Skill hot-reload: watch skills directory for changes
-	if reloadable, ok := skills.(ab.ReloadableSkillProvider); ok {
-		reloader := ab.NewSkillReloader("./skills", reloadable)
-		reloader.SetOnReload(func(loaded, removed []string) {
-			log.Printf("skills reloaded: +%v -%v", loaded, removed)
+	// Skill hot-reload: watch skills directory once for the shared provider
+	if backendSkillsErr == nil {
+		skillReloaderOnce.Do(func() {
+			if reloadable, ok := skills.(ab.ReloadableSkillProvider); ok {
+				reloader := ab.NewSkillReloader("./skills", reloadable)
+				reloader.SetOnReload(func(loaded, removed []string) {
+					log.Printf("skills reloaded: +%v -%v", loaded, removed)
+				})
+				reloader.Start(context.Background())
+			}
 		})
-		reloader.Start(context.Background())
 	}
 
 	return engine, rt, nil

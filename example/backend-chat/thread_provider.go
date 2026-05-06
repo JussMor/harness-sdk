@@ -2,6 +2,8 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
+	"fmt"
 	"net/http"
 	"strings"
 
@@ -16,7 +18,7 @@ import (
 //	GET  /api/threads?user=X  → list threads by user
 func (a *BackendChatApp) handleThreads(w http.ResponseWriter, r *http.Request) {
 	if a.threads == nil {
-		writeErr(w, http.StatusServiceUnavailable, nil)
+		writeErr(w, http.StatusServiceUnavailable, fmt.Errorf("thread provider unavailable"))
 		return
 	}
 
@@ -49,9 +51,10 @@ func (a *BackendChatApp) handleThreads(w http.ResponseWriter, r *http.Request) {
 
 	case http.MethodGet:
 		userID := r.URL.Query().Get("user")
-		status := ab.ThreadStatus(r.URL.Query().Get("status"))
-		if status == "" {
-			status = ab.ThreadStatusActive
+		status, ok := parseThreadStatus(r.URL.Query().Get("status"))
+		if !ok {
+			writeErr(w, http.StatusBadRequest, fmt.Errorf("invalid status"))
+			return
 		}
 
 		multi, ok := a.threads.(ab.MultiUserThreadProvider)
@@ -77,7 +80,7 @@ func (a *BackendChatApp) handleThreads(w http.ResponseWriter, r *http.Request) {
 //	GET /api/threads/:id → get thread
 func (a *BackendChatApp) handleThreadRoutes(w http.ResponseWriter, r *http.Request) {
 	if a.threads == nil {
-		writeErr(w, http.StatusServiceUnavailable, nil)
+		writeErr(w, http.StatusServiceUnavailable, fmt.Errorf("thread provider unavailable"))
 		return
 	}
 
@@ -90,14 +93,48 @@ func (a *BackendChatApp) handleThreadRoutes(w http.ResponseWriter, r *http.Reque
 
 	switch r.Method {
 	case http.MethodGet:
-		thread, err := a.threads.Get(r.Context(), threadID)
+		var thread *ab.Thread
+		var err error
+		if multi, ok := a.threads.(ab.MultiUserThreadProvider); ok {
+			userID := strings.TrimSpace(r.URL.Query().Get("user"))
+			if userID == "" {
+				writeErr(w, http.StatusBadRequest, fmt.Errorf("user is required"))
+				return
+			}
+			thread, err = multi.GetForUser(r.Context(), userID, threadID)
+			if errors.Is(err, ab.ErrThreadAccessDenied) {
+				writeErr(w, http.StatusForbidden, err)
+				return
+			}
+		} else {
+			thread, err = a.threads.Get(r.Context(), threadID)
+		}
 		if err != nil {
 			writeErr(w, http.StatusNotFound, err)
+			return
+		}
+		if thread == nil {
+			writeErr(w, http.StatusNotFound, fmt.Errorf("thread not found"))
 			return
 		}
 		writeJSON(w, http.StatusOK, thread)
 
 	case http.MethodDelete:
+		if multi, ok := a.threads.(ab.MultiUserThreadProvider); ok {
+			userID := strings.TrimSpace(r.URL.Query().Get("user"))
+			if userID == "" {
+				writeErr(w, http.StatusBadRequest, fmt.Errorf("user is required"))
+				return
+			}
+			if _, err := multi.GetForUser(r.Context(), userID, threadID); err != nil {
+				if errors.Is(err, ab.ErrThreadAccessDenied) {
+					writeErr(w, http.StatusForbidden, err)
+					return
+				}
+				writeErr(w, http.StatusNotFound, err)
+				return
+			}
+		}
 		if err := a.threads.Archive(r.Context(), threadID); err != nil {
 			writeErr(w, http.StatusInternalServerError, err)
 			return
@@ -106,5 +143,18 @@ func (a *BackendChatApp) handleThreadRoutes(w http.ResponseWriter, r *http.Reque
 
 	default:
 		w.WriteHeader(http.StatusMethodNotAllowed)
+	}
+}
+
+func parseThreadStatus(raw string) (ab.ThreadStatus, bool) {
+	status := ab.ThreadStatus(strings.TrimSpace(raw))
+	if status == "" {
+		return ab.ThreadStatusActive, true
+	}
+	switch status {
+	case ab.ThreadStatusActive, ab.ThreadStatusCompleted, ab.ThreadStatusFailed, ab.ThreadStatusArchived:
+		return status, true
+	default:
+		return "", false
 	}
 }

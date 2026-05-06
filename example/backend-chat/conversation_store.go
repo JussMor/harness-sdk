@@ -100,6 +100,10 @@ FROM sdk_conversations WHERE id = ?`, id)
 	conv := ab.NewConversation(convID)
 	conv.ThreadID = threadID.String
 	conv.MemoryRead = memoryRead == 1
+	conv.TurnCount = turnCount
+	if t, err := time.Parse(time.RFC3339, createdAt); err == nil {
+		conv.CreatedAt = t
+	}
 
 	if err := json.Unmarshal([]byte(messagesJSON), &conv.Messages); err != nil {
 		return nil, fmt.Errorf("unmarshal messages: %w", err)
@@ -224,14 +228,4 @@ func toAgentMessages(messages []Message) []ab.ChatMessage {
 	return out
 }
 
-// abToMessages converts []ab.ChatMessage → []Message for LoadOrCreateConversation.
-func abToMessages(msgs []ab.ChatMessage) []Message {
-	out := make([]Message, 0, len(msgs))
-	for _, m := range msgs {
-		out = append(out, Message{
-			Role:    string(m.Role),
-			Content: m.Content,
-		})
-	}
-	return out
-}
+

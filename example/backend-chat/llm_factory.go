@@ -1,12 +1,42 @@
 package main
 
 import (
+	"context"
+	"fmt"
 	"os"
 	"strings"
 
 	ab "github.com/everfaz/autobuild-sdk"
 	sdkllm "github.com/everfaz/autobuild-sdk/providers/llm"
 )
+
+// RuntimeLogContext carries identifiers for structured logging.
+type RuntimeLogContext struct {
+	ChatID int64
+	RunID  string
+	Mode   string
+}
+
+// EchoLLM is a no-op LLM for testing without an API key.
+type EchoLLM struct {
+	Model string
+}
+
+func (e *EchoLLM) Chat(_ context.Context, req ab.ChatRequest) (*ab.ChatResponse, error) {
+	var prompt string
+	for i := len(req.Messages) - 1; i >= 0; i-- {
+		if req.Messages[i].Role == ab.RoleUser {
+			prompt = req.Messages[i].Content
+			break
+		}
+	}
+	return &ab.ChatResponse{
+		Content:      fmt.Sprintf("[%s] Entendido: %q", e.Model, strings.TrimSpace(prompt)),
+		FinishReason: "stop",
+		Model:        e.Model,
+		Usage:        ab.TokenUsage{PromptTokens: 32, CompletionTokens: 48, TotalTokens: 80},
+	}, nil
+}
 
 // BuildLLMFromEnv builds the LLM provider from environment variables.
 // Uses SDK-native providers for streaming support.
