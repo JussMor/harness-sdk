@@ -1,7 +1,7 @@
 # Parity Schema — harness-sdk vs Claude
 
 Estado actual de paridad entre el SDK y el comportamiento real de Claude.
-Actualizado: 2026-05-04.
+Actualizado: 2026-05-05.
 
 ---
 
@@ -346,3 +346,29 @@ Los 4% restantes son features que no son críticas para la mayoría de deploymen
 - **Copyright filter** — Idem, política específica del producto
 - **PDF/document multimodal input** — Anthropic lo soporta pero no está en el SDK
 - **Differential compaction granular** — el SDK usa compactors LLM-based; Claude tiene scoring intrínseco
+
+---
+
+## Documentación
+
+| Documento | Ubicación | Descripción |
+|---|---|---|
+| SDK Reference | `sdk/docs/SDK_REFERENCE.md` | Todos los 40+ archivos del SDK documentados con tipos, constructores y métodos |
+| Memory System | `example/backend-chat/MEMORY.md` | BM25, layers, triggers EN+ES, eviction, API de tools |
+| Sandbox System | `example/backend-chat/SANDBOX.md` | OpenSandbox, lifecycle, MIME outputs, testing manual |
+| Backend Updates | `example/backend-chat/BACKEND_UPDATES.md` | Guía de migración para adoptar nuevas features del SDK |
+| OpenSandbox Setup | `OPENSANDBOX_SETUP.md` | Setup del sandbox en development y production |
+
+---
+
+## Changelog de paridad
+
+| Versión | Cambio | Overall |
+|---|---|---|
+| Review inicial | Baseline tras primera implementación | 78% |
+| Gap closure batch 1 | Tiktoken, prompt caching, EpisodicCompactor, memory dedup | 88% |
+| Memory 100% | BM25, LayeredFilesystem, MemoryRoots, triggers, eviction | 88% → memory 100% |
+| Backend update | LayeredFilesystem en backend, mode_provider actualizado | — |
+| Extended thinking | ThinkingBudget, ThinkingContent, StreamEventThinking | 91% |
+| SQLite threads | ThreadProvider + MultiUserThreadProvider | 91% |
+| Full gap closure | OpenAI provider, vision, message caching, hybrid search, AutoTokenizer, SkillReloader, Postgres, Ollama streaming, LocalEmbedder, IntrinsicVerification | **96%** |
