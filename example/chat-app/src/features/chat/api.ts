@@ -309,6 +309,35 @@ function parseChunk(chunk: string): StreamEvent | null {
           r2Url?: string
         },
       }
+    case "plan_proposed":
+      return {
+        type: "plan_proposed",
+        data: parsed as {
+          id: string
+          title: string
+          objective: string
+          executables: Array<{
+            id: string
+            name: string
+            description: string
+            dependencies: Array<string>
+            status: string
+          }>
+        },
+      }
+    case "subagent_result":
+      return {
+        type: "subagent_result",
+        data: parsed as {
+          id: string
+          task: string
+          output: string
+          turns: number
+          stop_reason: string
+          duration_ms: number
+          error?: string
+        },
+      }
     case "done":
       return {
         type: "done",

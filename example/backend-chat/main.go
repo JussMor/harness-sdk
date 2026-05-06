@@ -580,6 +580,70 @@ func (a *BackendChatApp) handleStream(w http.ResponseWriter, r *http.Request, ch
 						sseWrite("sandbox_output", string(sbJSON))
 					}
 				}
+
+				// Extract files created by subagents so they appear as artifacts
+				if ev.ToolResult.Name == "dispatch-subagents" && ev.ToolResult.Error == nil {
+					var dispatchResult struct {
+						FilesCreated []struct {
+							Path    string `json:"path"`
+							Content string `json:"content"`
+						} `json:"files_created"`
+					}
+					if json.Unmarshal([]byte(ev.ToolResult.Content), &dispatchResult) == nil {
+						for _, f := range dispatchResult.FilesCreated {
+							if f.Path != "" && f.Content != "" {
+								streamMeta.Artifacts = append(streamMeta.Artifacts, MetadataArtifact{
+									Path:     f.Path,
+									Language: inferLangFromPath(f.Path),
+									Content:  f.Content,
+								})
+							}
+						}
+					}
+				}
+			}
+
+		case ab.StreamEventPlanProposed:
+			if ev.Plan != nil {
+				executables := make([]map[string]any, 0, len(ev.Plan.Executables))
+				for _, exec := range ev.Plan.Executables {
+					executables = append(executables, map[string]any{
+						"id":           exec.ID,
+						"name":         exec.Name,
+						"description":  exec.Description,
+						"dependencies": exec.Dependencies,
+						"status":       string(exec.Status),
+					})
+				}
+				d, _ := json.Marshal(map[string]any{
+					"id":          ev.Plan.ID,
+					"title":       ev.Plan.Title,
+					"objective":   ev.Plan.Objective,
+					"executables": executables,
+				})
+				sseWrite("plan_proposed", string(d))
+				log.Printf("stream.plan_proposed chat_id=%d run_id=%s executables=%d",
+					chatID, runID, len(ev.Plan.Executables))
+			}
+
+		case ab.StreamEventSubagentResult:
+			if ev.SubagentResult != nil {
+				errMsg := ""
+				if ev.SubagentResult.Error != nil {
+					errMsg = ev.SubagentResult.Error.Error()
+				}
+				d, _ := json.Marshal(map[string]any{
+					"id":          ev.SubagentResult.ID,
+					"task":        ev.SubagentResult.Task,
+					"output":      ev.SubagentResult.Output,
+					"turns":       ev.SubagentResult.Turns,
+					"stop_reason": ev.SubagentResult.StopReason,
+					"duration_ms": ev.SubagentResult.Duration.Milliseconds(),
+					"error":       errMsg,
+				})
+				sseWrite("subagent_result", string(d))
+				log.Printf("stream.subagent_result chat_id=%d run_id=%s agent_id=%s",
+					chatID, runID, ev.SubagentResult.ID)
 			}
 
 		case ab.StreamEventDone:

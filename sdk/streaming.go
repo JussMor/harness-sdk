@@ -25,6 +25,12 @@ type StreamEvent struct {
 	// ToolResult is set when Type=StreamEventToolResult.
 	ToolResult *ToolResult `json:"tool_result,omitempty"`
 
+	// Plan is set when Type=StreamEventPlanProposed.
+	Plan *Plan `json:"plan,omitempty"`
+
+	// SubagentResult is set when Type=StreamEventSubagentResult.
+	SubagentResult *SubagentResult `json:"subagent_result,omitempty"`
+
 	// Final is the complete accumulated response when Type=StreamEventDone.
 	Final *AgentLoopResult `json:"final,omitempty"`
 
@@ -55,6 +61,16 @@ const (
 	// StreamEventTurnComplete fires when a single LLM turn finishes
 	// (one request/response cycle within the agent loop).
 	StreamEventTurnComplete StreamEventType = "turn_complete"
+
+	// StreamEventPlanProposed fires when the alignment phase proposes an
+	// execution plan. Consumers can display plan status or trigger custom
+	// subagent orchestration at the application layer.
+	StreamEventPlanProposed StreamEventType = "plan_proposed"
+
+	// StreamEventSubagentResult fires once per subagent as they complete
+	// during plan fan-out execution. Consumers can stream partial results
+	// to the user as each parallel task finishes.
+	StreamEventSubagentResult StreamEventType = "subagent_result"
 
 	// StreamEventDone fires once when the entire agent loop has finished.
 	// Final field is populated.
@@ -181,12 +197,15 @@ func (r *Runtime) runStreamInternal(
 
 	_ = r.advancePhase(ctx, PhaseAlignment)
 	// Alignment: planner (non-streaming, cheap)
+	var proposedPlan *Plan
 	if r.planner != nil && r.engine.HasExecution() && r.planner.ShouldPlan(ctx, userMessage, conv) {
 		plan, _ := r.planner.Propose(ctx, userMessage, conv)
 		if plan != nil {
 			if _, err := r.engine.Execution.Propose(ctx, *plan); err == nil && r.autoApprovePlan {
 				_ = r.engine.Execution.Approve(ctx, true)
 			}
+			proposedPlan = plan
+			out <- StreamEvent{Type: StreamEventPlanProposed, Plan: plan}
 		}
 	}
 
@@ -344,6 +363,14 @@ func (r *Runtime) runStreamInternal(
 		}
 	}
 
+	// ── Subagent fan-out from proposed plan ──
+	if proposedPlan != nil && len(proposedPlan.Executables) >= 2 {
+		ready := proposedPlan.NextReady()
+		if len(ready) >= 2 {
+			r.runStreamSubagents(ctx, ready, out)
+		}
+	}
+
 	// ── Phases 4-5: Verification + Closure ──
 	_ = r.advancePhase(ctx, PhaseVerification)
 	_ = r.advancePhase(ctx, PhaseClosure)
@@ -364,6 +391,51 @@ func (r *Runtime) runStreamInternal(
 
 	out <- StreamEvent{Type: StreamEventDone}
 	return nil
+}
+
+// runStreamSubagents executes plan executables as parallel subagents, emitting
+// a StreamEventSubagentResult as each one completes.
+func (r *Runtime) runStreamSubagents(ctx context.Context, executables []Executable, out chan<- StreamEvent) {
+	// Build subagents from ready executables
+	agents := make([]Subagent, 0, len(executables))
+	for _, exec := range executables {
+		task := strings.TrimSpace(exec.Description)
+		if task == "" {
+			task = strings.TrimSpace(exec.Name)
+		}
+		if task == "" {
+			continue
+		}
+		agents = append(agents, Subagent{
+			ID:       exec.ID,
+			Task:     task,
+			Engine:   r.engine,
+			MaxTurns: 4,
+			Timeout:  30 * 1000000000, // 30s
+		})
+	}
+	if len(agents) < 2 {
+		return
+	}
+
+	// Run in parallel, emit results as they arrive via a channel
+	results := make(chan *SubagentResult, len(agents))
+	var wg sync.WaitGroup
+	wg.Add(len(agents))
+	for i := range agents {
+		go func(agent Subagent) {
+			defer wg.Done()
+			results <- agent.Run(ctx)
+		}(agents[i])
+	}
+	go func() {
+		wg.Wait()
+		close(results)
+	}()
+
+	for res := range results {
+		out <- StreamEvent{Type: StreamEventSubagentResult, SubagentResult: res}
+	}
 }
 
 // buildRequestMessages prepends a system message to the conversation history.

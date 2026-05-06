@@ -47,7 +47,7 @@ type Anthropic struct {
 	// MaxTokens caps the response. Defaults to 4096.
 	MaxTokens int
 
-	// Client is the HTTP client used for requests. Defaults to one with 90s timeout.
+	// Client is the HTTP client used for requests. Defaults to one with 180s timeout.
 	Client *http.Client
 }
 
@@ -59,7 +59,7 @@ func NewAnthropic(apiKey, defaultModel string) *Anthropic {
 		BaseURL:          "https://api.anthropic.com/v1/messages",
 		AnthropicVersion: "2023-06-01",
 		MaxTokens:        4096,
-		Client:           &http.Client{Timeout: 90 * time.Second},
+		Client:           &http.Client{Timeout: 180 * time.Second},
 	}
 }
 
@@ -477,10 +477,9 @@ func (a *Anthropic) ChatStream(ctx context.Context, req autobuild.ChatRequest) (
 	httpReq.Header.Set("anthropic-version", a.AnthropicVersion)
 	httpReq.Header.Set("Accept", "text/event-stream")
 
-	client := a.Client
-	if client == nil {
-		client = &http.Client{Timeout: 0} // no timeout for streaming — use ctx
-	}
+	// Streaming connections can last indefinitely — use a client with no timeout.
+	// Context cancellation handles cleanup.
+	client := &http.Client{Timeout: 0}
 
 	resp, err := client.Do(httpReq)
 	if err != nil {

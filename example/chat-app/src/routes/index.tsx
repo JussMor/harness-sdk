@@ -2,6 +2,7 @@ import { ChatMain } from "@/components/chat-main"
 import type { SidebarChat } from "@/components/chat-sidebar"
 import { ChatSidebar } from "@/components/chat-sidebar"
 import { ChatAPI } from "@/features/chat/api"
+import type { Thread } from "@/features/chat/types"
 import { createFileRoute } from "@tanstack/react-router"
 import { useCallback, useEffect, useMemo, useState } from "react"
 
@@ -15,6 +16,7 @@ const backendBaseURL =
 function IndexRoute() {
   const api = useMemo(() => new ChatAPI(backendBaseURL), [])
   const [chats, setChats] = useState<Array<SidebarChat>>([])
+  const [threads, setThreads] = useState<Array<Thread>>([])
   const [activeChatID, setActiveChatID] = useState<string | undefined>()
   const [isCreatingNewChat, setIsCreatingNewChat] = useState(true)
 
@@ -38,9 +40,31 @@ function IndexRoute() {
     }
   }, [activeChatID, api, isCreatingNewChat])
 
+  const loadThreads = useCallback(async () => {
+    try {
+      const payload = await api.listThreads("default")
+      setThreads(payload)
+    } catch {
+      // threads are optional — silently ignore
+    }
+  }, [api])
+
   useEffect(() => {
     void loadChats()
-  }, [loadChats])
+    void loadThreads()
+  }, [loadChats, loadThreads])
+
+  const handleArchiveThread = useCallback(
+    async (threadId: string) => {
+      try {
+        await api.archiveThread(threadId)
+        void loadThreads()
+      } catch {
+        // ignore
+      }
+    },
+    [api, loadThreads]
+  )
 
   const handleNewChat = () => {
     setIsCreatingNewChat(true)
@@ -66,8 +90,10 @@ function IndexRoute() {
       <aside className="chat-app-sidebar">
         <ChatSidebar
           chats={chats}
+          threads={threads}
           onNewChat={handleNewChat}
           onSelectChat={handleSelectChat}
+          onArchiveThread={handleArchiveThread}
           activeId={activeChatID}
         />
       </aside>

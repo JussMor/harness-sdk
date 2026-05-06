@@ -1025,3 +1025,104 @@
   @apply px-3 pb-3 text-xs text-amber-900/80 whitespace-pre-wrap font-mono
     max-h-64 overflow-y-auto border-t border-amber-200/60 pt-2;
 }
+
+/* ── Plan Block ────────────────────────────────────────────────────────────── */
+
+.chat-plan-block {
+  @apply my-2 rounded-lg border border-indigo-200 bg-indigo-50/50 overflow-hidden;
+}
+
+.chat-plan-toggle {
+  @apply flex items-center gap-2 w-full px-3 py-2 text-xs font-medium text-indigo-700
+    hover:bg-indigo-100/50 transition-colors cursor-pointer border-none bg-transparent;
+}
+
+.chat-plan-icon {
+  @apply text-indigo-500;
+}
+
+.chat-plan-count {
+  @apply ml-1 text-indigo-400 font-normal;
+}
+
+.chat-plan-chevron {
+  @apply ml-auto transition-transform text-indigo-400;
+}
+
+.chat-plan-chevron--open {
+  @apply rotate-180;
+}
+
+.chat-plan-body {
+  @apply px-3 pb-3 border-t border-indigo-200/60 pt-2;
+}
+
+.chat-plan-objective {
+  @apply text-xs text-indigo-800/80 mb-2 italic;
+}
+
+.chat-plan-steps {
+  @apply list-decimal list-inside space-y-1;
+}
+
+.chat-plan-step {
+  @apply text-xs text-indigo-900/80;
+}
+
+.chat-plan-step-name {
+  @apply font-medium;
+}
+
+.chat-plan-step-desc {
+  @apply ml-1 text-indigo-600/70;
+}
+
+/* ── Subagent Results (streamed) ───────────────────────────────────────────── */
+
+.chat-subagent-results {
+  @apply my-2 space-y-1;
+}
+
+/* ── Thread Sidebar ────────────────────────────────────────────────────────── */
+
+.sidebar-threads {
+  @apply mt-4 px-2 border-t border-zinc-200 pt-3;
+}
+
+.sidebar-thread-item {
+  @apply flex items-center gap-2 px-2 py-1.5 text-xs rounded-md
+    hover:bg-zinc-100 transition-colors;
+}
+
+.sidebar-thread-status {
+  @apply px-1.5 py-0.5 rounded text-[10px] font-medium uppercase;
+}
+
+.sidebar-thread-status--active {
+  @apply bg-green-100 text-green-700;
+}
+
+.sidebar-thread-status--completed {
+  @apply bg-blue-100 text-blue-700;
+}
+
+.sidebar-thread-status--failed {
+  @apply bg-red-100 text-red-700;
+}
+
+.sidebar-thread-status--archived {
+  @apply bg-zinc-100 text-zinc-500;
+}
+
+.sidebar-thread-id {
+  @apply font-mono text-zinc-600 truncate;
+}
+
+.sidebar-thread-mode {
+  @apply text-zinc-400 truncate;
+}
+
+.sidebar-thread-archive {
+  @apply ml-auto p-1 rounded hover:bg-zinc-200 text-zinc-400 hover:text-zinc-600
+    transition-colors cursor-pointer border-none bg-transparent;
+}

@@ -1,5 +1,6 @@
+import type { Thread } from "@/features/chat/types"
 import { cn } from "@/lib/utils"
-import { Clock3, MessageSquarePlus, Search } from "lucide-react"
+import { Archive, Clock3, GitBranch, MessageSquarePlus, Search } from "lucide-react"
 import { useMemo, useState } from "react"
 
 export interface SidebarChat {
@@ -10,9 +11,11 @@ export interface SidebarChat {
 
 export interface ChatSidebarProps {
   chats: Array<SidebarChat>
+  threads?: Array<Thread>
   activeId?: string
   onNewChat: () => void
   onSelectChat?: (chatId: string) => void
+  onArchiveThread?: (threadId: string) => void
 }
 
 type ChatGroup = "Today" | "Yesterday" | "Last 7 Days" | "Older"
@@ -41,9 +44,11 @@ function computeGroup(updatedAt: string): ChatGroup {
 
 export function ChatSidebar({
   chats,
+  threads,
   activeId,
   onNewChat,
   onSelectChat,
+  onArchiveThread,
 }: ChatSidebarProps) {
   const [query, setQuery] = useState("")
 
@@ -117,6 +122,34 @@ export function ChatSidebar({
           )
         })}
       </div>
+
+      {threads && threads.length > 0 && (
+        <div className="sidebar-threads">
+          <p className="sidebar-group-title">
+            <GitBranch size={13} />
+            Threads
+          </p>
+          {threads.map((thread) => (
+            <div key={thread.id} className="sidebar-thread-item">
+              <span className={cn("sidebar-thread-status", `sidebar-thread-status--${thread.status}`)}>
+                {thread.status}
+              </span>
+              <span className="sidebar-thread-id">{thread.id.slice(0, 8)}</span>
+              {thread.mode_id && <span className="sidebar-thread-mode">{thread.mode_id}</span>}
+              {onArchiveThread && thread.status === "active" && (
+                <button
+                  type="button"
+                  className="sidebar-thread-archive"
+                  onClick={() => onArchiveThread(thread.id)}
+                  title="Archive thread"
+                >
+                  <Archive size={12} />
+                </button>
+              )}
+            </div>
+          ))}
+        </div>
+      )}
     </section>
   )
 }

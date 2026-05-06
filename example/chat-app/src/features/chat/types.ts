@@ -90,8 +90,35 @@ export type StreamEvent =
   | { type: "tool_result"; data: StreamToolResult }
   | { type: "sandbox_output"; data: StreamSandboxOutput }
   | { type: "artifact"; data: StreamArtifact }
+  | { type: "plan_proposed"; data: StreamPlanProposed }
+  | { type: "subagent_result"; data: StreamSubagentResult }
   | { type: "done"; data: StreamDone }
   | { type: "error"; data: { error?: string } }
+
+export interface StreamPlanProposed {
+  id: string
+  title: string
+  objective: string
+  executables: Array<StreamPlanExecutable>
+}
+
+export interface StreamPlanExecutable {
+  id: string
+  name: string
+  description: string
+  dependencies: Array<string>
+  status: string
+}
+
+export interface StreamSubagentResult {
+  id: string
+  task: string
+  output: string
+  turns: number
+  stop_reason: string
+  duration_ms: number
+  error?: string
+}
 
 export interface StreamArtifact {
   id: string
