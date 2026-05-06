@@ -25,6 +25,7 @@ const (
 // share project scope, mode, and persistence.
 type Thread struct {
 	ID        string       `json:"id"`
+	UserID    string       `json:"user_id,omitempty"`    // tenant isolation; empty = single-user
 	ProjectID string       `json:"project_id,omitempty"`
 	ModeID    string       `json:"mode_id,omitempty"`
 	Status    ThreadStatus `json:"status"`
@@ -36,7 +37,7 @@ type Thread struct {
 // (e.g. multi-user, multi-project apps). Skip if you only need single-user
 // in-memory conversations — Conversation alone is enough.
 type ThreadProvider interface {
-	// Create starts a new thread.
+	// Create starts a new thread with no user scoping.
 	Create(ctx context.Context, projectID, modeID string) (*Thread, error)
 
 	// Get returns thread metadata by ID.
@@ -48,3 +49,30 @@ type ThreadProvider interface {
 	// SendMessage delivers a message to another thread (cross-thread comms).
 	SendMessage(ctx context.Context, msg Message) error
 }
+
+// MultiUserThreadProvider extends ThreadProvider with per-user scoping.
+// Implement this for multi-tenant deployments where threads belong to users.
+//
+// Implementations must enforce that a user can only Get/List/Archive their
+// own threads — return ErrThreadAccessDenied when accessed with the wrong UserID.
+type MultiUserThreadProvider interface {
+	ThreadProvider
+
+	// CreateForUser starts a thread owned by userID.
+	CreateForUser(ctx context.Context, userID, projectID, modeID string) (*Thread, error)
+
+	// GetForUser returns a thread only if it belongs to userID.
+	// Returns ErrThreadAccessDenied if the thread exists but belongs to another user.
+	GetForUser(ctx context.Context, userID, threadID string) (*Thread, error)
+
+	// ListByUser returns all threads owned by userID, optionally filtered by status.
+	ListByUser(ctx context.Context, userID string, status ThreadStatus) ([]*Thread, error)
+}
+
+// ErrThreadAccessDenied is returned when a user tries to access a thread
+// owned by another user.
+var ErrThreadAccessDenied = &threadError{"thread: access denied"}
+
+type threadError struct{ msg string }
+
+func (e *threadError) Error() string { return e.msg }

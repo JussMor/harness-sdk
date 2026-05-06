@@ -132,3 +132,42 @@ func (p *fileSkillProvider) Get(_ context.Context, name string) (*ab.Skill, erro
 	}
 	return skill, nil
 }
+
+// ── ReloadableSkillProvider interface ─────────────────────────────────────────
+
+func (p *fileSkillProvider) AddOrReplace(skill *ab.Skill) {
+	if skill == nil || strings.TrimSpace(skill.Name) == "" {
+		return
+	}
+	name := strings.TrimSpace(skill.Name)
+
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	if _, exists := p.all[name]; !exists {
+		p.names = append(p.names, name)
+		sort.Strings(p.names)
+	}
+	p.all[name] = skill
+}
+
+func (p *fileSkillProvider) Remove(skillID string) {
+	trimmed := strings.TrimSpace(skillID)
+	if trimmed == "" {
+		return
+	}
+
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	delete(p.all, trimmed)
+	delete(p.loaded, trimmed)
+	for i, n := range p.names {
+		if n == trimmed {
+			p.names = append(p.names[:i], p.names[i+1:]...)
+			break
+		}
+	}
+}
+
+var _ ab.ReloadableSkillProvider = (*fileSkillProvider)(nil)

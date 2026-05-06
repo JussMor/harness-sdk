@@ -11,10 +11,15 @@ import type {
   ChatMode,
   ProvidersResponse,
   StreamEvent,
+  StreamPlanProposed,
+  StreamSubagentResult,
 } from "@/features/chat/types"
 import {
   Bot,
+  Brain,
   Check,
+  ChevronDown,
+  ChevronRight,
   Copy,
   LoaderCircle,
   RefreshCw,
@@ -37,7 +42,10 @@ export interface ChatMessage {
   role: "user" | "assistant"
   model?: string
   pending?: boolean
+  thinking?: string
   traces?: Array<ToolTrace>
+  plan?: StreamPlanProposed
+  subagentResults?: Array<StreamSubagentResult>
 }
 
 export interface ChatMainProps {
@@ -121,7 +129,60 @@ export function ChatMain({
           (message) => message.role === "user" || message.role === "assistant"
         )
         .map(toChatMessage)
-      setMessages(next)
+
+      // Preserve streaming-only fields (plan, subagentResults) that aren't
+      // persisted in the backend but were accumulated during the stream.
+      // The local streaming message has a temporary id (e.g. "local-assistant-…")
+      // that won't match the new numeric DB id, so we find the most recent
+      // prev assistant message with these fields and graft them onto the
+      // LAST assistant message in next (the one we just finalized).
+      setMessages((prev) => {
+        const prevMap = new Map(prev.map((m) => [m.id, m]))
+
+        // Find the latest prev assistant message carrying streaming-only data.
+        let latestStreamFields:
+          | Pick<ChatMessage, "plan" | "subagentResults">
+          | undefined
+        for (let i = prev.length - 1; i >= 0; i--) {
+          const m = prev[i]
+          if (
+            m.role === "assistant" &&
+            (m.plan || (m.subagentResults && m.subagentResults.length > 0))
+          ) {
+            latestStreamFields = {
+              plan: m.plan,
+              subagentResults: m.subagentResults,
+            }
+            break
+          }
+        }
+
+        // Index of the last assistant message in next.
+        let lastAssistantIdx = -1
+        for (let i = next.length - 1; i >= 0; i--) {
+          if (next[i].role === "assistant") {
+            lastAssistantIdx = i
+            break
+          }
+        }
+
+        return next.map((m, idx) => {
+          // Same-id match (e.g. older messages already persisted with stable ids)
+          const existing = prevMap.get(m.id)
+          if (existing && (existing.plan || existing.subagentResults)) {
+            return {
+              ...m,
+              plan: existing.plan,
+              subagentResults: existing.subagentResults,
+            }
+          }
+          // Graft streaming-only fields onto the freshly-persisted assistant message.
+          if (idx === lastAssistantIdx && latestStreamFields) {
+            return { ...m, ...latestStreamFields }
+          }
+          return m
+        })
+      })
 
       // Reconstruct artifacts from persisted metadata
       const restored: Array<Artifact> = []
@@ -267,6 +328,19 @@ export function ChatMain({
         return
       }
 
+      if (event.type === "thinking") {
+        const thinking = event.data.thinking || ""
+        if (!thinking) return
+        setMessages((prev) =>
+          prev.map((message) =>
+            message.id === pendingAssistantId
+              ? { ...message, thinking: (message.thinking || "") + thinking }
+              : message
+          )
+        )
+        return
+      }
+
       if (event.type === "tool_call") {
         const toolName = event.data.name || "unknown_tool"
         const traceId = `trace-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`
@@ -383,27 +457,45 @@ export function ChatMain({
         return
       }
 
-      if (event.type === "done") {
-        const messageId = event.data.messageId
-        if (!messageId || !chatID) return
-
-        // Fetch the persisted message from the backend and replace the local
-        // in-memory message with it. This ensures tool traces from metadata
-        // are correctly restored and nothing is lost after stream ends.
-        api.listMessages(chatID).then((msgs) => {
-          const saved = msgs.find((m) => m.id === messageId)
-          if (!saved) return
-          const restored = toChatMessage(saved)
-          setMessages((prev) =>
-            prev.map((m) => (m.id === pendingAssistantId ? restored : m))
+      if (event.type === "plan_proposed") {
+        const plan = event.data
+        pushTimeline(
+          `Plan: ${plan.title} (${plan.executables.length} steps)`,
+          "info"
+        )
+        setMessages((prev) =>
+          prev.map((message) =>
+            message.id === pendingAssistantId ? { ...message, plan } : message
           )
-        }).catch(() => {
-          // Non-fatal — in-memory message already has the content
-        })
+        )
+        return
+      }
+
+      if (event.type === "subagent_result") {
+        const result = event.data
+        const level: TimelineEvent["level"] = result.error ? "error" : "success"
+        pushTimeline(`Subagent ${result.id}: ${result.error || "done"}`, level)
+        setMessages((prev) =>
+          prev.map((message) =>
+            message.id === pendingAssistantId
+              ? {
+                  ...message,
+                  subagentResults: [...(message.subagentResults ?? []), result],
+                }
+              : message
+          )
+        )
+        return
+      }
+
+      if (event.type === "done") {
+        // Mark stream as done — syncMessages() after streamChat resolves
+        // handles full message and artifact restoration from backend.
+        pushTimeline("Stream finished", "success")
         return
       }
     },
-    [pushTimeline, api, chatID]
+    [pushTimeline]
   )
 
   const ensureChat = useCallback(async (): Promise<number> => {
@@ -471,16 +563,12 @@ export function ChatMain({
       await syncMessages(targetChatID)
       onChatsChanged?.()
       setStatusText("Completed")
-      pushTimeline("Stream finished", "success")
 
-      // Finalize any open artifact
+      // Finalize any open inline artifact from the text detector,
+      // but don't overwrite allArtifacts — syncMessages already restored
+      // the authoritative set from backend metadata.
       const finalState = finalizeStream(detectorRef.current)
       detectorRef.current = finalState
-      if (finalState.artifacts.length > 0) {
-        const lastArt = finalState.artifacts[finalState.artifacts.length - 1]
-        setActiveArtifact(lastArt)
-        setAllArtifacts(finalState.artifacts)
-      }
       setIsArtifactStreaming(false)
     } catch (error) {
       const aborted =
@@ -625,18 +713,47 @@ export function ChatMain({
                     ))}
                   </div>
                 )}
+                {message.plan && (
+                  <PlanBlock
+                    plan={message.plan}
+                    defaultOpen={!!message.pending}
+                  />
+                )}
+                {message.subagentResults &&
+                  message.subagentResults.length > 0 && (
+                    <SubagentResultsBlock
+                      results={message.subagentResults}
+                      defaultOpen={!!message.pending}
+                    />
+                  )}
+                {message.thinking && (
+                  <ThinkingBlock
+                    content={message.thinking}
+                    isStreaming={!!message.pending}
+                  />
+                )}
                 <MessageContent message={message} />
                 {/* Actions row — only for complete assistant messages */}
-                {message.role === "assistant" && !message.pending && !isStreaming && (
-                  <MessageActions content={message.content} onRetry={() => {
-                    const idx = messages.findIndex(m => m.id === message.id)
-                    const prev = messages.slice(0, idx).reverse().find(m => m.role === "user")
-                    if (prev) {
-                      setInput(prev.content)
-                      setTimeout(() => void sendPrompt(), 0)
-                    }
-                  }} />
-                )}
+                {message.role === "assistant" &&
+                  !message.pending &&
+                  !isStreaming && (
+                    <MessageActions
+                      content={message.content}
+                      onRetry={() => {
+                        const idx = messages.findIndex(
+                          (m) => m.id === message.id
+                        )
+                        const prev = messages
+                          .slice(0, idx)
+                          .reverse()
+                          .find((m) => m.role === "user")
+                        if (prev) {
+                          setInput(prev.content)
+                          setTimeout(() => void sendPrompt(), 0)
+                        }
+                      }}
+                    />
+                  )}
               </article>
             ))}
             <div ref={listEndRef} />
@@ -761,6 +878,7 @@ function toChatMessage(message: BackendMessage): ChatMessage {
       result: tc.result,
       error: tc.error,
       status: tc.error ? ("error" as const) : ("success" as const),
+      subagents: parseSubagentResult(tc.name, tc.result),
     })
   )
 
@@ -857,11 +975,13 @@ function MessageContent({ message }: { message: ChatMessage }) {
             const isBlock = code.includes("\n") || !!lang
 
             if (!isBlock) {
-              return <code className="chat-inline-code" {...props}>{children}</code>
+              return (
+                <code className="chat-inline-code" {...props}>
+                  {children}
+                </code>
+              )
             }
-            return (
-              <CodeBlock lang={lang} code={code} />
-            )
+            return <CodeBlock lang={lang} code={code} />
           },
           // Links open in new tab
           a({ href, children }) {
@@ -966,4 +1086,175 @@ function MessageActions({
       </button>
     </div>
   )
+}
+
+// ── ThinkingBlock ─────────────────────────────────────────────────────────────
+// Collapsible display of extended thinking content from deep-work mode.
+
+function ThinkingBlock({
+  content,
+  isStreaming,
+}: {
+  content: string
+  isStreaming: boolean
+}) {
+  const [expanded, setExpanded] = useState(false)
+
+  return (
+    <div className="chat-thinking-block">
+      <button
+        type="button"
+        className="chat-thinking-toggle"
+        onClick={() => setExpanded(!expanded)}
+      >
+        <Brain size={14} className="chat-thinking-icon" />
+        <span>{isStreaming ? "Thinking..." : "Thought process"}</span>
+        {isStreaming && <LoaderCircle className="spin" size={12} />}
+        <ChevronDown
+          size={14}
+          className={`chat-thinking-chevron ${expanded ? "chat-thinking-chevron--open" : ""}`}
+        />
+      </button>
+      {expanded && <pre className="chat-thinking-content">{content}</pre>}
+    </div>
+  )
+}
+
+// ── PlanBlock ─────────────────────────────────────────────────────────────────
+// Shows the proposed execution plan with its DAG of executables.
+
+function PlanBlock({
+  plan,
+  defaultOpen = true,
+}: {
+  plan: StreamPlanProposed
+  defaultOpen?: boolean
+}) {
+  const [expanded, setExpanded] = useState(defaultOpen)
+
+  return (
+    <div className="chat-plan-block">
+      <button
+        type="button"
+        className="chat-plan-toggle"
+        onClick={() => setExpanded(!expanded)}
+      >
+        <Sparkles size={14} className="chat-plan-icon" />
+        <span>{plan.title || "Execution Plan"}</span>
+        <span className="chat-plan-count">
+          {plan.executables.length} step
+          {plan.executables.length !== 1 ? "s" : ""}
+        </span>
+        <ChevronDown
+          size={14}
+          className={`chat-plan-chevron ${expanded ? "chat-plan-chevron--open" : ""}`}
+        />
+      </button>
+      {expanded && (
+        <div className="chat-plan-body">
+          {plan.objective && (
+            <p className="chat-plan-objective">{plan.objective}</p>
+          )}
+          <ol className="chat-plan-steps">
+            {plan.executables.map((exec) => (
+              <li key={exec.id} className="chat-plan-step">
+                <span className="chat-plan-step-name">{exec.name}</span>
+                {exec.description && (
+                  <span className="chat-plan-step-desc">
+                    {exec.description}
+                  </span>
+                )}
+              </li>
+            ))}
+          </ol>
+        </div>
+      )}
+    </div>
+  )
+}
+
+// ── SubagentResultsBlock ──────────────────────────────────────────────────────
+// Renders subagent results as they stream in from plan fan-out.
+
+function SubagentResultsBlock({
+  results,
+  defaultOpen = true,
+}: {
+  results: Array<StreamSubagentResult>
+  defaultOpen?: boolean
+}) {
+  const [expanded, setExpanded] = useState(defaultOpen)
+  const doneCount = results.filter((r) => !r.error).length
+  const errorCount = results.filter((r) => r.error).length
+
+  return (
+    <div className="chat-subagent-results">
+      <button
+        type="button"
+        className="chat-plan-toggle"
+        onClick={() => setExpanded(!expanded)}
+      >
+        <Bot size={14} className="chat-plan-icon" />
+        <span>
+          {results.length} subagent{results.length !== 1 ? "s" : ""}
+          {doneCount > 0 && ` · ${doneCount} done`}
+          {errorCount > 0 && ` · ${errorCount} failed`}
+        </span>
+        <ChevronDown
+          size={14}
+          className={`chat-plan-chevron ${expanded ? "chat-plan-chevron--open" : ""}`}
+        />
+      </button>
+      {expanded &&
+        results.map((result) => (
+          <SubagentResultCard key={result.id} result={result} />
+        ))}
+    </div>
+  )
+}
+
+function SubagentResultCard({ result }: { result: StreamSubagentResult }) {
+  const [open, setOpen] = useState(false)
+  const failed = Boolean(result.error)
+
+  return (
+    <div className={`subagent-card ${failed ? "subagent-card-error" : ""}`}>
+      <button
+        type="button"
+        className="subagent-card-header"
+        onClick={() => setOpen((v) => !v)}
+      >
+        {open ? <ChevronDown size={12} /> : <ChevronRight size={12} />}
+        <Bot size={12} />
+        <span className="subagent-card-id">{result.id}</span>
+        <span className="subagent-card-meta">
+          {result.turns > 0 && `${result.turns} turns · `}
+          {result.duration_ms > 0 && formatDurationMs(result.duration_ms)}
+        </span>
+      </button>
+      {open && (
+        <div className="subagent-card-body">
+          <p className="subagent-card-task">
+            <strong>Task:</strong> {result.task}
+          </p>
+          {result.error ? (
+            <p className="subagent-card-err">Error: {result.error}</p>
+          ) : (
+            result.output && (
+              <pre className="subagent-card-output">
+                {result.output.length > 2000
+                  ? result.output.slice(0, 2000) + "..."
+                  : result.output}
+              </pre>
+            )
+          )}
+        </div>
+      )}
+    </div>
+  )
+}
+
+function formatDurationMs(ms: number): string {
+  if (ms < 1000) return `${ms}ms`
+  return `${(ms / 1000).toFixed(1)}s`
 }

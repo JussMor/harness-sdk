@@ -85,12 +85,40 @@ export interface StreamSandboxOutput {
 
 export type StreamEvent =
   | { type: "delta"; data: { delta?: string } }
+  | { type: "thinking"; data: { thinking?: string } }
   | { type: "tool_call"; data: StreamToolCall }
   | { type: "tool_result"; data: StreamToolResult }
   | { type: "sandbox_output"; data: StreamSandboxOutput }
   | { type: "artifact"; data: StreamArtifact }
+  | { type: "plan_proposed"; data: StreamPlanProposed }
+  | { type: "subagent_result"; data: StreamSubagentResult }
   | { type: "done"; data: StreamDone }
   | { type: "error"; data: { error?: string } }
+
+export interface StreamPlanProposed {
+  id: string
+  title: string
+  objective: string
+  executables: Array<StreamPlanExecutable>
+}
+
+export interface StreamPlanExecutable {
+  id: string
+  name: string
+  description: string
+  dependencies: Array<string>
+  status: string
+}
+
+export interface StreamSubagentResult {
+  id: string
+  task: string
+  output: string
+  turns: number
+  stop_reason: string
+  duration_ms: number
+  error?: string
+}
 
 export interface StreamArtifact {
   id: string
@@ -119,7 +147,7 @@ export interface ArtifactRecord {
   language: string
   title: string
   createdAt: string
-  versions?: ArtifactVersion[]
+  versions?: Array<ArtifactVersion>
 }
 
 export interface ArtifactStorageResponse {
@@ -130,4 +158,17 @@ export interface ArtifactStorageResponse {
 
 export interface StreamCallbacks {
   onEvent: (event: StreamEvent) => void
+}
+
+// ── Thread types ──────────────────────────────────────────────────────────────
+
+export type ThreadStatus = "active" | "completed" | "failed" | "archived"
+
+export interface Thread {
+  id: string
+  user_id?: string
+  project_id?: string
+  mode_id?: string
+  status: ThreadStatus
+  parent_id?: string
 }

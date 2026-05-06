@@ -60,12 +60,3 @@ func executeFormalPlanFromProposedPlan(ctx context.Context, runtime *agentRuntim
 
 	return runners, nil
 }
-
-func latestUserPrompt(messages []ab.ChatMessage) string {
-	for i := len(messages) - 1; i >= 0; i-- {
-		if messages[i].Role == ab.RoleUser {
-			return strings.TrimSpace(messages[i].Content)
-		}
-	}
-	return ""
-}

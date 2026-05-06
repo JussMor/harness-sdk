@@ -47,7 +47,7 @@ type Anthropic struct {
 	// MaxTokens caps the response. Defaults to 4096.
 	MaxTokens int
 
-	// Client is the HTTP client used for requests. Defaults to one with 90s timeout.
+	// Client is the HTTP client used for requests. Defaults to one with 180s timeout.
 	Client *http.Client
 }
 
@@ -59,7 +59,7 @@ func NewAnthropic(apiKey, defaultModel string) *Anthropic {
 		BaseURL:          "https://api.anthropic.com/v1/messages",
 		AnthropicVersion: "2023-06-01",
 		MaxTokens:        4096,
-		Client:           &http.Client{Timeout: 90 * time.Second},
+		Client:           &http.Client{Timeout: 180 * time.Second},
 	}
 }
 
@@ -127,14 +127,41 @@ type anthropicMessage struct {
 }
 
 type anthropicContent struct {
-	Type      string          `json:"type"`
-	Text      *string         `json:"text,omitempty"`
-	Thinking  *string         `json:"thinking,omitempty"`  // extended thinking block
-	ID        string          `json:"id,omitempty"`          // tool_use
-	Name      string          `json:"name,omitempty"`        // tool_use
-	Input     json.RawMessage `json:"input,omitempty"`       // tool_use
-	ToolUseID string          `json:"tool_use_id,omitempty"` // tool_result
-	Content   string          `json:"content,omitempty"`     // tool_result body
+	Type         string                 `json:"type"`
+	Text         *string                `json:"text,omitempty"`
+	Thinking     *string                `json:"thinking,omitempty"`  // extended thinking block
+	ID           string                 `json:"id,omitempty"`          // tool_use
+	Name         string                 `json:"name,omitempty"`        // tool_use
+	Input        json.RawMessage        `json:"input,omitempty"`       // tool_use
+	ToolUseID    string                 `json:"tool_use_id,omitempty"` // tool_result
+	Content      string                 `json:"content,omitempty"`     // tool_result body
+	Source       *anthropicImageSource  `json:"source,omitempty"`      // image
+	CacheControl *anthropicCacheControl `json:"cache_control,omitempty"` // message-level caching
+}
+
+// anthropicImageSource represents the image data — either base64 or url.
+type anthropicImageSource struct {
+	Type      string `json:"type"`                 // "base64" or "url"
+	MediaType string `json:"media_type,omitempty"` // "image/jpeg", "image/png", etc.
+	Data      string `json:"data,omitempty"`       // base64 data (for type=base64)
+	URL       string `json:"url,omitempty"`        // image URL (for type=url)
+}
+
+// buildAnthropicImageBlock converts an SDK ImageContent to an Anthropic content block.
+func buildAnthropicImageBlock(img autobuild.ImageContent) anthropicContent {
+	src := &anthropicImageSource{}
+	if img.URL != "" {
+		src.Type = "url"
+		src.URL = img.URL
+	} else {
+		src.Type = "base64"
+		src.MediaType = img.MediaType
+		src.Data = img.Source
+	}
+	return anthropicContent{
+		Type:   "image",
+		Source: src,
+	}
 }
 
 func strPtr(s string) *string { return &s }
@@ -242,12 +269,18 @@ func buildAnthropicRequest(model string, maxTokens int, req autobuild.ChatReques
 			continue
 
 		case autobuild.RoleUser:
+			// Build content blocks: images first, then text
+			var content []anthropicContent
+			for _, img := range m.Images {
+				content = append(content, buildAnthropicImageBlock(img))
+			}
 			if m.Content != "" {
+				content = append(content, anthropicContent{Type: "text", Text: strPtr(m.Content)})
+			}
+			if len(content) > 0 {
 				out.Messages = append(out.Messages, anthropicMessage{
-					Role: "user",
-					Content: []anthropicContent{
-						{Type: "text", Text: strPtr(m.Content)},
-					},
+					Role:    "user",
+					Content: content,
 				})
 			}
 			i++
@@ -301,6 +334,25 @@ func buildAnthropicRequest(model string, maxTokens int, req autobuild.ChatReques
 		}
 	}
 
+	// Message-level prompt caching: mark the last assistant or tool_result message
+	// for caching so subsequent turns can skip re-processing the conversation history.
+	// Anthropic caches up to 4 cache breakpoints; we use 1 here (system + 1 message).
+	// Best location: the final block of the last assistant or tool_result message,
+	// because the user's next turn will arrive after it and the cache persists.
+	if len(out.Messages) >= 2 {
+		// Find the last message that is "stable" (not the latest user message)
+		// — typically the assistant turn before the new user input.
+		for idx := len(out.Messages) - 1; idx >= 0; idx-- {
+			msg := &out.Messages[idx]
+			if msg.Role == "assistant" || (msg.Role == "user" && hasToolResult(msg.Content)) {
+				if len(msg.Content) > 0 {
+					msg.Content[len(msg.Content)-1].CacheControl = &anthropicCacheControl{Type: "ephemeral"}
+				}
+				break
+			}
+		}
+	}
+
 	// Tools
 	for _, t := range req.Tools {
 		schema, err := json.Marshal(t.Function.Parameters)
@@ -315,6 +367,17 @@ func buildAnthropicRequest(model string, maxTokens int, req autobuild.ChatReques
 	}
 
 	return json.Marshal(out)
+}
+
+// hasToolResult returns true if the content includes a tool_result block,
+// which means the message is a user message echoing tool outputs (good cache point).
+func hasToolResult(content []anthropicContent) bool {
+	for _, c := range content {
+		if c.Type == "tool_result" {
+			return true
+		}
+	}
+	return false
 }
 
 func parseAnthropicResponse(body []byte) (*autobuild.ChatResponse, error) {
@@ -414,10 +477,9 @@ func (a *Anthropic) ChatStream(ctx context.Context, req autobuild.ChatRequest) (
 	httpReq.Header.Set("anthropic-version", a.AnthropicVersion)
 	httpReq.Header.Set("Accept", "text/event-stream")
 
-	client := a.Client
-	if client == nil {
-		client = &http.Client{Timeout: 0} // no timeout for streaming — use ctx
-	}
+	// Streaming connections can last indefinitely — use a client with no timeout.
+	// Context cancellation handles cleanup.
+	client := &http.Client{Timeout: 0}
 
 	resp, err := client.Do(httpReq)
 	if err != nil {

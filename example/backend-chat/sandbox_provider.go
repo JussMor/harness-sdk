@@ -3,7 +3,6 @@ package main
 import (
 	"context"
 	"database/sql"
-	"encoding/json"
 	"fmt"
 	"os"
 	"strconv"
@@ -11,7 +10,6 @@ import (
 	"sync"
 	"time"
 
-	opensandbox "github.com/alibaba/OpenSandbox/sdks/sandbox/go"
 	ab "github.com/everfaz/autobuild-sdk"
 	sbprovider "github.com/everfaz/autobuild-sdk/providers/sandbox"
 )
@@ -375,122 +373,4 @@ func formatExecResult(r ab.ExecResult) string {
 		return "[no output]"
 	}
 	return result
-}
-
-func formatCodeExecution(exec *opensandbox.Execution) string {
-	if exec == nil {
-		return "[no output]"
-	}
-
-	var parts []string
-
-	// stdout
-	if text := exec.Text(); text != "" {
-		parts = append(parts, strings.TrimSpace(text))
-	}
-
-	// execution results (MIME-keyed)
-	for _, res := range exec.Results {
-		if res.Results == nil {
-			continue
-		}
-		// Prefer text/plain for LLM context
-		if plain := res.Results["text/plain"]; plain != "" {
-			parts = append(parts, strings.TrimSpace(plain))
-		}
-		// Annotate HTML presence — frontend will render it
-		if html, ok := res.Results["text/html"]; ok && html != "" {
-			parts = append(parts, "[html_output available — frontend will render]")
-		}
-		// Images come as base64 — annotate but don't dump to LLM
-		if _, ok := res.Results["image/png"]; ok {
-			parts = append(parts, "[image output available — frontend will render]")
-		}
-		if _, ok := res.Results["image/svg+xml"]; ok {
-			parts = append(parts, "[svg output available — frontend will render]")
-		}
-	}
-
-	// error
-	if exec.Error != nil {
-		errMsg := fmt.Sprintf("[error: %s: %s]", exec.Error.Name, exec.Error.Value)
-		if len(exec.Error.Traceback) > 0 {
-			errMsg += "\n" + strings.Join(exec.Error.Traceback, "\n")
-		}
-		parts = append(parts, errMsg)
-	}
-
-	// execution time
-	if exec.Complete != nil && exec.Complete.ExecutionTime > 0 {
-		parts = append(parts, fmt.Sprintf("[execution_time: %dms]", exec.Complete.ExecutionTime))
-	}
-
-	result := strings.Join(parts, "\n")
-	if result == "" {
-		return "[no output]"
-	}
-	return result
-}
-
-// formatCodeExecutionForSSE formats an Execution as JSON for the sandbox_output SSE event.
-func formatCodeExecutionForSSE(exec *opensandbox.Execution, language string) map[string]any {
-	out := map[string]any{
-		"language": language,
-	}
-	if exec == nil {
-		return out
-	}
-
-	if text := exec.Text(); text != "" {
-		out["stdout"] = text
-	}
-	var stderr strings.Builder
-	for _, m := range exec.Stderr {
-		stderr.WriteString(m.Text)
-		stderr.WriteByte('\n')
-	}
-	if s := strings.TrimSpace(stderr.String()); s != "" {
-		out["stderr"] = s
-	}
-
-	// Rich outputs keyed by MIME type
-	var results []map[string]string
-	for _, res := range exec.Results {
-		if len(res.Results) > 0 {
-			results = append(results, res.Results)
-		}
-	}
-	if len(results) > 0 {
-		out["results"] = results
-	}
-
-	if exec.Error != nil {
-		errOut := map[string]any{
-			"name":  exec.Error.Name,
-			"value": exec.Error.Value,
-		}
-		if len(exec.Error.Traceback) > 0 {
-			errOut["traceback"] = exec.Error.Traceback
-		}
-		out["error"] = errOut
-	}
-	if exec.ExitCode != nil {
-		out["exit_code"] = *exec.ExitCode
-	}
-	if exec.Complete != nil {
-		out["execution_time_ms"] = exec.Complete.ExecutionTime
-	}
-	return out
-}
-
-// sandboxOutputJSON serializes a sandbox output event for SSE.
-func sandboxOutputJSON(sandboxID string, chatID int64, output map[string]any) ([]byte, error) {
-	event := map[string]any{
-		"sandbox_id": sandboxID,
-		"chat_id":    chatID,
-	}
-	for k, v := range output {
-		event[k] = v
-	}
-	return json.Marshal(event)
 }

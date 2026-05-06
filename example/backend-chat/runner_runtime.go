@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -393,6 +394,26 @@ func (r *agentRuntime) newSubagentDispatchTool() *ab.Tool {
 				return "tasks must be a non-empty array", nil
 			}
 
+			// Track file writes made by subagents so the parent stream
+			// can emit them as artifacts visible to the frontend.
+			tracker := &fileWriteTracker{}
+			subEngine := r.subagentEngine
+			if isSandboxAvailable() && r.chatID > 0 {
+				subReg := ab.NewToolRegistry()
+				subReg.Register(r.newCheckpointTool())
+				if r.memory != nil {
+					subReg.Register(r.newMemoryTool())
+				}
+				subReg.Register(r.newBashTool(r.chatID))
+				subReg.Register(r.newCodeInterpreterTool(r.chatID))
+				subReg.Register(r.newTrackedFileWriteTool(r.chatID, tracker))
+				subReg.Register(r.newFileReadTool(r.chatID))
+				subEngine = ab.New(
+					ab.WithLLM(r.subagentEngine.LLM),
+					ab.WithToolRegistry(subReg),
+				)
+			}
+
 			subs := make([]ab.Subagent, 0, len(rawTasks))
 			for i, raw := range rawTasks {
 				m, ok := raw.(map[string]any)
@@ -411,14 +432,14 @@ func (r *agentRuntime) newSubagentDispatchTool() *ab.Tool {
 				if v, ok := m["max_turns"].(float64); ok && v > 0 {
 					maxTurns = int(v)
 				}
-				timeout := 90 * time.Second
+				timeout := 120 * time.Second
 				if v, ok := m["timeout_seconds"].(float64); ok && v > 0 {
 					timeout = time.Duration(v) * time.Second
 				}
 				subs = append(subs, ab.Subagent{
 					ID:       id,
 					Task:     task,
-					Engine:   r.subagentEngine,
+					Engine:   subEngine,
 					Mode:     strings.TrimSpace(asString(m["mode"])),
 					MaxTurns: maxTurns,
 					Timeout:  timeout,
@@ -450,8 +471,9 @@ func (r *agentRuntime) newSubagentDispatchTool() *ab.Tool {
 				summaries = append(summaries, entry)
 			}
 			out, err := json.Marshal(map[string]any{
-				"count":   len(summaries),
-				"results": summaries,
+				"count":         len(summaries),
+				"results":       summaries,
+				"files_created": tracker.collected(),
 			})
 			if err != nil {
 				return "", fmt.Errorf("marshal subagent results: %w", err)
@@ -479,4 +501,66 @@ func isTimeoutError(err error) bool {
 		return true
 	}
 	return strings.Contains(strings.ToLower(err.Error()), "deadline exceeded")
+}
+
+// fileWriteTracker records file writes made during subagent execution so
+// the parent stream handler can emit them as artifacts.
+type fileWriteTracker struct {
+	mu    sync.Mutex
+	files []trackedFile
+}
+
+type trackedFile struct {
+	Path    string `json:"path"`
+	Content string `json:"content"`
+}
+
+func (t *fileWriteTracker) record(path, content string) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.files = append(t.files, trackedFile{Path: path, Content: content})
+}
+
+func (t *fileWriteTracker) collected() []trackedFile {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	out := make([]trackedFile, len(t.files))
+	copy(out, t.files)
+	return out
+}
+
+// newTrackedFileWriteTool is like newFileWriteTool but also records writes to a tracker.
+func (r *agentRuntime) newTrackedFileWriteTool(chatID int64, tracker *fileWriteTracker) *ab.Tool {
+	mgr := getSandboxManager()
+	return &ab.Tool{
+		Name:        "file_write",
+		Description: "Write a file to the sandbox filesystem. The file persists across turns and can be read, executed, or served by subsequent tool calls. Use for: saving scripts, data files, HTML pages, config files.",
+		Category:    ab.ToolCategoryWorkspace,
+		Parameters: ab.ToolFuncParams{
+			Type: "object",
+			Properties: map[string]ab.ToolParam{
+				"path":    {Type: "string", Description: "Absolute or relative file path (e.g. /workspace/script.py or data.csv)."},
+				"content": {Type: "string", Description: "File content to write."},
+			},
+			Required: []string{"path", "content"},
+		},
+		Execute: func(ctx context.Context, _ string, args map[string]any) (string, error) {
+			path := strings.TrimSpace(asString(args["path"]))
+			content := asString(args["content"])
+			if path == "" {
+				return "", fmt.Errorf("path is required")
+			}
+
+			sbID, err := mgr.getOrCreateSandbox(ctx, chatID)
+			if err != nil {
+				return "", fmt.Errorf("sandbox unavailable: %w", err)
+			}
+
+			if err := mgr.driver.WriteFile(ctx, sbID, path, content); err != nil {
+				return "", fmt.Errorf("write file: %w", err)
+			}
+			tracker.record(path, content)
+			return fmt.Sprintf("file written: %s (%d bytes)", path, len(content)), nil
+		},
+	}
 }

@@ -177,4 +177,133 @@ func mapOllamaDone(s string) string {
 	}
 }
 
-var _ autobuild.LLMProvider = (*Ollama)(nil)
+// ChatStream implements StreamingLLMProvider for Ollama.
+// Ollama natively supports streaming via NDJSON — each line is a JSON object
+// with a "message.content" delta and a "done" boolean.
+func (o *Ollama) ChatStream(ctx context.Context, req autobuild.ChatRequest) (<-chan autobuild.StreamEvent, error) {
+	model := req.Model
+	if model == "" {
+		model = o.DefaultModel
+	}
+	if model == "" {
+		return nil, fmt.Errorf("ollama: Model is required")
+	}
+
+	body, err := buildOllamaRequest(model, req, true)
+	if err != nil {
+		return nil, err
+	}
+
+	httpReq, err := http.NewRequestWithContext(ctx, "POST",
+		o.BaseURL+"/api/chat", bytes.NewReader(body))
+	if err != nil {
+		return nil, err
+	}
+	httpReq.Header.Set("Content-Type", "application/json")
+
+	resp, err := o.Client.Do(httpReq)
+	if err != nil {
+		return nil, fmt.Errorf("ollama: http: %w", err)
+	}
+	if resp.StatusCode >= 400 {
+		errBody, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		return nil, fmt.Errorf("ollama: %d: %s", resp.StatusCode, string(errBody))
+	}
+
+	out := make(chan autobuild.StreamEvent, 32)
+	go func() {
+		defer close(out)
+		defer resp.Body.Close()
+		readOllamaStream(ctx, resp.Body, out)
+	}()
+	return out, nil
+}
+
+// buildOllamaRequest mirrors what Chat sends, optionally streaming.
+func buildOllamaRequest(model string, req autobuild.ChatRequest, stream bool) ([]byte, error) {
+	msgs := make([]map[string]any, 0, len(req.Messages))
+	for _, m := range req.Messages {
+		msg := map[string]any{
+			"role":    string(m.Role),
+			"content": m.Content,
+		}
+		if len(m.Images) > 0 {
+			imgs := make([]string, 0, len(m.Images))
+			for _, img := range m.Images {
+				if img.Source != "" {
+					imgs = append(imgs, img.Source)
+				}
+			}
+			if len(imgs) > 0 {
+				msg["images"] = imgs
+			}
+		}
+		msgs = append(msgs, msg)
+	}
+	body := map[string]any{
+		"model":    model,
+		"messages": msgs,
+		"stream":   stream,
+	}
+	if req.Temperature > 0 {
+		body["options"] = map[string]any{"temperature": req.Temperature}
+	}
+	return json.Marshal(body)
+}
+
+// readOllamaStream parses NDJSON and emits StreamEvents.
+func readOllamaStream(ctx context.Context, body io.Reader, out chan<- autobuild.StreamEvent) {
+	dec := json.NewDecoder(body)
+	for {
+		select {
+		case <-ctx.Done():
+			out <- autobuild.StreamEvent{Type: autobuild.StreamEventError, Error: ctx.Err()}
+			return
+		default:
+		}
+		var chunk struct {
+			Message struct {
+				Content string `json:"content"`
+			} `json:"message"`
+			Done            bool   `json:"done"`
+			DoneReason      string `json:"done_reason"`
+			PromptEvalCount int    `json:"prompt_eval_count"`
+			EvalCount       int    `json:"eval_count"`
+		}
+		if err := dec.Decode(&chunk); err != nil {
+			if err == io.EOF {
+				break
+			}
+			out <- autobuild.StreamEvent{
+				Type:  autobuild.StreamEventError,
+				Error: fmt.Errorf("ollama stream decode: %w", err),
+			}
+			return
+		}
+		if chunk.Message.Content != "" {
+			out <- autobuild.StreamEvent{
+				Type:  autobuild.StreamEventDelta,
+				Delta: chunk.Message.Content,
+			}
+		}
+		if chunk.Done {
+			out <- autobuild.StreamEvent{
+				Type: autobuild.StreamEventDone,
+				Final: &autobuild.AgentLoopResult{
+					TotalUsage: autobuild.TokenUsage{
+						PromptTokens:     chunk.PromptEvalCount,
+						CompletionTokens: chunk.EvalCount,
+						TotalTokens:      chunk.PromptEvalCount + chunk.EvalCount,
+					},
+				},
+			}
+			return
+		}
+	}
+}
+
+var (
+	_ autobuild.LLMProvider          = (*Ollama)(nil)
+	_ autobuild.StreamingLLMProvider = (*Ollama)(nil)
+)

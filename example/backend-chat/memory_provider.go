@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 
 	ab "github.com/everfaz/autobuild-sdk"
+	sdkembedders "github.com/everfaz/autobuild-sdk/providers/embedders"
 	sdkmemory "github.com/everfaz/autobuild-sdk/providers/memory"
 )
 
@@ -41,8 +42,19 @@ func loadBackendMemory() (ab.MemoryProvider, []ab.MemoryRoot, error) {
 		return nil, nil, fmt.Errorf("layered filesystem memory: %w", err)
 	}
 
-	log.Printf("backend memory: root=%s (BM25 search, layered)", root)
-	return provider, ab.DefaultMemoryRoots, nil
+	// Wrap with Hybrid search (BM25 + vector via RRF)
+	var mem ab.MemoryProvider = provider
+	if apiKey := os.Getenv("VOYAGE_API_KEY"); apiKey != "" {
+		embedder := sdkembedders.NewVoyage(apiKey, "voyage-3")
+		mem = ab.NewHybridMemorySearch(provider, embedder)
+		log.Printf("backend memory: root=%s (hybrid BM25+Voyage search)", root)
+	} else {
+		embedder := sdkembedders.NewLocal(384)
+		mem = ab.NewHybridMemorySearch(provider, embedder)
+		log.Printf("backend memory: root=%s (hybrid BM25+local-embedder search)", root)
+	}
+
+	return mem, ab.DefaultMemoryRoots, nil
 }
 
 // resolveMemoryRoot finds or creates the memory directory.

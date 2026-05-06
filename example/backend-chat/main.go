@@ -14,6 +14,7 @@ import (
 	"time"
 
 	ab "github.com/everfaz/autobuild-sdk"
+	sdkthread "github.com/everfaz/autobuild-sdk/providers/thread"
 )
 
 func main() {
@@ -60,6 +61,15 @@ func main() {
 		app.multi = multi
 	}
 
+	// Thread provider (SQLite-backed, multi-user isolation)
+	threadProvider, err := sdkthread.OpenSQLite(db)
+	if err != nil {
+		log.Printf("thread provider unavailable: %v", err)
+	} else {
+		app.threads = threadProvider
+		log.Printf("backend-chat thread provider: SQLite")
+	}
+
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", app.handleHealth)
 	mux.HandleFunc("/api/modes", app.handleModes)
@@ -67,6 +77,8 @@ func main() {
 	mux.HandleFunc("/api/chats", app.handleChats)
 	mux.HandleFunc("/api/chats/", app.handleChatRoutes)
 	mux.HandleFunc("/admin/eval", app.handleEval)
+	mux.HandleFunc("/api/threads", app.handleThreads)
+	mux.HandleFunc("/api/threads/", app.handleThreadRoutes)
 	app.registerArtifactRoutes(mux)
 
 	log.Printf("backend-chat listening on %s", addr)
@@ -82,6 +94,7 @@ type BackendChatApp struct {
 	llm       ab.LLMProvider
 	multi     *ab.RoutedLLMProvider
 	modes     ab.ModeProvider
+	threads   ab.ThreadProvider
 	modelName string
 }
 
@@ -355,35 +368,13 @@ func (a *BackendChatApp) handleMessages(w http.ResponseWriter, r *http.Request, 
 	}
 }
 
-func payloadString(payload map[string]any, key string) string {
-	if payload == nil {
-		return ""
-	}
-	value, ok := payload[key]
-	if !ok || value == nil {
-		return ""
-	}
-	text := strings.TrimSpace(fmt.Sprintf("%v", value))
-	if text == "" || text == "<nil>" {
-		return ""
-	}
-	return text
-}
 
-func firstNonEmpty(values ...string) string {
-	for _, value := range values {
-		if strings.TrimSpace(value) != "" {
-			return value
-		}
-	}
-	return ""
-}
 
 func newRunID() string {
 	return fmt.Sprintf("run_%d", time.Now().UnixNano())
 }
 
-// handleStream is the real-time streaming counterpart of handleRun.
+// handleStream is the real-time streaming endpoint for LLM generation.
 // Uses Server-Sent Events to push token deltas as the LLM generates them.
 //
 // POST /api/chats/:id/stream
@@ -481,7 +472,7 @@ func (a *BackendChatApp) handleStream(w http.ResponseWriter, r *http.Request, ch
 	logContext := RuntimeLogContext{ChatID: chatID, RunID: runID, Mode: strings.TrimSpace(req.Mode)}
 	log.Printf("stream.start chat_id=%d run_id=%s model=%s", chatID, runID, effectiveModel)
 
-	_, agentRT, err := newModeEngineWithDB(a.llm, effectiveModel, logContext, a.db)
+	_, agentRT, err := newModeEngineWithDB(a.llm, effectiveModel, logContext, a.db, a.threads)
 	if err != nil {
 		d, _ := json.Marshal(map[string]string{"error": err.Error()})
 		sseWrite("error", string(d))
@@ -519,6 +510,12 @@ func (a *BackendChatApp) handleStream(w http.ResponseWriter, r *http.Request, ch
 			fullResponse.WriteString(ev.Delta)
 			d, _ := json.Marshal(map[string]string{"delta": ev.Delta})
 			sseWrite("delta", string(d))
+
+		case ab.StreamEventThinking:
+			if ev.Thinking != "" {
+				d, _ := json.Marshal(map[string]string{"thinking": ev.Thinking})
+				sseWrite("thinking", string(d))
+			}
 
 		case ab.StreamEventToolCall:
 			if ev.ToolCall != nil {
@@ -583,6 +580,70 @@ func (a *BackendChatApp) handleStream(w http.ResponseWriter, r *http.Request, ch
 						sseWrite("sandbox_output", string(sbJSON))
 					}
 				}
+
+				// Extract files created by subagents so they appear as artifacts
+				if ev.ToolResult.Name == "dispatch-subagents" && ev.ToolResult.Error == nil {
+					var dispatchResult struct {
+						FilesCreated []struct {
+							Path    string `json:"path"`
+							Content string `json:"content"`
+						} `json:"files_created"`
+					}
+					if json.Unmarshal([]byte(ev.ToolResult.Content), &dispatchResult) == nil {
+						for _, f := range dispatchResult.FilesCreated {
+							if f.Path != "" && f.Content != "" {
+								streamMeta.Artifacts = append(streamMeta.Artifacts, MetadataArtifact{
+									Path:     f.Path,
+									Language: inferLangFromPath(f.Path),
+									Content:  f.Content,
+								})
+							}
+						}
+					}
+				}
+			}
+
+		case ab.StreamEventPlanProposed:
+			if ev.Plan != nil {
+				executables := make([]map[string]any, 0, len(ev.Plan.Executables))
+				for _, exec := range ev.Plan.Executables {
+					executables = append(executables, map[string]any{
+						"id":           exec.ID,
+						"name":         exec.Name,
+						"description":  exec.Description,
+						"dependencies": exec.Dependencies,
+						"status":       string(exec.Status),
+					})
+				}
+				d, _ := json.Marshal(map[string]any{
+					"id":          ev.Plan.ID,
+					"title":       ev.Plan.Title,
+					"objective":   ev.Plan.Objective,
+					"executables": executables,
+				})
+				sseWrite("plan_proposed", string(d))
+				log.Printf("stream.plan_proposed chat_id=%d run_id=%s executables=%d",
+					chatID, runID, len(ev.Plan.Executables))
+			}
+
+		case ab.StreamEventSubagentResult:
+			if ev.SubagentResult != nil {
+				errMsg := ""
+				if ev.SubagentResult.Error != nil {
+					errMsg = ev.SubagentResult.Error.Error()
+				}
+				d, _ := json.Marshal(map[string]any{
+					"id":          ev.SubagentResult.ID,
+					"task":        ev.SubagentResult.Task,
+					"output":      ev.SubagentResult.Output,
+					"turns":       ev.SubagentResult.Turns,
+					"stop_reason": ev.SubagentResult.StopReason,
+					"duration_ms": ev.SubagentResult.Duration.Milliseconds(),
+					"error":       errMsg,
+				})
+				sseWrite("subagent_result", string(d))
+				log.Printf("stream.subagent_result chat_id=%d run_id=%s agent_id=%s",
+					chatID, runID, ev.SubagentResult.ID)
 			}
 
 		case ab.StreamEventDone:
@@ -636,7 +697,7 @@ func withCORS(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Access-Control-Allow-Origin", "*")
 		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
-		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS")
 		if r.Method == http.MethodOptions {
 			w.WriteHeader(http.StatusNoContent)
 			return
@@ -678,7 +739,11 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 
 func writeErr(w http.ResponseWriter, status int, err error) {
 	log.Printf("request failed status=%d error=%v", status, err)
-	writeJSON(w, status, map[string]any{"error": err.Error()})
+	message := "request failed"
+	if err != nil {
+		message = err.Error()
+	}
+	writeJSON(w, status, map[string]any{"error": message})
 }
 
 func getenv(key, fallback string) string {
