@@ -85,6 +85,7 @@ export interface StreamSandboxOutput {
 
 export type StreamEvent =
   | { type: "delta"; data: { delta?: string } }
+  | { type: "thinking"; data: { thinking?: string } }
   | { type: "tool_call"; data: StreamToolCall }
   | { type: "tool_result"; data: StreamToolResult }
   | { type: "sandbox_output"; data: StreamSandboxOutput }
@@ -119,7 +120,7 @@ export interface ArtifactRecord {
   language: string
   title: string
   createdAt: string
-  versions?: ArtifactVersion[]
+  versions?: Array<ArtifactVersion>
 }
 
 export interface ArtifactStorageResponse {
@@ -130,4 +131,17 @@ export interface ArtifactStorageResponse {
 
 export interface StreamCallbacks {
   onEvent: (event: StreamEvent) => void
+}
+
+// ── Thread types ──────────────────────────────────────────────────────────────
+
+export type ThreadStatus = "active" | "completed" | "failed" | "archived"
+
+export interface Thread {
+  id: string
+  user_id?: string
+  project_id?: string
+  mode_id?: string
+  status: ThreadStatus
+  parent_id?: string
 }

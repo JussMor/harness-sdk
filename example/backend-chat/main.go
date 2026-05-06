@@ -14,6 +14,7 @@ import (
 	"time"
 
 	ab "github.com/everfaz/autobuild-sdk"
+	sdkthread "github.com/everfaz/autobuild-sdk/providers/thread"
 )
 
 func main() {
@@ -60,6 +61,15 @@ func main() {
 		app.multi = multi
 	}
 
+	// Thread provider (SQLite-backed, multi-user isolation)
+	threadProvider, err := sdkthread.OpenSQLite(db)
+	if err != nil {
+		log.Printf("thread provider unavailable: %v", err)
+	} else {
+		app.threads = threadProvider
+		log.Printf("backend-chat thread provider: SQLite")
+	}
+
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", app.handleHealth)
 	mux.HandleFunc("/api/modes", app.handleModes)
@@ -67,6 +77,8 @@ func main() {
 	mux.HandleFunc("/api/chats", app.handleChats)
 	mux.HandleFunc("/api/chats/", app.handleChatRoutes)
 	mux.HandleFunc("/admin/eval", app.handleEval)
+	mux.HandleFunc("/api/threads", app.handleThreads)
+	mux.HandleFunc("/api/threads/", app.handleThreadRoutes)
 	app.registerArtifactRoutes(mux)
 
 	log.Printf("backend-chat listening on %s", addr)
@@ -82,6 +94,7 @@ type BackendChatApp struct {
 	llm       ab.LLMProvider
 	multi     *ab.RoutedLLMProvider
 	modes     ab.ModeProvider
+	threads   ab.ThreadProvider
 	modelName string
 }
 
@@ -519,6 +532,12 @@ func (a *BackendChatApp) handleStream(w http.ResponseWriter, r *http.Request, ch
 			fullResponse.WriteString(ev.Delta)
 			d, _ := json.Marshal(map[string]string{"delta": ev.Delta})
 			sseWrite("delta", string(d))
+
+		case ab.StreamEventThinking:
+			if ev.Thinking != "" {
+				d, _ := json.Marshal(map[string]string{"thinking": ev.Thinking})
+				sseWrite("thinking", string(d))
+			}
 
 		case ab.StreamEventToolCall:
 			if ev.ToolCall != nil {

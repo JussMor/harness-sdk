@@ -14,7 +14,9 @@ import type {
 } from "@/features/chat/types"
 import {
   Bot,
+  Brain,
   Check,
+  ChevronDown,
   Copy,
   LoaderCircle,
   RefreshCw,
@@ -37,6 +39,7 @@ export interface ChatMessage {
   role: "user" | "assistant"
   model?: string
   pending?: boolean
+  thinking?: string
   traces?: Array<ToolTrace>
 }
 
@@ -267,6 +270,19 @@ export function ChatMain({
         return
       }
 
+      if (event.type === "thinking") {
+        const thinking = event.data.thinking || ""
+        if (!thinking) return
+        setMessages((prev) =>
+          prev.map((message) =>
+            message.id === pendingAssistantId
+              ? { ...message, thinking: (message.thinking || "") + thinking }
+              : message
+          )
+        )
+        return
+      }
+
       if (event.type === "tool_call") {
         const toolName = event.data.name || "unknown_tool"
         const traceId = `trace-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`
@@ -390,16 +406,19 @@ export function ChatMain({
         // Fetch the persisted message from the backend and replace the local
         // in-memory message with it. This ensures tool traces from metadata
         // are correctly restored and nothing is lost after stream ends.
-        api.listMessages(chatID).then((msgs) => {
-          const saved = msgs.find((m) => m.id === messageId)
-          if (!saved) return
-          const restored = toChatMessage(saved)
-          setMessages((prev) =>
-            prev.map((m) => (m.id === pendingAssistantId ? restored : m))
-          )
-        }).catch(() => {
-          // Non-fatal — in-memory message already has the content
-        })
+        api
+          .listMessages(chatID)
+          .then((msgs) => {
+            const saved = msgs.find((m) => m.id === messageId)
+            if (!saved) return
+            const restored = toChatMessage(saved)
+            setMessages((prev) =>
+              prev.map((m) => (m.id === pendingAssistantId ? restored : m))
+            )
+          })
+          .catch(() => {
+            // Non-fatal — in-memory message already has the content
+          })
         return
       }
     },
@@ -625,18 +644,34 @@ export function ChatMain({
                     ))}
                   </div>
                 )}
+                {message.thinking && (
+                  <ThinkingBlock
+                    content={message.thinking}
+                    isStreaming={!!message.pending}
+                  />
+                )}
                 <MessageContent message={message} />
                 {/* Actions row — only for complete assistant messages */}
-                {message.role === "assistant" && !message.pending && !isStreaming && (
-                  <MessageActions content={message.content} onRetry={() => {
-                    const idx = messages.findIndex(m => m.id === message.id)
-                    const prev = messages.slice(0, idx).reverse().find(m => m.role === "user")
-                    if (prev) {
-                      setInput(prev.content)
-                      setTimeout(() => void sendPrompt(), 0)
-                    }
-                  }} />
-                )}
+                {message.role === "assistant" &&
+                  !message.pending &&
+                  !isStreaming && (
+                    <MessageActions
+                      content={message.content}
+                      onRetry={() => {
+                        const idx = messages.findIndex(
+                          (m) => m.id === message.id
+                        )
+                        const prev = messages
+                          .slice(0, idx)
+                          .reverse()
+                          .find((m) => m.role === "user")
+                        if (prev) {
+                          setInput(prev.content)
+                          setTimeout(() => void sendPrompt(), 0)
+                        }
+                      }}
+                    />
+                  )}
               </article>
             ))}
             <div ref={listEndRef} />
@@ -857,11 +892,13 @@ function MessageContent({ message }: { message: ChatMessage }) {
             const isBlock = code.includes("\n") || !!lang
 
             if (!isBlock) {
-              return <code className="chat-inline-code" {...props}>{children}</code>
+              return (
+                <code className="chat-inline-code" {...props}>
+                  {children}
+                </code>
+              )
             }
-            return (
-              <CodeBlock lang={lang} code={code} />
-            )
+            return <CodeBlock lang={lang} code={code} />
           },
           // Links open in new tab
           a({ href, children }) {
@@ -964,6 +1001,38 @@ function MessageActions({
       >
         <ThumbsDown size={13} />
       </button>
+    </div>
+  )
+}
+
+// ── ThinkingBlock ─────────────────────────────────────────────────────────────
+// Collapsible display of extended thinking content from deep-work mode.
+
+function ThinkingBlock({
+  content,
+  isStreaming,
+}: {
+  content: string
+  isStreaming: boolean
+}) {
+  const [expanded, setExpanded] = useState(false)
+
+  return (
+    <div className="chat-thinking-block">
+      <button
+        type="button"
+        className="chat-thinking-toggle"
+        onClick={() => setExpanded(!expanded)}
+      >
+        <Brain size={14} className="chat-thinking-icon" />
+        <span>{isStreaming ? "Thinking..." : "Thought process"}</span>
+        {isStreaming && <LoaderCircle className="spin" size={12} />}
+        <ChevronDown
+          size={14}
+          className={`chat-thinking-chevron ${expanded ? "chat-thinking-chevron--open" : ""}`}
+        />
+      </button>
+      {expanded && <pre className="chat-thinking-content">{content}</pre>}
     </div>
   )
 }

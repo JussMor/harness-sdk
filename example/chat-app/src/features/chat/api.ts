@@ -1,14 +1,16 @@
 import type {
-    ArtifactRecord,
-    ArtifactStorageResponse,
-    ArtifactVersion,
-    BackendChat,
-    BackendMessage,
-    ChatMode,
-    ProvidersResponse,
-    StreamCallbacks,
-    StreamEvent,
-    StreamRequest,
+  ArtifactRecord,
+  ArtifactStorageResponse,
+  ArtifactVersion,
+  BackendChat,
+  BackendMessage,
+  ChatMode,
+  ProvidersResponse,
+  StreamCallbacks,
+  StreamEvent,
+  StreamRequest,
+  Thread,
+  ThreadStatus,
 } from "@/features/chat/types"
 
 function trimTrailingSlash(value: string): string {
@@ -115,7 +117,12 @@ export class ChatAPI {
 
   async createArtifact(
     chatId: number,
-    payload: { language: string; title?: string; content: string; messageId?: number }
+    payload: {
+      language: string
+      title?: string
+      content: string
+      messageId?: number
+    }
   ): Promise<ArtifactRecord> {
     const r = await fetch(`${this.baseURL}/api/chats/${chatId}/artifacts`, {
       method: "POST",
@@ -130,12 +137,18 @@ export class ChatAPI {
     return readJSON<ArtifactRecord>(r)
   }
 
-  async addArtifactVersion(artifactId: string, content: string): Promise<ArtifactVersion> {
-    const r = await fetch(`${this.baseURL}/api/artifacts/${artifactId}/versions`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ content }),
-    })
+  async addArtifactVersion(
+    artifactId: string,
+    content: string
+  ): Promise<ArtifactVersion> {
+    const r = await fetch(
+      `${this.baseURL}/api/artifacts/${artifactId}/versions`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ content }),
+      }
+    )
     return readJSON<ArtifactVersion>(r)
   }
 
@@ -146,7 +159,9 @@ export class ChatAPI {
   ): Promise<ArtifactStorageResponse> {
     const params = new URLSearchParams({ shared: String(shared) })
     if (userId) params.set("userId", userId)
-    const r = await fetch(`${this.baseURL}/api/artifacts/${artifactId}/storage?${params}`)
+    const r = await fetch(
+      `${this.baseURL}/api/artifacts/${artifactId}/storage?${params}`
+    )
     return readJSON<ArtifactStorageResponse>(r)
   }
 
@@ -172,7 +187,47 @@ export class ChatAPI {
   ): Promise<void> {
     const params = new URLSearchParams({ shared: String(shared) })
     if (userId) params.set("userId", userId)
-    await fetch(`${this.baseURL}/api/artifacts/${artifactId}/storage/${key}?${params}`, {
+    await fetch(
+      `${this.baseURL}/api/artifacts/${artifactId}/storage/${key}?${params}`,
+      {
+        method: "DELETE",
+      }
+    )
+  }
+
+  // ── Thread endpoints ──────────────────────────────────────────────────────────────
+
+  async createThread(opts: {
+    userId?: string
+    projectId?: string
+    modeId?: string
+  }): Promise<Thread> {
+    const r = await fetch(`${this.baseURL}/api/threads`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(opts),
+    })
+    return readJSON<Thread>(r)
+  }
+
+  async listThreads(
+    userId: string,
+    status?: ThreadStatus,
+    signal?: AbortSignal
+  ): Promise<Array<Thread>> {
+    const params = new URLSearchParams({ user: userId })
+    if (status) params.set("status", status)
+    const r = await fetch(`${this.baseURL}/api/threads?${params}`, { signal })
+    return readJSON<Array<Thread>>(r)
+  }
+
+  async getThread(threadId: string): Promise<Thread> {
+    const r = await fetch(`${this.baseURL}/api/threads/${threadId}`)
+    return readJSON<Thread>(r)
+  }
+
+  async archiveThread(threadId: string): Promise<void> {
+    await fetch(`${this.baseURL}/api/threads/${threadId}`, {
       method: "DELETE",
     })
   }
@@ -225,6 +280,8 @@ function parseChunk(chunk: string): StreamEvent | null {
   switch (type) {
     case "delta":
       return { type: "delta", data: parsed as { delta?: string } }
+    case "thinking":
+      return { type: "thinking", data: parsed as { thinking?: string } }
     case "tool_call":
       return {
         type: "tool_call",
@@ -239,6 +296,18 @@ function parseChunk(chunk: string): StreamEvent | null {
       return {
         type: "sandbox_output",
         data: parsed as Record<string, unknown>,
+      }
+    case "artifact":
+      return {
+        type: "artifact",
+        data: parsed as {
+          id: string
+          language: string
+          title: string
+          version: number
+          content: string
+          r2Url?: string
+        },
       }
     case "done":
       return {

@@ -997,3 +997,31 @@
 .chat-action-divider {
   @apply w-px h-4 bg-zinc-200 mx-1;
 }
+
+/* ── Thinking block (extended thinking / deep-work) ──────────────────────── */
+
+.chat-thinking-block {
+  @apply my-2 rounded-lg border border-amber-200 bg-amber-50/50 overflow-hidden;
+}
+
+.chat-thinking-toggle {
+  @apply flex items-center gap-2 w-full px-3 py-2 text-xs font-medium text-amber-700
+    hover:bg-amber-100/50 transition-colors cursor-pointer border-none bg-transparent;
+}
+
+.chat-thinking-icon {
+  @apply text-amber-500;
+}
+
+.chat-thinking-chevron {
+  @apply ml-auto transition-transform text-amber-400;
+}
+
+.chat-thinking-chevron--open {
+  @apply rotate-180;
+}
+
+.chat-thinking-content {
+  @apply px-3 pb-3 text-xs text-amber-900/80 whitespace-pre-wrap font-mono
+    max-h-64 overflow-y-auto border-t border-amber-200/60 pt-2;
+}

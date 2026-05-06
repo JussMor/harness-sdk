@@ -3,10 +3,14 @@ package main
 import (
 	"context"
 	"database/sql"
+	"log"
+	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 
 	ab "github.com/everfaz/autobuild-sdk"
+	sdktokenizers "github.com/everfaz/autobuild-sdk/providers/tokenizers"
 )
 
 // newModeEngine builds a fully-wired agentRuntime using the SDK Runtime.
@@ -105,10 +109,11 @@ func newModeEngineWithDB(provider ab.LLMProvider, model string, logContext Runti
 		WithOutputFilter(ab.NewOutputFilterChain(
 			ab.DefaultSecretRedactionFilter(),
 		)).
-		// Verification: lightweight local check (no extra LLM call)
+		// Verification: lightweight local check + intrinsic self-check markers
 		WithVerification(ab.VerificationChain{Strategies: []ab.VerificationStrategy{
 			ab.LocalVerification{MustNotBeEmpty: true, MinLength: 5, NoHallucination: true},
 			ab.CompletionVerification{MinLength: 5},
+			ab.IntrinsicVerification{MinMarkers: 1},
 		}}).
 		WithMaxVerifyRetry(1).
 		// Compaction: episodic — preserves key decisions, summarizes the rest
@@ -128,16 +133,28 @@ func newModeEngineWithDB(provider ab.LLMProvider, model string, logContext Runti
 		// Planning: LLM-driven decision + executable DAG proposal
 		WithPlanner(&ab.LLMPlanner{Provider: provider, Model: model, MaxExecutables: 6}).
 		WithAutoApprovePlan(true).
+		// Extended thinking for deep-work mode
+		WithThinkingBudget(resolveThinkingBudget(logContext.Mode)).
 		// Session context: inject time every turn
 		WithSessionContext(ab.LocalTimeSessionContext()).
-		// Tokenizer: Claude-tuned heuristic (swap for tiktoken in production)
-		WithTokenizer(&claudeTokenizerAdapter{}).
+		// Tokenizer: auto-selects per model (gpt-4o→O200K, gpt-4→CL100K, claude→heuristic)
+		WithTokenizer(sdktokenizers.NewAutoForModel(model)).
 		// Persistence: SQLite conversation store
 		WithConversationStore(convStore).
 		// Wellbeing detection
 		WithWellbeing(ab.DefaultWellbeingDetector{})
 
 	rt.runtime = runtime
+
+	// Skill hot-reload: watch skills directory for changes
+	if reloadable, ok := skills.(ab.ReloadableSkillProvider); ok {
+		reloader := ab.NewSkillReloader("./skills", reloadable)
+		reloader.SetOnReload(func(loaded, removed []string) {
+			log.Printf("skills reloaded: +%v -%v", loaded, removed)
+		})
+		reloader.Start(context.Background())
+	}
+
 	return engine, rt, nil
 }
 
@@ -161,45 +178,20 @@ func (p *inMemoryCheckpointProvider) List(_ context.Context) ([]*ab.Checkpoint, 
 	return nil, nil // lightweight — no persistence needed for checkpoints
 }
 
-// ── Tokenizer adapter ─────────────────────────────────────────────────────────
+// ── Thinking budget ───────────────────────────────────────────────────────────
 
-// claudeTokenizerAdapter uses the ClaudeTokenizer from providers/tokenizers.
-// Inline implementation to avoid cross-module import.
-type claudeTokenizerAdapter struct{}
-
-func (claudeTokenizerAdapter) Count(text string) int {
-	if text == "" {
+// resolveThinkingBudget returns the thinking token budget for the given mode.
+// Only deep-work mode enables extended thinking. Override via THINKING_BUDGET env var.
+func resolveThinkingBudget(mode string) int {
+	if strings.ToLower(strings.TrimSpace(mode)) != "deep-work" {
 		return 0
 	}
-	// Claude-tuned heuristic: words*1.3 + specials*0.4 + nonASCII*0.6
-	words := 0
-	inWord := false
-	specials := 0
-	nonASCII := 0
-	for _, r := range text {
-		switch {
-		case r > 127:
-			nonASCII++
-			inWord = false
-		case r == ' ' || r == '\t':
-			inWord = false
-		case r == '\n':
-			specials++
-			inWord = false
-		case r == '{' || r == '}' || r == '[' || r == ']' || r == '(' || r == ')':
-			specials++
-			inWord = false
-		case r == ',' || r == ';' || r == ':' || r == '"' || r == '\'':
-			specials++
-			inWord = false
-		default:
-			if !inWord {
-				words++
-				inWord = true
-			}
+	if env := os.Getenv("THINKING_BUDGET"); env != "" {
+		if n, err := strconv.Atoi(env); err == nil && n >= 1024 {
+			return n
 		}
 	}
-	return int(float64(words)*1.3 + float64(specials)*0.4 + float64(nonASCII)*0.6)
+	return 10_000
 }
 
 // ── Mode loader ───────────────────────────────────────────────────────────────
