@@ -72,14 +72,58 @@ var layerOrder = []SystemPromptLayer{
 //	builder.Set(LayerSkills, skill1.Content+"\n\n"+skill2.Content)
 //	prompt := builder.Build()
 type SystemPromptBuilder struct {
-	layers map[SystemPromptLayer]string
+	layers         map[SystemPromptLayer]string
+	maxLayerTokens map[SystemPromptLayer]int // per-layer token caps; 0 = unlimited
 }
 
 // NewSystemPromptBuilder returns an empty builder.
 func NewSystemPromptBuilder() *SystemPromptBuilder {
 	return &SystemPromptBuilder{
-		layers: make(map[SystemPromptLayer]string),
+		layers:         make(map[SystemPromptLayer]string),
+		maxLayerTokens: make(map[SystemPromptLayer]int),
 	}
+}
+
+// SetMaxLayerTokens caps the token count for a specific layer.
+// When Build() is called with a tokenizer, layers exceeding their cap are
+// truncated before concatenation. This prevents LayerSkills from exploding
+// the system prompt when many skills are loaded simultaneously.
+//
+// Example — cap skills to 4k tokens:
+//
+//	builder.SetMaxLayerTokens(LayerSkills, 4000)
+//	builder.SetMaxLayerTokens(LayerMemory, 8000)
+func (b *SystemPromptBuilder) SetMaxLayerTokens(layer SystemPromptLayer, maxTokens int) {
+	b.maxLayerTokens[layer] = maxTokens
+}
+
+// Build assembles all non-empty layers into a single system prompt string.
+// Layers are separated by a blank line and injected in canonical order.
+// No token enforcement — use BuildWithBudget for token-aware assembly.
+func (b *SystemPromptBuilder) Build() string {
+	return b.BuildWithBudget(nil)
+}
+
+// BuildWithBudget assembles layers like Build, but enforces per-layer token
+// caps set via SetMaxLayerTokens. If tok is nil, falls back to Build behavior.
+func (b *SystemPromptBuilder) BuildWithBudget(tok Tokenizer) string {
+	var parts []string
+	for _, layer := range layerOrder {
+		content := strings.TrimSpace(b.layers[layer])
+		if content == "" {
+			continue
+		}
+		// Apply per-layer token cap if configured and tokenizer is available
+		if tok != nil {
+			if cap := b.maxLayerTokens[layer]; cap > 0 {
+				if tok.Count(content) > cap {
+					content = TruncateToTokens(content, cap, tok)
+				}
+			}
+		}
+		parts = append(parts, content)
+	}
+	return strings.Join(parts, "\n\n")
 }
 
 // Get returns the content for a layer. Empty if not set.
@@ -111,20 +155,6 @@ func (b *SystemPromptBuilder) Append(layer SystemPromptLayer, content string) {
 // Clear removes a layer from the prompt.
 func (b *SystemPromptBuilder) Clear(layer SystemPromptLayer) {
 	delete(b.layers, layer)
-}
-
-// Build assembles all non-empty layers into a single system prompt string.
-// Layers are separated by a blank line and injected in canonical order.
-func (b *SystemPromptBuilder) Build() string {
-	var parts []string
-	for _, layer := range layerOrder {
-		content := strings.TrimSpace(b.layers[layer])
-		if content == "" {
-			continue
-		}
-		parts = append(parts, content)
-	}
-	return strings.Join(parts, "\n\n")
 }
 
 // ── Default behavior layer ───────────────────────────────────────────────────

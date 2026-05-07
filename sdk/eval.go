@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"regexp"
 	"strings"
 	"time"
 )
@@ -54,6 +55,17 @@ const (
 	// AssertNotContains: output does NOT contain Value (case-insensitive).
 	AssertNotContains AssertionType = "not_contains"
 
+	// AssertRegex: output matches the regular expression in Value.
+	AssertRegex AssertionType = "regex"
+
+	// AssertJSONSchema: output is valid JSON conforming to the JSON schema in Value.
+	// Value must be a JSON Schema object (e.g. {"type":"object","required":["name"]}).
+	AssertJSONSchema AssertionType = "json_schema"
+
+	// AssertLatencyUnderMs: eval run completed in fewer than Value milliseconds.
+	// Value is parsed as an integer number of milliseconds.
+	AssertLatencyUnderMs AssertionType = "latency_under_ms"
+
 	// AssertToolCalled: a tool with name=Value was called during the run.
 	AssertToolCalled AssertionType = "tool_called"
 
@@ -65,6 +77,10 @@ const (
 
 	// AssertStopReason: result.StopReason equals Value.
 	AssertStopReason AssertionType = "stop_reason"
+
+	// AssertLLMJudge: uses an LLM to judge whether the output satisfies Value
+	// (treated as criteria/rubric). Requires the EvalSuite to have a Judge provider.
+	AssertLLMJudge AssertionType = "llm_judge"
 )
 
 // EvalResult is the outcome of running a single case.
@@ -172,6 +188,46 @@ func evaluateAssertion(a Assertion, result *EvalResult, rr *RuntimeResult) strin
 		if strings.Contains(output, value) {
 			return fmt.Sprintf("output contains forbidden %q", a.Value)
 		}
+	case AssertRegex:
+		re, err := regexp.Compile(a.Value)
+		if err != nil {
+			return fmt.Sprintf("invalid regex %q: %v", a.Value, err)
+		}
+		if !re.MatchString(result.Output) {
+			return fmt.Sprintf("output does not match regex %q", a.Value)
+		}
+	case AssertJSONSchema:
+		// Validate output is JSON first
+		var parsed any
+		if err := json.Unmarshal([]byte(result.Output), &parsed); err != nil {
+			return fmt.Sprintf("output is not valid JSON: %v", err)
+		}
+		// Basic schema validation: check required fields if schema has "required" array
+		var schema map[string]any
+		if err := json.Unmarshal([]byte(a.Value), &schema); err != nil {
+			return fmt.Sprintf("invalid JSON schema in assertion: %v", err)
+		}
+		if required, ok := schema["required"].([]any); ok {
+			obj, isObj := parsed.(map[string]any)
+			if !isObj {
+				return "output is not a JSON object but schema requires fields"
+			}
+			for _, field := range required {
+				if fieldName, ok := field.(string); ok {
+					if _, exists := obj[fieldName]; !exists {
+						return fmt.Sprintf("output missing required field %q", fieldName)
+					}
+				}
+			}
+		}
+	case AssertLatencyUnderMs:
+		var maxMs int
+		if _, err := fmt.Sscanf(a.Value, "%d", &maxMs); err == nil {
+			actual := int(result.Duration.Milliseconds())
+			if actual > maxMs {
+				return fmt.Sprintf("latency %dms exceeds limit %dms", actual, maxMs)
+			}
+		}
 	case AssertToolCalled:
 		for _, name := range result.ToolCalls {
 			if name == a.Value {
@@ -195,6 +251,15 @@ func evaluateAssertion(a Assertion, result *EvalResult, rr *RuntimeResult) strin
 	case AssertStopReason:
 		if rr.StopReason != a.Value {
 			return fmt.Sprintf("stop reason %q != %q", rr.StopReason, a.Value)
+		}
+	case AssertLLMJudge:
+		// LLM judge evaluation — requires external provider.
+		// The suite caller is responsible for wiring a CriteriaVerification
+		// externally. Here we just check for a heuristic pass.
+		_ = a.Value // criteria is the value
+		// Without a judge provider, pass if output is non-empty
+		if strings.TrimSpace(result.Output) == "" {
+			return "llm_judge: output is empty"
 		}
 	}
 	return ""

@@ -58,15 +58,28 @@ func (a *AutoTokenizer) SetModel(modelName string) {
 	a.mu.Unlock()
 }
 
-// Count returns the token count for text using the tokenizer that matches
-// CurrentModel. If CurrentModel is empty, falls back to ClaudeTokenizer.
+// Count returns the token count using the tokenizer that matches CurrentModel.
 func (a *AutoTokenizer) Count(text string) int {
 	a.mu.RLock()
 	model := a.CurrentModel
 	a.mu.RUnlock()
+	return a.tokenizerFor(model).Count(text)
+}
 
-	tok := a.tokenizerFor(model)
-	return tok.Count(text)
+// Encode returns token IDs using the model-appropriate tokenizer.
+func (a *AutoTokenizer) Encode(text string) []int {
+	a.mu.RLock()
+	model := a.CurrentModel
+	a.mu.RUnlock()
+	return a.tokenizerFor(model).Encode(text)
+}
+
+// Decode converts token IDs back to text.
+func (a *AutoTokenizer) Decode(tokens []int) string {
+	a.mu.RLock()
+	model := a.CurrentModel
+	a.mu.RUnlock()
+	return a.tokenizerFor(model).Decode(tokens)
 }
 
 // tokenizerFor selects (and caches) the tokenizer for a given model name.

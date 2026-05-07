@@ -164,6 +164,28 @@ func buildAnthropicImageBlock(img autobuild.ImageContent) anthropicContent {
 	}
 }
 
+// buildAnthropicDocumentBlock converts an SDK DocumentContent to an Anthropic
+// document content block. Supports PDFs and plain text.
+func buildAnthropicDocumentBlock(doc autobuild.DocumentContent) anthropicContent {
+	c := anthropicContent{Type: "document"}
+	if doc.URL != "" {
+		c.Source = &anthropicImageSource{Type: "url", URL: doc.URL}
+	} else {
+		c.Source = &anthropicImageSource{
+			Type:      "base64",
+			MediaType: doc.MediaType,
+			Data:      doc.Source,
+		}
+	}
+	if doc.Title != "" {
+		c.Text = strPtr(doc.Title)
+	}
+	if doc.CacheControl == "ephemeral" {
+		c.CacheControl = &anthropicCacheControl{Type: "ephemeral"}
+	}
+	return c
+}
+
 func strPtr(s string) *string { return &s }
 
 type anthropicTool struct {
@@ -179,7 +201,19 @@ type anthropicRequest struct {
 	SystemBlocks []anthropicSystemBlock `json:"system,omitempty"`
 	Messages     []anthropicMessage     `json:"messages"`
 	Tools        []anthropicTool        `json:"tools,omitempty"`
+	ToolChoice   *anthropicToolChoice   `json:"tool_choice,omitempty"`
 	Thinking     *anthropicThinking     `json:"thinking,omitempty"`
+	Temperature  *float64               `json:"temperature,omitempty"`
+	TopP         *float64               `json:"top_p,omitempty"`
+	TopK         *int                   `json:"top_k,omitempty"`
+	Metadata     map[string]string      `json:"metadata,omitempty"`
+}
+
+// anthropicToolChoice controls tool selection.
+type anthropicToolChoice struct {
+	Type                   string `json:"type"`                               // "auto", "any", "tool"
+	Name                   string `json:"name,omitempty"`                     // required when Type=="tool"
+	DisableParallelToolUse bool   `json:"disable_parallel_tool_use,omitempty"` // prevent batched tool calls
 }
 
 // anthropicThinking enables extended thinking mode.
@@ -219,19 +253,46 @@ func buildAnthropicRequest(model string, maxTokens int, req autobuild.ChatReques
 		MaxTokens: maxTokens,
 	}
 
-	// Extended thinking: when ThinkingBudget is set, enable the thinking block.
-	// MaxTokens must exceed ThinkingBudget — enforce minimum here.
+	// Extended thinking
 	if req.ThinkingBudget > 0 {
 		budget := req.ThinkingBudget
 		if budget < 1024 {
-			budget = 1024 // Anthropic minimum
+			budget = 1024
 		}
 		if out.MaxTokens <= budget {
-			out.MaxTokens = budget + 4096 // ensure room for response
+			out.MaxTokens = budget + 4096
 		}
 		out.Thinking = &anthropicThinking{
 			Type:         "enabled",
 			BudgetTokens: budget,
+		}
+	}
+
+	// Sampling parameters
+	if req.Temperature > 0 {
+		v := req.Temperature
+		out.Temperature = &v
+	}
+	if req.TopP > 0 {
+		v := req.TopP
+		out.TopP = &v
+	}
+	if req.TopK > 0 {
+		v := req.TopK
+		out.TopK = &v
+	}
+
+	// Metadata (user_id for abuse tracking, etc.)
+	if len(req.Metadata) > 0 {
+		out.Metadata = req.Metadata
+	}
+
+	// Tool choice
+	if req.ToolChoice != nil && req.ToolChoice.Type != "" {
+		out.ToolChoice = &anthropicToolChoice{
+			Type:                   req.ToolChoice.Type,
+			Name:                   req.ToolChoice.Name,
+			DisableParallelToolUse: req.ToolChoice.DisableParallelToolUse,
 		}
 	}
 
@@ -269,8 +330,11 @@ func buildAnthropicRequest(model string, maxTokens int, req autobuild.ChatReques
 			continue
 
 		case autobuild.RoleUser:
-			// Build content blocks: images first, then text
+			// Build content blocks: documents, images, then text
 			var content []anthropicContent
+			for _, doc := range m.Documents {
+				content = append(content, buildAnthropicDocumentBlock(doc))
+			}
 			for _, img := range m.Images {
 				content = append(content, buildAnthropicImageBlock(img))
 			}

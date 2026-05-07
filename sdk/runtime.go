@@ -60,8 +60,20 @@ type Runtime struct {
 
 // Tokenizer estimates token count for a string. Replace the default heuristic
 // with a real tokenizer (tiktoken, claude-tokenizer) for accurate budgets.
+//
+// Minimum implementation: Count. Implement Encode/Decode for accurate
+// truncation at token boundaries (required by evictMemoryToTokenBudget).
 type Tokenizer interface {
+	// Count returns the number of tokens in text.
 	Count(text string) int
+
+	// Encode converts text to a token ID sequence.
+	// Optional: return nil to fall back to character-boundary truncation.
+	Encode(text string) []int
+
+	// Decode converts a token ID sequence back to text.
+	// Optional: return "" if Encode is not implemented.
+	Decode(tokens []int) string
 }
 
 // HeuristicTokenizer is the default — chars/4. Good enough for English.
@@ -70,6 +82,27 @@ type Tokenizer interface {
 type HeuristicTokenizer struct{}
 
 func (HeuristicTokenizer) Count(text string) int { return len(text) / 4 }
+func (HeuristicTokenizer) Encode(text string) []int { return nil } // not supported
+func (HeuristicTokenizer) Decode(tokens []int) string { return "" } // not supported
+
+// TruncateToTokens truncates text to at most maxTokens tokens using the given
+// tokenizer. If Encode returns nil (heuristic tokenizer), falls back to
+// character-boundary truncation at maxTokens*4 characters.
+func TruncateToTokens(text string, maxTokens int, tok Tokenizer) string {
+	if tok.Count(text) <= maxTokens {
+		return text
+	}
+	tokens := tok.Encode(text)
+	if tokens != nil && len(tokens) > maxTokens {
+		return tok.Decode(tokens[:maxTokens])
+	}
+	// Fallback: character truncation
+	limit := maxTokens * 4
+	if limit > len(text) {
+		limit = len(text)
+	}
+	return text[:limit]
+}
 
 // ObservationFilter decides if a tool result should become an Observation.
 type ObservationFilter func(call ToolCallEntry, result ToolResult) Observation
