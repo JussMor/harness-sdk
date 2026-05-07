@@ -95,7 +95,7 @@ export class ChatAPI {
     const decoder = new TextDecoder()
     let buffer = ""
 
-    while (true) {
+    for (;;) {
       const { value, done } = await reader.read()
       if (done) {
         break
@@ -245,12 +245,17 @@ export class ChatAPI {
     chatId: number,
     id: string,
     approved: boolean,
-    modifiedArgs?: string,
+    modifiedArgs?: string
   ): Promise<void> {
     await fetch(`${this.baseURL}/api/confirm`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ chat_id: chatId, id, approved, modified_args: modifiedArgs ?? "" }),
+      body: JSON.stringify({
+        chat_id: chatId,
+        id,
+        approved,
+        modified_args: modifiedArgs ?? "",
+      }),
     })
   }
 }

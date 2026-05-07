@@ -1,20 +1,3 @@
-import { ArtifactCanvas } from "@/components/artifact-canvas"
-import { ChatAPI } from "@/features/chat/api"
-import type { Artifact } from "@/features/chat/artifact-detector"
-import {
-  createDetectorState,
-  finalizeStream,
-  processStreamDelta,
-} from "@/features/chat/artifact-detector"
-import type {
-  BackendMessage,
-  ChatMode,
-  ConfirmationRequest,
-  ProvidersResponse,
-  StreamEvent,
-  StreamPlanProposed,
-  StreamSubagentResult,
-} from "@/features/chat/types"
 import {
   Bot,
   Brain,
@@ -37,8 +20,25 @@ import {
 import { useCallback, useEffect, useMemo, useRef, useState } from "react"
 import ReactMarkdown from "react-markdown"
 import remarkGfm from "remark-gfm"
-import type { SubagentTrace, ToolTrace } from "./tool-trace"
 import { ToolTraceCard } from "./tool-trace"
+import type { SubagentTrace, ToolTrace } from "./tool-trace"
+import type {
+  BackendMessage,
+  ChatMode,
+  ConfirmationRequest,
+  ProvidersResponse,
+  StreamEvent,
+  StreamPlanProposed,
+  StreamSubagentResult,
+} from "@/features/chat/types"
+import type { Artifact } from "@/features/chat/artifact-detector"
+import {
+  createDetectorState,
+  finalizeStream,
+  processStreamDelta,
+} from "@/features/chat/artifact-detector"
+import { ChatAPI } from "@/features/chat/api"
+import { ArtifactCanvas } from "@/components/artifact-canvas"
 
 export interface ChatMessage {
   id: string
@@ -98,8 +98,9 @@ export function ChatMain({
   const [selectedProvider, setSelectedProvider] = useState("")
 
   // ── Human-in-the-Loop state ──────────────────────────────────────────────
-  const [hilEnabled, setHilEnabled] = useState(false)
-  const [pendingConfirmation, setPendingConfirmation] = useState<ConfirmationRequest | null>(null)
+  const [hilEnabled, setHilEnabled] = useState(true)
+  const [pendingConfirmation, setPendingConfirmation] =
+    useState<ConfirmationRequest | null>(null)
 
   const streamControllerRef = useRef<AbortController | null>(null)
   const listEndRef = useRef<HTMLDivElement>(null)
@@ -132,11 +133,7 @@ export function ChatMain({
   const syncMessages = useCallback(
     async (targetChatID: number, signal?: AbortSignal) => {
       const payload = await api.listMessages(targetChatID, signal)
-      const next = payload
-        .filter(
-          (message) => message.role === "user" || message.role === "assistant"
-        )
-        .map(toChatMessage)
+      const next = payload.map(toChatMessage)
 
       // Preserve streaming-only fields (plan, subagentResults) that aren't
       // persisted in the backend but were accumulated during the stream.
@@ -705,7 +702,11 @@ export function ChatMain({
 
           <button
             type="button"
-            title={hilEnabled ? "Human-in-the-loop ON — click to disable" : "Human-in-the-loop OFF — click to enable"}
+            title={
+              hilEnabled
+                ? "Human-in-the-loop ON — click to disable"
+                : "Human-in-the-loop OFF — click to enable"
+            }
             onClick={() => setHilEnabled((v) => !v)}
             disabled={isStreaming}
             className={`chat-hil-toggle ${hilEnabled ? "chat-hil-toggle--on" : ""}`}
@@ -1271,7 +1272,9 @@ function SubagentResultCard({ result }: { result: StreamSubagentResult }) {
         <Bot size={12} />
         <span className="subagent-card-id">{result.id}</span>
         {result.model && (
-          <code className="subagent-card-model">{result.model.split("-").slice(0, 2).join("-")}</code>
+          <code className="subagent-card-model">
+            {result.model.split("-").slice(0, 2).join("-")}
+          </code>
         )}
         <span className="subagent-card-meta">
           {result.turns > 0 && `${result.turns} turns · `}
@@ -1351,7 +1354,11 @@ function ConfirmationDialog({
   }
 
   return (
-    <div className="hil-dialog" role="dialog" aria-label="Tool approval required">
+    <div
+      className="hil-dialog"
+      role="dialog"
+      aria-label="Tool approval required"
+    >
       <div className="hil-dialog-header">
         <ShieldAlert size={16} className="hil-dialog-icon" />
         <span className="hil-dialog-title">Approval required</span>

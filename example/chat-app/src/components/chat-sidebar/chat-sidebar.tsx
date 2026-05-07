@@ -1,7 +1,14 @@
+import {
+  Archive,
+  Clock3,
+  GitBranch,
+  MessageSquarePlus,
+  Search,
+} from "lucide-react"
+import { useMemo, useState } from "react"
+
 import type { Thread } from "@/features/chat/types"
 import { cn } from "@/lib/utils"
-import { Archive, Clock3, GitBranch, MessageSquarePlus, Search } from "lucide-react"
-import { useMemo, useState } from "react"
 
 export interface SidebarChat {
   id: string
@@ -131,11 +138,18 @@ export function ChatSidebar({
           </p>
           {threads.map((thread) => (
             <div key={thread.id} className="sidebar-thread-item">
-              <span className={cn("sidebar-thread-status", `sidebar-thread-status--${thread.status}`)}>
+              <span
+                className={cn(
+                  "sidebar-thread-status",
+                  `sidebar-thread-status--${thread.status}`
+                )}
+              >
                 {thread.status}
               </span>
               <span className="sidebar-thread-id">{thread.id.slice(0, 8)}</span>
-              {thread.mode_id && <span className="sidebar-thread-mode">{thread.mode_id}</span>}
+              {thread.mode_id && (
+                <span className="sidebar-thread-mode">{thread.mode_id}</span>
+              )}
               {onArchiveThread && thread.status === "active" && (
                 <button
                   type="button"

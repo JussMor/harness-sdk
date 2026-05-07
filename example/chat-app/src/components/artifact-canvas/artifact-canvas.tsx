@@ -1,5 +1,3 @@
-import type { Artifact } from "@/features/chat/artifact-detector"
-import type { ArtifactVersion } from "@/features/chat/types"
 import {
   ChevronLeft,
   ChevronRight,
@@ -10,7 +8,9 @@ import {
   Minimize2,
   X,
 } from "lucide-react"
-import { lazy, Suspense, useCallback, useEffect, useRef, useState } from "react"
+import { Suspense, lazy, useCallback, useEffect, useRef, useState } from "react"
+import type { Artifact } from "@/features/chat/artifact-detector"
+import type { ArtifactVersion } from "@/features/chat/types"
 
 // Lazy-load heavy editors to avoid bundle bloat
 const MDEditor = lazy(() => import("@uiw/react-md-editor"))
@@ -21,7 +21,7 @@ const MDPreview = lazy(() =>
 export interface ArtifactCanvasProps {
   artifact: Artifact | null
   isStreaming: boolean
-  versions?: ArtifactVersion[]
+  versions?: Array<ArtifactVersion>
   onClose: () => void
   onSaveVersion?: (artifactId: string, content: string) => Promise<void>
   apiBaseURL?: string
@@ -101,20 +101,40 @@ export function ArtifactCanvas({
       const id = artifact.id
       try {
         if (type === "storage:get") {
-          const r = await fetch(`${apiBaseURL}/api/artifacts/${id}/storage?shared=${shared ?? false}`)
+          const r = await fetch(
+            `${apiBaseURL}/api/artifacts/${id}/storage?shared=${shared ?? false}`
+          )
           const body = await r.json()
-          ev.source?.postMessage({ type: "storage:get:result", key, value: body.data?.[key] ?? null }, { targetOrigin: "*" })
+          ev.source?.postMessage(
+            {
+              type: "storage:get:result",
+              key,
+              value: body.data?.[key] ?? null,
+            },
+            { targetOrigin: "*" }
+          )
         } else if (type === "storage:set") {
           await fetch(`${apiBaseURL}/api/artifacts/${id}/storage`, {
             method: "POST",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({ key, value, shared: shared ?? false }),
           })
-          ev.source?.postMessage({ type: "storage:set:result", key, ok: true }, { targetOrigin: "*" })
+          ev.source?.postMessage(
+            { type: "storage:set:result", key, ok: true },
+            { targetOrigin: "*" }
+          )
         } else if (type === "storage:delete") {
-          const params = new URLSearchParams({ shared: String(shared ?? false) })
-          await fetch(`${apiBaseURL}/api/artifacts/${id}/storage/${key}?${params}`, { method: "DELETE" })
-          ev.source?.postMessage({ type: "storage:delete:result", key, ok: true }, { targetOrigin: "*" })
+          const params = new URLSearchParams({
+            shared: String(shared ?? false),
+          })
+          await fetch(
+            `${apiBaseURL}/api/artifacts/${id}/storage/${key}?${params}`,
+            { method: "DELETE" }
+          )
+          ev.source?.postMessage(
+            { type: "storage:delete:result", key, ok: true },
+            { targetOrigin: "*" }
+          )
         }
       } catch (e) {
         console.warn("storage bridge error", e)
@@ -127,24 +147,32 @@ export function ArtifactCanvas({
   if (!artifact) return null
 
   const currentVersion = versionIndex !== null ? versions[versionIndex] : null
-  const activeContent = currentVersion?.content ?? artifact.content ?? ""
+  const activeContent = currentVersion?.content ?? artifact.content
   const totalVersions = versions.length || (artifact.complete ? 1 : 0)
-  const displayVersionNum = versionIndex !== null ? versionIndex + 1 : totalVersions
+  const displayVersionNum =
+    versionIndex !== null ? versionIndex + 1 : totalVersions
   const isMd = isMarkdown(artifact.language)
   const isHtmlArt = isHtml(artifact.language)
   const title = artifact.title || `${artifact.language} artifact`
 
   return (
-    <aside className={`artifact-canvas ${isFullscreen ? "artifact-canvas--fullscreen" : ""}`}>
-
+    <aside
+      className={`artifact-canvas ${isFullscreen ? "artifact-canvas--fullscreen" : ""}`}
+    >
       {/* Header */}
       <header className="artifact-canvas__header">
         <div className="artifact-canvas__title">
           {isMd ? <FileText size={14} /> : <Code size={14} />}
           <span>{title}</span>
-          {isStreaming && <span className="artifact-canvas__streaming-badge">streaming…</span>}
-          {isDirty && !isSaving && <span className="artifact-canvas__dirty-badge">unsaved</span>}
-          {isSaving && <span className="artifact-canvas__saving-badge">saving…</span>}
+          {isStreaming && (
+            <span className="artifact-canvas__streaming-badge">streaming…</span>
+          )}
+          {isDirty && !isSaving && (
+            <span className="artifact-canvas__dirty-badge">unsaved</span>
+          )}
+          {isSaving && (
+            <span className="artifact-canvas__saving-badge">saving…</span>
+          )}
         </div>
 
         <div className="artifact-canvas__actions">
@@ -201,7 +229,9 @@ export function ArtifactCanvas({
       <div className="artifact-canvas__lang-bar">
         <span className="artifact-canvas__lang-badge">{artifact.language}</span>
         {activeContent && (
-          <span className="artifact-canvas__size">{activeContent.length} chars</span>
+          <span className="artifact-canvas__size">
+            {activeContent.length} chars
+          </span>
         )}
         {totalVersions > 1 && (
           <div className="artifact-canvas__versions">
@@ -209,7 +239,11 @@ export function ArtifactCanvas({
               type="button"
               className="artifact-canvas__version-btn"
               disabled={displayVersionNum <= 1}
-              onClick={() => setVersionIndex((i) => Math.max(0, (i ?? versions.length - 1) - 1))}
+              onClick={() =>
+                setVersionIndex((i) =>
+                  Math.max(0, (i ?? versions.length - 1) - 1)
+                )
+              }
             >
               <ChevronLeft size={12} />
             </button>
@@ -220,7 +254,11 @@ export function ArtifactCanvas({
               type="button"
               className="artifact-canvas__version-btn"
               disabled={displayVersionNum >= totalVersions}
-              onClick={() => setVersionIndex((i) => Math.min(versions.length - 1, (i ?? 0) + 1))}
+              onClick={() =>
+                setVersionIndex((i) =>
+                  Math.min(versions.length - 1, (i ?? 0) + 1)
+                )
+              }
             >
               <ChevronRight size={12} />
             </button>
@@ -238,14 +276,24 @@ export function ArtifactCanvas({
           </pre>
         ) : isMd ? (
           // Markdown: WYSIWYG editor or preview depending on mode
-          <Suspense fallback={<div className="artifact-canvas__loading">Loading editor…</div>}>
+          <Suspense
+            fallback={
+              <div className="artifact-canvas__loading">Loading editor…</div>
+            }
+          >
             {viewMode === "preview" && (
-              <div className="artifact-canvas__md-preview" data-color-mode="light">
+              <div
+                className="artifact-canvas__md-preview"
+                data-color-mode="light"
+              >
                 <MDPreview source={editContent || activeContent} />
               </div>
             )}
             {viewMode === "edit" && (
-              <div data-color-mode="light" className="artifact-canvas__md-editor">
+              <div
+                data-color-mode="light"
+                className="artifact-canvas__md-editor"
+              >
                 <MDEditor
                   value={editContent}
                   onChange={handleContentChange}
@@ -256,7 +304,10 @@ export function ArtifactCanvas({
               </div>
             )}
             {viewMode === "split" && (
-              <div data-color-mode="light" className="artifact-canvas__md-editor">
+              <div
+                data-color-mode="light"
+                className="artifact-canvas__md-editor"
+              >
                 <MDEditor
                   value={editContent}
                   onChange={handleContentChange}
@@ -268,7 +319,11 @@ export function ArtifactCanvas({
             )}
           </Suspense>
         ) : isHtmlArt ? (
-          <HtmlPreview ref={iframeRef} content={activeContent} artifactId={artifact.id} />
+          <HtmlPreview
+            ref={iframeRef}
+            content={activeContent}
+            artifactId={artifact.id}
+          />
         ) : (
           <pre className="artifact-canvas__pre">
             <code>{activeContent || " "}</code>
@@ -311,7 +366,7 @@ export interface ArtifactCanvasProps {
   /** Whether the stream is still producing content for this artifact */
   isStreaming: boolean
   /** All persisted versions from the backend (may be empty during streaming) */
-  versions?: ArtifactVersion[]
+  versions?: Array<ArtifactVersion>
   /** Called when user closes the canvas */
   onClose: () => void
   /** Called when user saves a local edit — triggers a new version on the backend */
@@ -319,4 +374,3 @@ export interface ArtifactCanvasProps {
   /** Backend API base URL — used by the storage bridge */
   apiBaseURL?: string
 }
-
