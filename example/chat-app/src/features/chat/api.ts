@@ -231,6 +231,28 @@ export class ChatAPI {
       method: "DELETE",
     })
   }
+
+  // ── Human-in-the-loop ────────────────────────────────────────────────────────
+
+  /**
+   * Deliver a human approval or rejection to a paused agent loop.
+   * @param chatId    The chat whose agent is waiting.
+   * @param id        The ApprovalRequest.id from the confirmation_required event.
+   * @param approved  true to allow the tool call, false to reject.
+   * @param modifiedArgs  Optional JSON string to override tool arguments.
+   */
+  async confirm(
+    chatId: number,
+    id: string,
+    approved: boolean,
+    modifiedArgs?: string,
+  ): Promise<void> {
+    await fetch(`${this.baseURL}/api/confirm`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ chat_id: chatId, id, approved, modified_args: modifiedArgs ?? "" }),
+    })
+  }
 }
 
 function emitSSEEvents(
@@ -337,6 +359,21 @@ function parseChunk(chunk: string): StreamEvent | null {
           duration_ms: number
           error?: string
         },
+      }
+    case "confirmation_required":
+      return {
+        type: "confirmation_required",
+        data: parsed as {
+          id: string
+          tool: string
+          args: string
+          reason: string
+        },
+      }
+    case "confirmation_resolved":
+      return {
+        type: "confirmation_resolved",
+        data: parsed as { id: string; tool: string; approved: boolean },
       }
     case "done":
       return {

@@ -314,12 +314,13 @@ func matchAny(text string, patterns []string) []string {
 // ApplyFilter runs a SafetyFilter against a batch of tool calls and
 // separates them into allowed and blocked. Tool calls that get Block
 // receive the Reason as their result content, so the LLM can see why
-// and self-correct.
+// and self-correct. SafetyPause is treated as Block here — the pause
+// logic lives in HumanApprovalFilter.Inspect which blocks synchronously.
 func ApplyFilter(filter SafetyFilter, ctx context.Context, calls []ToolCallEntry) (allowed []ToolCallEntry, blocked []ToolResult) {
 	for _, c := range calls {
 		v := filter.Inspect(ctx, c)
 		switch v.Decision {
-		case SafetyBlock:
+		case SafetyBlock, SafetyPause:
 			blocked = append(blocked, ToolResult{
 				ToolCallID: c.ID,
 				Name:       c.Name,

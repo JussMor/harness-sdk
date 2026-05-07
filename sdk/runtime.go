@@ -53,9 +53,10 @@ type Runtime struct {
 	sessionContext  SessionContextProvider
 	outputFilter    OutputFilter
 	compactor       Compactor
-	maxMemoryTokens int        // 0 = unlimited
+	maxMemoryTokens int          // 0 = unlimited
 	memoryRootsV2   []MemoryRoot // nil = use DefaultMemoryRoots
 	thinkingBudget  int          // 0 = disabled; >0 enables extended thinking
+	approvalGate    *ApprovalGate // non-nil when human-in-the-loop is active
 }
 
 // Tokenizer estimates token count for a string. Replace the default heuristic

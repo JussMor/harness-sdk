@@ -76,6 +76,7 @@ func main() {
 	mux.HandleFunc("/api/providers", app.handleProviders)
 	mux.HandleFunc("/api/chats", app.handleChats)
 	mux.HandleFunc("/api/chats/", app.handleChatRoutes)
+	mux.HandleFunc("/api/confirm", app.handleConfirm)
 	mux.HandleFunc("/admin/eval", app.handleEval)
 	mux.HandleFunc("/api/threads", app.handleThreads)
 	mux.HandleFunc("/api/threads/", app.handleThreadRoutes)
@@ -396,11 +397,12 @@ func (a *BackendChatApp) handleStream(w http.ResponseWriter, r *http.Request, ch
 	}
 
 	var req struct {
-		Prompt      string `json:"prompt"`
-		Mode        string `json:"mode"`
-		Provider    string `json:"provider"`
-		Model       string `json:"model"`
-		ClientRunID string `json:"clientRunId"`
+		Prompt       string `json:"prompt"`
+		Mode         string `json:"mode"`
+		Provider     string `json:"provider"`
+		Model        string `json:"model"`
+		ClientRunID  string `json:"clientRunId"`
+		HumanInLoop  bool   `json:"human_in_loop"` // enable HIL for this stream
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeErr(w, http.StatusBadRequest, err)
@@ -479,6 +481,14 @@ func (a *BackendChatApp) handleStream(w http.ResponseWriter, r *http.Request, ch
 		return
 	}
 
+	// Human-in-the-loop: wire approval gate when requested
+	if req.HumanInLoop {
+		gate, updatedRuntime := agentRT.runtime.WithHumanApproval(ab.DefaultApprovalPolicy)
+		agentRT.runtime = updatedRuntime
+		hilRegistry.Register(chatID, gate)
+		defer hilRegistry.Unregister(chatID)
+	}
+
 	conv, err := LoadOrCreateConversation(ctx, agentRT.convStore, chatID, history)
 	if err != nil {
 		d, _ := json.Marshal(map[string]string{"error": err.Error()})
@@ -515,6 +525,27 @@ func (a *BackendChatApp) handleStream(w http.ResponseWriter, r *http.Request, ch
 			if ev.Thinking != "" {
 				d, _ := json.Marshal(map[string]string{"thinking": ev.Thinking})
 				sseWrite("thinking", string(d))
+			}
+
+		case ab.StreamEventConfirmationRequired:
+			if ev.ConfirmationRequest != nil {
+				d, _ := json.Marshal(map[string]any{
+					"id":     ev.ConfirmationRequest.ID,
+					"tool":   ev.ConfirmationRequest.ToolCall.Name,
+					"args":   ev.ConfirmationRequest.ToolCall.Arguments,
+					"reason": ev.ConfirmationRequest.Reason,
+				})
+				sseWrite("confirmation_required", string(d))
+			}
+
+		case ab.StreamEventConfirmationResolved:
+			if ev.ConfirmationRequest != nil {
+				d, _ := json.Marshal(map[string]any{
+					"id":      ev.ConfirmationRequest.ID,
+					"tool":    ev.ConfirmationRequest.ToolCall.Name,
+					"approved": true,
+				})
+				sseWrite("confirmation_resolved", string(d))
 			}
 
 		case ab.StreamEventToolCall:

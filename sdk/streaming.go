@@ -31,6 +31,11 @@ type StreamEvent struct {
 	// SubagentResult is set when Type=StreamEventSubagentResult.
 	SubagentResult *SubagentResult `json:"subagent_result,omitempty"`
 
+	// ConfirmationRequest is set when Type=StreamEventConfirmationRequired.
+	// The agent loop is paused. The consumer must call ApprovalGate.Respond
+	// to unblock it.
+	ConfirmationRequest *ApprovalRequest `json:"confirmation_request,omitempty"`
+
 	// Final is the complete accumulated response when Type=StreamEventDone.
 	Final *AgentLoopResult `json:"final,omitempty"`
 
@@ -50,6 +55,16 @@ const (
 	// Thinking content is the model's internal reasoning — not shown to users
 	// by default. Use for debugging, tracing, or advanced UX.
 	StreamEventThinking StreamEventType = "thinking"
+
+	// StreamEventConfirmationRequired is emitted when a tool call needs human
+	// approval. The agent loop is paused until ApprovalGate.Respond is called.
+	// StreamEvent.ConfirmationRequest contains the request details.
+	StreamEventConfirmationRequired StreamEventType = "confirmation_required"
+
+	// StreamEventConfirmationResolved is emitted after a confirmation_required
+	// is resolved — approved or rejected.
+	// StreamEvent.ConfirmationRequest.ID identifies which request resolved.
+	StreamEventConfirmationResolved StreamEventType = "confirmation_resolved"
 
 	// StreamEventToolCall is emitted when the LLM decides to call a tool.
 	// Tool execution happens between this event and the next StreamEventToolResult.
@@ -236,6 +251,25 @@ func (r *Runtime) runStreamInternal(
 
 	dispatcher := NewToolDispatcher(r.engine.Tools, r.engine.Sandbox)
 
+	// If human-in-the-loop is active, forward ApprovalRequests to the stream
+	// as StreamEventConfirmationRequired events. This runs in a separate goroutine
+	// because HumanApprovalFilter.Inspect blocks the main loop while waiting —
+	// we need to forward the request to the frontend before unblocking.
+	if r.approvalGate != nil {
+		go func() {
+			for req := range r.approvalGate.Requests() {
+				select {
+				case <-ctx.Done():
+					return
+				case out <- StreamEvent{
+					Type:                StreamEventConfirmationRequired,
+					ConfirmationRequest: &req,
+				}:
+				}
+			}
+		}()
+	}
+
 	for turn := 0; turn < 50; turn++ {
 		if ctx.Err() != nil {
 			return ctx.Err()
@@ -310,6 +344,13 @@ func (r *Runtime) runStreamInternal(
 		for _, call := range turnToolCalls {
 			if r.safety != nil {
 				verdict := r.safety.Inspect(ctx, call)
+				// If HIL was involved, emit resolved event
+				if r.approvalGate != nil && (verdict.Decision == SafetyAllow || verdict.Decision == SafetyTransform) {
+					out <- StreamEvent{
+						Type:                StreamEventConfirmationResolved,
+						ConfirmationRequest: &ApprovalRequest{ToolCall: call},
+					}
+				}
 				if verdict.Decision == SafetyBlock {
 					// Emit blocked result as tool_result to the consumer
 					blocked := ToolResult{

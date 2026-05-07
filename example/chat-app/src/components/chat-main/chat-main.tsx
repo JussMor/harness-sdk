@@ -9,6 +9,7 @@ import {
 import type {
   BackendMessage,
   ChatMode,
+  ConfirmationRequest,
   ProvidersResponse,
   StreamEvent,
   StreamPlanProposed,
@@ -24,11 +25,14 @@ import {
   LoaderCircle,
   RefreshCw,
   SendHorizontal,
+  Shield,
+  ShieldAlert,
   Sparkles,
   Square,
   ThumbsDown,
   ThumbsUp,
   User,
+  X,
 } from "lucide-react"
 import { useCallback, useEffect, useMemo, useRef, useState } from "react"
 import ReactMarkdown from "react-markdown"
@@ -92,6 +96,10 @@ export function ChatMain({
   const [selectedMode, setSelectedMode] = useState("balanced")
   const [providers, setProviders] = useState<Array<string>>([])
   const [selectedProvider, setSelectedProvider] = useState("")
+
+  // ── Human-in-the-Loop state ──────────────────────────────────────────────
+  const [hilEnabled, setHilEnabled] = useState(false)
+  const [pendingConfirmation, setPendingConfirmation] = useState<ConfirmationRequest | null>(null)
 
   const streamControllerRef = useRef<AbortController | null>(null)
   const listEndRef = useRef<HTMLDivElement>(null)
@@ -488,6 +496,21 @@ export function ChatMain({
         return
       }
 
+      if (event.type === "confirmation_required") {
+        pushTimeline(`Awaiting approval: ${event.data.tool}`, "info")
+        setPendingConfirmation(event.data)
+        return
+      }
+
+      if (event.type === "confirmation_resolved") {
+        pushTimeline(
+          `${event.data.approved ? "Approved" : "Rejected"}: ${event.data.tool}`,
+          event.data.approved ? "success" : "error"
+        )
+        setPendingConfirmation(null)
+        return
+      }
+
       if (event.type === "done") {
         // Mark stream as done — syncMessages() after streamChat resolves
         // handles full message and artifact restoration from backend.
@@ -553,6 +576,7 @@ export function ChatMain({
           mode: selectedMode,
           provider: selectedProvider || undefined,
           clientRunId: runID,
+          human_in_loop: hilEnabled,
         },
         {
           onEvent: (event) => handleStreamEvent(assistantMessageID, event),
@@ -678,7 +702,26 @@ export function ChatMain({
               </span>
             )}
           </div>
+
+          <button
+            type="button"
+            title={hilEnabled ? "Human-in-the-loop ON — click to disable" : "Human-in-the-loop OFF — click to enable"}
+            onClick={() => setHilEnabled((v) => !v)}
+            disabled={isStreaming}
+            className={`chat-hil-toggle ${hilEnabled ? "chat-hil-toggle--on" : ""}`}
+          >
+            {hilEnabled ? <ShieldAlert size={14} /> : <Shield size={14} />}
+            <span>{hilEnabled ? "HIL on" : "HIL off"}</span>
+          </button>
         </div>
+
+        {pendingConfirmation && (
+          <ConfirmationDialog
+            request={pendingConfirmation}
+            chatId={chatID ?? 0}
+            api={api}
+          />
+        )}
 
         <div className="chat-main-grid">
           <div className="chat-main-feed">
@@ -1266,4 +1309,101 @@ function SubagentResultCard({ result }: { result: StreamSubagentResult }) {
 function formatDurationMs(ms: number): string {
   if (ms < 1000) return `${ms}ms`
   return `${(ms / 1000).toFixed(1)}s`
+}
+
+// ── ConfirmationDialog ────────────────────────────────────────────────────────
+// Blocking dialog shown when the agent requests human approval before executing
+// a tool call. Rendered inline above the message feed — not as a modal — so
+// the user can still scroll up to read context before deciding.
+
+function ConfirmationDialog({
+  request,
+  chatId,
+  api,
+}: {
+  request: ConfirmationRequest
+  chatId: number
+  api: ChatAPI
+}) {
+  const [loading, setLoading] = useState(false)
+  const [modifiedArgs, setModifiedArgs] = useState(
+    (() => {
+      try {
+        return JSON.stringify(JSON.parse(request.args), null, 2)
+      } catch {
+        return request.args
+      }
+    })()
+  )
+  const [editingArgs, setEditingArgs] = useState(false)
+
+  const respond = async (approved: boolean) => {
+    if (loading) return
+    setLoading(true)
+    try {
+      const argsToSend = editingArgs ? modifiedArgs : undefined
+      await api.confirm(chatId, request.id, approved, argsToSend)
+    } catch {
+      // error handled by stream event
+    } finally {
+      setLoading(false)
+    }
+  }
+
+  return (
+    <div className="hil-dialog" role="dialog" aria-label="Tool approval required">
+      <div className="hil-dialog-header">
+        <ShieldAlert size={16} className="hil-dialog-icon" />
+        <span className="hil-dialog-title">Approval required</span>
+        <code className="hil-dialog-tool">{request.tool}</code>
+      </div>
+
+      <p className="hil-dialog-reason">{request.reason}</p>
+
+      <div className="hil-dialog-args">
+        <div className="hil-dialog-args-header">
+          <span>Arguments</span>
+          <button
+            type="button"
+            className="hil-dialog-edit-btn"
+            onClick={() => setEditingArgs((v) => !v)}
+          >
+            {editingArgs ? "cancel edit" : "edit"}
+          </button>
+        </div>
+        {editingArgs ? (
+          <textarea
+            className="hil-dialog-args-editor"
+            value={modifiedArgs}
+            onChange={(e) => setModifiedArgs(e.target.value)}
+            rows={6}
+            spellCheck={false}
+          />
+        ) : (
+          <pre className="hil-dialog-args-pre">{modifiedArgs}</pre>
+        )}
+      </div>
+
+      <div className="hil-dialog-actions">
+        <button
+          type="button"
+          className="hil-dialog-reject"
+          onClick={() => respond(false)}
+          disabled={loading}
+        >
+          <X size={14} />
+          Reject
+        </button>
+        <button
+          type="button"
+          className="hil-dialog-approve"
+          onClick={() => respond(true)}
+          disabled={loading}
+        >
+          <Check size={14} />
+          {editingArgs ? "Approve with changes" : "Approve"}
+        </button>
+      </div>
+    </div>
+  )
 }

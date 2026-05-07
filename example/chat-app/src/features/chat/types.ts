@@ -55,6 +55,7 @@ export interface StreamRequest {
   provider?: string
   model?: string
   clientRunId?: string
+  human_in_loop?: boolean
 }
 
 export interface StreamToolCall {
@@ -92,8 +93,19 @@ export type StreamEvent =
   | { type: "artifact"; data: StreamArtifact }
   | { type: "plan_proposed"; data: StreamPlanProposed }
   | { type: "subagent_result"; data: StreamSubagentResult }
+  | { type: "confirmation_required"; data: ConfirmationRequest }
+  | { type: "confirmation_resolved"; data: { id: string; tool: string; approved: boolean } }
   | { type: "done"; data: StreamDone }
   | { type: "error"; data: { error?: string } }
+
+// ── Human-in-the-Loop types ───────────────────────────────────────────────────
+
+export interface ConfirmationRequest {
+  id: string
+  tool: string
+  args: string   // raw JSON string of tool arguments
+  reason: string
+}
 
 export interface StreamPlanProposed {
   id: string
