@@ -207,6 +207,20 @@ func (r *Runtime) WithThinkingBudget(budgetTokens int) *Runtime {
 	return r
 }
 
+// WithMaxSkillTokens caps how many tokens of skill content can be injected
+// into LayerSkills. When combined skill content exceeds this, it is truncated
+// at token boundaries using the configured tokenizer.
+//
+// Without this cap, loading many skills simultaneously can overflow the system
+// prompt context window. Recommended: 4000–8000 tokens.
+// Default 0 = no cap.
+func (r *Runtime) WithMaxSkillTokens(maxTokens int) *Runtime {
+	if r.engine.HasPrompt() {
+		r.engine.Prompt.SetMaxLayerTokens(LayerSkills, maxTokens)
+	}
+	return r
+}
+
 // Run executes a conversation turn. The Conversation accumulates state
 // across calls — first call is "cold" (full orientation), subsequent calls
 // are "warm" (reuse loaded skills and memory).
@@ -514,7 +528,17 @@ func (r *Runtime) warmRefresh(ctx context.Context, userMessage string, conv *Con
 					continue
 				}
 				if r.engine.HasPrompt() {
-					r.engine.Prompt.Append(LayerSkills, "# Skill: "+skill.Name+"\n\n"+skill.Content+"\n\n")
+					existing := r.engine.Prompt.Get(LayerSkills)
+					newContent := existing
+					if newContent != "" {
+						newContent += "\n\n"
+					}
+					newContent += "# Skill: " + skill.Name + "\n\n" + skill.Content + "\n\n"
+					cap := r.engine.Prompt.maxLayerTokens[LayerSkills]
+					if cap > 0 && r.tokenizer.Count(newContent) > cap {
+						newContent = TruncateToTokens(newContent, cap, r.tokenizer)
+					}
+					r.engine.Prompt.Set(LayerSkills, newContent)
 				}
 				conv.MarkSkillLoaded(skill.Name, m.Score, r.tokenizer.Count(skill.Content))
 			}
@@ -572,7 +596,17 @@ func (r *Runtime) matchAndLoadSkills(ctx context.Context, userMessage string, co
 		loadSkill(m.Skill.Name, 0)
 	}
 	if skillContent.Len() > 0 {
-		r.engine.Prompt.Set(LayerSkills, skillContent.String())
+		content := skillContent.String()
+		// Apply token cap on LayerSkills to prevent system prompt overflow
+		// when many skills are loaded simultaneously. Uses the same tokenizer
+		// as the rest of the budget enforcement.
+		if r.engine.HasPrompt() {
+			cap := r.engine.Prompt.maxLayerTokens[LayerSkills]
+			if cap > 0 && r.tokenizer.Count(content) > cap {
+				content = TruncateToTokens(content, cap, r.tokenizer)
+			}
+		}
+		r.engine.Prompt.Set(LayerSkills, content)
 	}
 	return nil
 }
