@@ -121,19 +121,22 @@ func newModeEngineWithDB(provider ab.LLMProvider, model string, logContext Runti
 		WithOutputFilter(ab.NewOutputFilterChain(
 			ab.DefaultSecretRedactionFilter(),
 		)).
-		// Verification: lightweight local check + intrinsic self-check markers
+		// Verification: local check (no extra LLM call)
 		WithVerification(ab.VerificationChain{Strategies: []ab.VerificationStrategy{
 			ab.LocalVerification{MustNotBeEmpty: true, MinLength: 5, NoHallucination: true},
 			ab.CompletionVerification{MinLength: 5},
-			ab.IntrinsicVerification{MinMarkers: 1},
 		}}).
 		WithMaxVerifyRetry(1).
-		// Compaction: episodic — preserves key decisions, summarizes the rest
+		// Compaction: episodic with differential scoring (pre-filters low-importance msgs)
 		WithCompactor(&ab.EpisodicCompactor{
-			Provider: provider,
-			Model:    model,
-			MaxWords: 400,
+			Provider:            provider,
+			Model:               model,
+			MaxWords:            400,
+			ImportanceThreshold: 0.25,
+			EpisodeThreshold:    0.65,
 		}).
+		// Skills: cap LayerSkills at 6k tokens to prevent system prompt overflow
+		WithMaxSkillTokens(6_000).
 		// Memory inference: extract persistent facts, deduplicated
 		WithMemoryWriter(&ab.InferredMemoryWriter{
 			Provider:        provider,
