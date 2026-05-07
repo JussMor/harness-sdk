@@ -118,6 +118,10 @@ export interface StreamSubagentResult {
   stop_reason: string
   duration_ms: number
   error?: string
+  /** Model used by this subagent if overridden. */
+  model?: string
+  /** Custom system prompt assigned to this subagent. */
+  system_prompt?: string
 }
 
 export interface StreamArtifact {

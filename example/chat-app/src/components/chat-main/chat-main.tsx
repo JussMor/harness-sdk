@@ -1227,6 +1227,9 @@ function SubagentResultCard({ result }: { result: StreamSubagentResult }) {
         {open ? <ChevronDown size={12} /> : <ChevronRight size={12} />}
         <Bot size={12} />
         <span className="subagent-card-id">{result.id}</span>
+        {result.model && (
+          <code className="subagent-card-model">{result.model.split("-").slice(0, 2).join("-")}</code>
+        )}
         <span className="subagent-card-meta">
           {result.turns > 0 && `${result.turns} turns · `}
           {result.duration_ms > 0 && formatDurationMs(result.duration_ms)}
@@ -1234,6 +1237,12 @@ function SubagentResultCard({ result }: { result: StreamSubagentResult }) {
       </button>
       {open && (
         <div className="subagent-card-body">
+          {result.system_prompt && (
+            <details className="subagent-card-prompt">
+              <summary>System prompt</summary>
+              <pre>{result.system_prompt}</pre>
+            </details>
+          )}
           <p className="subagent-card-task">
             <strong>Task:</strong> {result.task}
           </p>
