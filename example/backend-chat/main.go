@@ -169,10 +169,19 @@ func (a *BackendChatApp) handleEval(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// isSandboxOutput returns true for tools that produce rich sandbox outputs.
-func isSandboxOutput(toolName string) bool {
-	switch toolName {
-	case "bash", "code_interpreter", "file_write", "file_read":
+// isSandboxOutput returns true for tools whose category is compute or workspace
+// (sandbox-backed tools that may produce rich outputs). Uses the ToolRegistry
+// to avoid hardcoding tool names.
+func isSandboxOutput(toolName string, registry *ab.ToolRegistry) bool {
+	if registry == nil {
+		return false
+	}
+	tool := registry.Get(toolName)
+	if tool == nil {
+		return false
+	}
+	switch tool.Category {
+	case ab.ToolCategoryCompute, ab.ToolCategoryWorkspace:
 		return true
 	}
 	return false
@@ -496,8 +505,9 @@ func (a *BackendChatApp) handleStream(w http.ResponseWriter, r *http.Request, ch
 	if req.HumanInLoop {
 		_, agentRT.runtime = agentRT.runtime.WithHumanApproval(ab.DefaultApprovalPolicy)
 	}
-	// Register the gate so the token-resolve endpoint can deliver responses.
-	ensureInterruptRegistry().Register(chatID, gate)
+	// Register the runtime's actual gate — WithHumanApproval may have replaced
+	// the original gate with its own internal one.
+	ensureInterruptRegistry().Register(chatID, agentRT.runtime.InterruptGate())
 	defer ensureInterruptRegistry().Unregister(chatID)
 
 	conv, err := LoadOrCreateConversation(ctx, agentRT.convStore, chatID, history)
@@ -541,6 +551,9 @@ func (a *BackendChatApp) handleStream(w http.ResponseWriter, r *http.Request, ch
 				d, _ := json.Marshal(map[string]string{"thinking": ev.Thinking})
 				sseWrite("thinking", string(d))
 			}
+
+		case ab.StreamEventTurnComplete:
+			sseWrite("turn_complete", "{}")
 
 		case ab.StreamEventInterruptRequired:
 			if ev.Interrupt != nil {
@@ -630,7 +643,7 @@ func (a *BackendChatApp) handleStream(w http.ResponseWriter, r *http.Request, ch
 				_ = lastToolCall // used above
 
 				// For sandbox tools, emit structured sandbox_output event
-				if isSandboxOutput(ev.ToolResult.Name) {
+				if isSandboxOutput(ev.ToolResult.Name, agentRT.tools) {
 					if sbData := parseSandboxOutput(ev.ToolResult.Content); sbData != nil {
 						sbJSON, _ := json.Marshal(sbData)
 						sseWrite("sandbox_output", string(sbJSON))
@@ -730,22 +743,29 @@ func (a *BackendChatApp) handleStream(w http.ResponseWriter, r *http.Request, ch
 			_ = a.pub.PublishChatMessage(ctx, chatID, assistantMsg)
 
 			// Auto-persist artifacts detected from stream (file_write tool calls)
-			// and emit artifact SSE events so the frontend canvas can show them.
+			// and emit as unified SDK Artifact shape via "artifact_created".
 			for _, metaArt := range streamMeta.Artifacts {
 				art, ver, err := CreateArtifact(ctx, a.db, a.r2,
 					chatID, &assistantMsg.ID,
 					metaArt.Language, metaArt.Path, metaArt.Content,
 				)
 				if err == nil {
-					d, _ := json.Marshal(map[string]any{
-						"id":       art.ID,
-						"language": art.Language,
-						"title":    art.Title,
-						"version":  ver.Version,
-						"content":  ver.Content,
-						"r2Url":    ver.R2URL,
-					})
-					sseWrite("artifact", string(d))
+					unified := ab.Artifact{
+						ID:        art.ID,
+						Kind:      ab.ArtifactKindFile,
+						Placement: ab.ArtifactPlacementCanvas,
+						CreatedAt: art.CreatedAt,
+						File: &ab.FileArtifact{
+							Title:    art.Title,
+							Language: art.Language,
+							Path:     metaArt.Path,
+							Content:  ver.Content,
+							URL:      ver.R2URL,
+							Version:  ver.Version,
+						},
+					}
+					d, _ := json.Marshal(unified)
+					sseWrite("artifact_created", string(d))
 				}
 			}
 

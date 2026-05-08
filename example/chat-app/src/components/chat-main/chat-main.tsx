@@ -491,6 +491,11 @@ export function ChatMain({
         return
       }
 
+      if (event.type === "turn_complete") {
+        pushTimeline("LLM turn complete — dispatching tools", "info")
+        return
+      }
+
       if (event.type === "sandbox_output") {
         // Rich sandbox output (HTML, image, etc.) — show in canvas
         const data = event.data
@@ -581,27 +586,50 @@ export function ChatMain({
         event.type === "artifact_updated"
       ) {
         const a = event.data
-        if (a.kind !== "component") return
-        const placement = a.placement ?? "canvas"
-        if (placement === "canvas") {
-          // Mount in the dedicated side panel; close any open file canvas
-          // so the two surfaces don't fight for the same slot.
-          setCanvasComponent(a)
-          setActiveArtifact(null)
-          setIsArtifactStreaming(false)
-        } else {
-          setComponentArtifacts((prev) => {
-            const idx = prev.findIndex((x) => x.id === a.id)
-            if (idx === -1) return [...prev, a]
+        if (a.kind === "component") {
+          const placement = a.placement ?? "canvas"
+          if (placement === "canvas") {
+            // Mount in the dedicated side panel; close any open file canvas
+            // so the two surfaces don't fight for the same slot.
+            setCanvasComponent(a)
+            setActiveArtifact(null)
+            setIsArtifactStreaming(false)
+          } else {
+            setComponentArtifacts((prev) => {
+              const idx = prev.findIndex((x) => x.id === a.id)
+              if (idx === -1) return [...prev, a]
+              const next = prev.slice()
+              next[idx] = a
+              return next
+            })
+          }
+          pushTimeline(
+            `Rendered ${a.component?.name ?? "component"} (${placement})`,
+            "info"
+          )
+        } else if (a.kind === "file" && a.file) {
+          // File artifact — show in the artifact canvas
+          const fileArt: Artifact = {
+            id: a.id,
+            language: a.file.language ?? "",
+            content: a.file.content ?? "",
+            complete: true,
+            title: a.file.title ?? a.file.path ?? "Untitled",
+          }
+          setActiveArtifact(fileArt)
+          setAllArtifacts((prev) => {
+            const idx = prev.findIndex((x) => x.id === fileArt.id)
+            if (idx === -1) return [...prev, fileArt]
             const next = prev.slice()
-            next[idx] = a
+            next[idx] = fileArt
             return next
           })
+          setIsArtifactStreaming(false)
+          pushTimeline(
+            `File artifact: ${a.file.title ?? a.file.path ?? "file"}`,
+            "info"
+          )
         }
-        pushTimeline(
-          `Rendered ${a.component?.name ?? "component"} (${placement})`,
-          "info"
-        )
         return
       }
 
@@ -823,7 +851,7 @@ export function ChatMain({
                 await api.resolveInterrupt(
                   pendingInterrupt.id,
                   chatID,
-                  response,
+                  response
                 )
               } finally {
                 setPendingInterrupt(null)

@@ -273,6 +273,8 @@ function adaptSSEEvent(type: string, dataText: string): StreamEvent | null {
       return { type: "delta", data: parsed as { delta?: string } }
     case "thinking":
       return { type: "thinking", data: parsed as { thinking?: string } }
+    case "turn_complete":
+      return { type: "turn_complete", data: {} }
     case "tool_call":
       return {
         type: "tool_call",
@@ -289,16 +291,26 @@ function adaptSSEEvent(type: string, dataText: string): StreamEvent | null {
         data: parsed as Record<string, unknown>,
       }
     case "artifact":
+      // Legacy: backend now emits file artifacts as "artifact_created"
+      // with the unified SDK Artifact shape. Map for backward compat.
       return {
-        type: "artifact",
-        data: parsed as {
-          id: string
-          language: string
-          title: string
-          version: number
-          content: string
-          r2Url?: string
-        },
+        type: "artifact_created",
+        data: {
+          id: (parsed as Record<string, unknown>).id as string,
+          kind: "file" as const,
+          placement: "canvas" as const,
+          file: {
+            title: (parsed as Record<string, unknown>).title as string,
+            language: (parsed as Record<string, unknown>).language as string,
+            content: (parsed as Record<string, unknown>).content as string,
+            url: (parsed as Record<string, unknown>).r2Url as
+              | string
+              | undefined,
+            version: (parsed as Record<string, unknown>).version as
+              | number
+              | undefined,
+          },
+        } satisfies import("./types").StreamComponentArtifact,
       }
     case "plan_proposed":
       return {
