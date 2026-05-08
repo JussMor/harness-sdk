@@ -18,6 +18,7 @@ import (
 // agentRuntime wires the SDK Engine + Runtime for a single request.
 type agentRuntime struct {
 	chatID         int64
+	modelName      string // effective model for this run (e.g. "anthropic/claude-haiku-4-5-20251001")
 	tools          *ab.ToolRegistry
 	engine         *ab.Engine
 	runtime        *ab.Runtime
@@ -449,17 +450,23 @@ func (r *agentRuntime) newSubagentDispatchTool() *ab.Tool {
 				model := strings.TrimSpace(asString(m["model"]))
 				allowWrites, _ := m["allow_memory_writes"].(bool)
 
-				subs = append(subs, ab.Subagent{
-					ID:                id,
-					Task:              task,
-					Engine:            subEngine,
-					Mode:              strings.TrimSpace(asString(m["mode"])),
-					MaxTurns:          maxTurns,
-					Timeout:           timeout,
-					SystemPrompt:      systemPrompt,
-					Model:             model,
-					AllowMemoryWrites: allowWrites,
-				})
+			// Default to the parent's effective model so subagents always
+			// send a valid model name to the LLM provider.
+			effectiveModel := model
+			if effectiveModel == "" {
+				effectiveModel = r.modelName
+			}
+			subs = append(subs, ab.Subagent{
+				ID:                id,
+				Task:              task,
+				Engine:            subEngine,
+				Mode:              strings.TrimSpace(asString(m["mode"])),
+				MaxTurns:          maxTurns,
+				Timeout:           timeout,
+				SystemPrompt:      systemPrompt,
+				Model:             effectiveModel,
+				AllowMemoryWrites: allowWrites,
+			})
 			}
 
 			results := ab.RunSubagentsInParallel(ctx, subs)

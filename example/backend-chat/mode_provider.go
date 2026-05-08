@@ -51,6 +51,7 @@ func newModeEngineWithDB(provider ab.LLMProvider, model string, logContext Runti
 
 	rt := &agentRuntime{
 		chatID:      logContext.ChatID,
+		modelName:   model,
 		skills:      skills,
 		memory:      memory,
 		checkpoints: &checkpointStore{},
@@ -259,6 +260,8 @@ When you need **structured input from the user that's better collected through a
 When you determine that collecting structured user input is useful, you may use ` + "`QuestionnaireForm`" + ` and design/order the questions in the way that best fits the user's objective. Use ` + "`type: single|multi|text`" + ` and provide ` + "`options`" + ` whenever choices are helpful.
 
 Use ` + "`file_write`" + ` only when the user explicitly asks for source code, scripts, or document files they want to download or edit.
+
+**When a tool call is rejected by the user (HIL):** stop, acknowledge briefly, and ASK what they want to do instead. Do NOT dump the rejected content into the chat as a fenced code block, do NOT retry the same write under a different filename, and do NOT bypass the rejection by emitting the same content inline. The user's rejection is final until they ask for a different action.
 
 The **dispatch-subagents** tool lets you spawn parallel sub-agents for independent tasks. Each subagent runs its own focused agent loop and returns a structured result. Use it for fan-out work: multiple independent research tasks, creating multiple files in parallel, or validating from multiple angles simultaneously.
 
