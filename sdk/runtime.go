@@ -55,8 +55,9 @@ type Runtime struct {
 	compactor       Compactor
 	maxMemoryTokens int          // 0 = unlimited
 	memoryRootsV2   []MemoryRoot // nil = use DefaultMemoryRoots
-	thinkingBudget  int          // 0 = disabled; >0 enables extended thinking
-	approvalGate    *ApprovalGate // non-nil when human-in-the-loop is active
+	thinkingBudget  int            // 0 = disabled; >0 enables extended thinking
+	interruptGate   *InterruptGate // non-nil when human-in-the-loop / interrupts are active
+	webhooks        *WebhookDispatcher // non-nil when outbound webhooks are configured
 }
 
 // Tokenizer estimates token count for a string. Replace the default heuristic
@@ -221,6 +222,28 @@ func (r *Runtime) WithMaxSkillTokens(maxTokens int) *Runtime {
 	}
 	return r
 }
+
+// WithWebhooks attaches a WebhookDispatcher to the runtime. Stream events
+// emitted by RunStream are forwarded to all matching subscriptions in the
+// store, signed with HMAC-SHA256.
+//
+// The returned dispatcher is owned by the runtime; call dispatcher.Close()
+// when shutting down the process to drain in-flight deliveries.
+//
+// Usage:
+//
+//	store := ab.NewInMemoryWebhookStore()
+//	dispatcher, runtime := ab.NewRuntime(engine).WithWebhooks(store)
+//	defer dispatcher.Close()
+func (r *Runtime) WithWebhooks(store WebhookStore) (*WebhookDispatcher, *Runtime) {
+	d := NewWebhookDispatcher(store, nil)
+	r.webhooks = d
+	return d, r
+}
+
+// Webhooks returns the dispatcher attached to the runtime, or nil if
+// outbound webhooks are not configured.
+func (r *Runtime) Webhooks() *WebhookDispatcher { return r.webhooks }
 
 // Run executes a conversation turn. The Conversation accumulates state
 // across calls — first call is "cold" (full orientation), subsequent calls
