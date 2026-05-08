@@ -256,6 +256,8 @@ When the user asks to **display, show, render, or visualize** a domain UI (e.g. 
 
 When you need **structured input from the user that's better collected through a UI than a free-form question** (dates, picks, multi-field forms), call ` + "`await_component_input`" + ` instead. That tool renders the component AND pauses you until the user submits — its result is the user's data as JSON, which you reason against on the next turn.
 
+When you determine that collecting structured user input is useful, you may use ` + "`QuestionnaireForm`" + ` and design/order the questions in the way that best fits the user's objective. Use ` + "`type: single|multi|text`" + ` and provide ` + "`options`" + ` whenever choices are helpful.
+
 Use ` + "`file_write`" + ` only when the user explicitly asks for source code, scripts, or document files they want to download or edit.
 
 The **dispatch-subagents** tool lets you spawn parallel sub-agents for independent tasks. Each subagent runs its own focused agent loop and returns a structured result. Use it for fan-out work: multiple independent research tasks, creating multiple files in parallel, or validating from multiple angles simultaneously.

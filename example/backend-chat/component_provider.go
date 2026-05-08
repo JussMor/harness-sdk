@@ -47,6 +47,11 @@ var componentCatalog = []componentSpec{
 		Description: "Render a form to schedule an appointment for a patient.",
 		PropsHint:   `{"patientId":"string","defaultDate":"YYYY-MM-DDTHH:MM"}`,
 	},
+	{
+		Name:        "QuestionnaireForm",
+		Description: "Render a dynamic questionnaire with single-choice, multi-choice, and text questions.",
+		PropsHint:   `{"title":"string","description":"string","submitLabel":"string","questions":[{"id":"string","label":"string","type":"single|multi|text","options":["string"],"required":true}]}`,
+	},
 }
 
 // describeComponentCatalog renders the catalog for the system prompt so the

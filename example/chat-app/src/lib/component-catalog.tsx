@@ -62,6 +62,24 @@ interface AppointmentFormProps {
   onSubmit?: (data: unknown) => void
 }
 
+type QuestionnaireQuestionType = "single" | "multi" | "text"
+
+interface QuestionnaireQuestion {
+  id: string
+  label: string
+  type?: QuestionnaireQuestionType
+  options?: Array<string>
+  required?: boolean
+}
+
+interface QuestionnaireFormProps {
+  title?: string
+  description?: string
+  questions?: Array<QuestionnaireQuestion>
+  submitLabel?: string
+  onSubmit?: (data: unknown) => void
+}
+
 function AppointmentForm(props: Record<string, unknown>) {
   const p = props as AppointmentFormProps
   return (
@@ -96,8 +114,88 @@ function AppointmentForm(props: Record<string, unknown>) {
   )
 }
 
+function QuestionnaireForm(props: Record<string, unknown>) {
+  const p = props as QuestionnaireFormProps
+  const questions = p.questions ?? []
+  return (
+    <form
+      className="space-y-3 rounded-md border p-4"
+      onSubmit={(e) => {
+        e.preventDefault()
+        const fd = new FormData(e.currentTarget)
+        const answers: Record<string, unknown> = {}
+        for (const q of questions) {
+          const type = q.type ?? "single"
+          if (type === "multi") {
+            answers[q.id] = fd.getAll(q.id).map((v) => String(v))
+            continue
+          }
+          answers[q.id] = String(fd.get(q.id) ?? "")
+        }
+        p.onSubmit?.(answers)
+      }}
+    >
+      <div className="space-y-1">
+        <div className="font-medium">{p.title ?? "Questionnaire"}</div>
+        {p.description && (
+          <p className="text-sm text-muted-foreground">{p.description}</p>
+        )}
+      </div>
+
+      {questions.map((q) => {
+        const type = q.type ?? "single"
+        const options = q.options ?? []
+        return (
+          <fieldset key={q.id} className="space-y-2 rounded border p-3">
+            <legend className="px-1 text-sm font-medium">{q.label}</legend>
+
+            {type === "text" && (
+              <textarea
+                name={q.id}
+                className="w-full rounded border p-2 text-sm"
+                rows={3}
+                required={q.required}
+                placeholder="Type your answer"
+              />
+            )}
+
+            {type === "single" &&
+              options.map((opt) => (
+                <label key={opt} className="flex items-center gap-2 text-sm">
+                  <input
+                    type="radio"
+                    name={q.id}
+                    value={opt}
+                    required={q.required}
+                  />
+                  {opt}
+                </label>
+              ))}
+
+            {type === "multi" &&
+              options.map((opt) => (
+                <label key={opt} className="flex items-center gap-2 text-sm">
+                  <input type="checkbox" name={q.id} value={opt} />
+                  {opt}
+                </label>
+              ))}
+          </fieldset>
+        )
+      })}
+
+      <button
+        type="submit"
+        className="rounded bg-primary px-3 py-1 text-sm text-primary-foreground"
+      >
+        {p.submitLabel ?? "Submit"}
+      </button>
+    </form>
+  )
+}
+
 export const componentCatalog: ComponentCatalog = {
   PatientChart: { component: PatientChart },
   MedicationList: { component: MedicationList },
   AppointmentForm: { component: AppointmentForm },
+  QuestionnaireForm: { component: QuestionnaireForm },
 }
