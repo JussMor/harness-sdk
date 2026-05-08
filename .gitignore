@@ -54,3 +54,4 @@ example/backend-chat/.env.*
 count.txt
 todos.json
 *.log
+/backend-chat
