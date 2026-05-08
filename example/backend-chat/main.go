@@ -76,10 +76,19 @@ func main() {
 	mux.HandleFunc("/api/providers", app.handleProviders)
 	mux.HandleFunc("/api/chats", app.handleChats)
 	mux.HandleFunc("/api/chats/", app.handleChatRoutes)
+	mux.HandleFunc("/api/confirm", app.handleConfirm)
+	mux.HandleFunc("/api/webhooks", app.handleWebhooks)
+	mux.HandleFunc("/api/webhooks/", app.handleWebhookByID)
+	mux.HandleFunc("/api/interrupts/", app.handleInterruptResolve)
 	mux.HandleFunc("/admin/eval", app.handleEval)
 	mux.HandleFunc("/api/threads", app.handleThreads)
 	mux.HandleFunc("/api/threads/", app.handleThreadRoutes)
 	app.registerArtifactRoutes(mux)
+
+	// Best-effort: make sure OpenSandbox is up before accepting traffic so
+	// the very first chat with a tool call does not fail with "connection
+	// refused". When the API key is unset this is a no-op.
+	ensureOpenSandbox()
 
 	log.Printf("backend-chat listening on %s", addr)
 	if err := http.ListenAndServe(addr, withRequestLog(withCORS(mux))); err != nil {
@@ -396,11 +405,12 @@ func (a *BackendChatApp) handleStream(w http.ResponseWriter, r *http.Request, ch
 	}
 
 	var req struct {
-		Prompt      string `json:"prompt"`
-		Mode        string `json:"mode"`
-		Provider    string `json:"provider"`
-		Model       string `json:"model"`
-		ClientRunID string `json:"clientRunId"`
+		Prompt       string `json:"prompt"`
+		Mode         string `json:"mode"`
+		Provider     string `json:"provider"`
+		Model        string `json:"model"`
+		ClientRunID  string `json:"clientRunId"`
+		HumanInLoop  bool   `json:"human_in_loop"` // enable HIL for this stream
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeErr(w, http.StatusBadRequest, err)
@@ -479,6 +489,20 @@ func (a *BackendChatApp) handleStream(w http.ResponseWriter, r *http.Request, ch
 		return
 	}
 
+	// Human-in-the-loop: wire approval gate when requested. Whether HIL is on
+	// or off we always register an ApprovalGate so its inner InterruptGate
+	// can be used by tools that need user input (e.g. `await_component_input`)
+	// regardless of the safety policy. When HIL is off we install a no-op
+	// policy so no tool call ever pauses for approval.
+	policy := func(ab.ToolCallEntry) (bool, string) { return false, "" }
+	if req.HumanInLoop {
+		policy = ab.DefaultApprovalPolicy
+	}
+	gate, updatedRuntime := agentRT.runtime.WithHumanApproval(policy)
+	agentRT.runtime = updatedRuntime
+	hilRegistry.Register(chatID, gate)
+	defer hilRegistry.Unregister(chatID)
+
 	conv, err := LoadOrCreateConversation(ctx, agentRT.convStore, chatID, history)
 	if err != nil {
 		d, _ := json.Marshal(map[string]string{"error": err.Error()})
@@ -496,6 +520,10 @@ func (a *BackendChatApp) handleStream(w http.ResponseWriter, r *http.Request, ch
 	var fullResponse strings.Builder
 	var streamMeta MessageMetadata
 	var lastToolCall string // track last tool_call name for pairing with result
+	// Pending file_write artifacts queued at tool_call time. Only committed to
+	// streamMeta.Artifacts when the matching tool_result reports success — this
+	// prevents rejected/blocked file writes from leaking into the canvas.
+	pendingFileArtifacts := make([]MetadataArtifact, 0)
 	for {
 		select {
 		case <-ctx.Done():
@@ -517,6 +545,27 @@ func (a *BackendChatApp) handleStream(w http.ResponseWriter, r *http.Request, ch
 				sseWrite("thinking", string(d))
 			}
 
+		case ab.StreamEventConfirmationRequired:
+			if ev.ConfirmationRequest != nil {
+				d, _ := json.Marshal(map[string]any{
+					"id":     ev.ConfirmationRequest.ID,
+					"tool":   ev.ConfirmationRequest.ToolCall.Name,
+					"args":   ev.ConfirmationRequest.ToolCall.Arguments,
+					"reason": ev.ConfirmationRequest.Reason,
+				})
+				sseWrite("confirmation_required", string(d))
+			}
+
+		case ab.StreamEventConfirmationResolved:
+			if ev.ConfirmationRequest != nil {
+				d, _ := json.Marshal(map[string]any{
+					"id":      ev.ConfirmationRequest.ID,
+					"tool":    ev.ConfirmationRequest.ToolCall.Name,
+					"approved": true,
+				})
+				sseWrite("confirmation_resolved", string(d))
+			}
+
 		case ab.StreamEventToolCall:
 			if ev.ToolCall != nil {
 				// Parse args JSON string into object so frontend receives structured data
@@ -532,14 +581,17 @@ func (a *BackendChatApp) handleStream(w http.ResponseWriter, r *http.Request, ch
 
 				lastToolCall = ev.ToolCall.Name
 
-				// Collect file_write as artifact
+				// Queue file_write as a pending artifact. We only commit it to
+				// streamMeta.Artifacts (which is what gets persisted + emitted as
+				// `artifact` SSE on done) once the matching tool_result reports
+				// success. Rejected/blocked writes drop the queue entry.
 				if ev.ToolCall.Name == "file_write" {
 					var fileArgs struct {
 						Path    string `json:"path"`
 						Content string `json:"content"`
 					}
 					if json.Unmarshal([]byte(ev.ToolCall.Arguments), &fileArgs) == nil && fileArgs.Content != "" {
-						streamMeta.Artifacts = append(streamMeta.Artifacts, MetadataArtifact{
+						pendingFileArtifacts = append(pendingFileArtifacts, MetadataArtifact{
 							Path:     fileArgs.Path,
 							Language: inferLangFromPath(fileArgs.Path),
 							Content:  fileArgs.Content,
@@ -562,6 +614,18 @@ func (a *BackendChatApp) handleStream(w http.ResponseWriter, r *http.Request, ch
 					"error":   ev.ToolResult.Error != nil,
 				})
 				sseWrite("tool_result", string(d))
+
+				// Resolve pending file_write queue (FIFO). Commit on success,
+				// drop on error or safety-blocked result so rejected writes never
+				// leak to the canvas.
+				if ev.ToolResult.Name == "file_write" && len(pendingFileArtifacts) > 0 {
+					next := pendingFileArtifacts[0]
+					pendingFileArtifacts = pendingFileArtifacts[1:]
+					blocked := strings.HasPrefix(ev.ToolResult.Content, "[blocked")
+					if ev.ToolResult.Error == nil && !blocked {
+						streamMeta.Artifacts = append(streamMeta.Artifacts, next)
+					}
+				}
 
 				// Pair result with last matching tool call in metadata
 				for i := len(streamMeta.ToolCalls) - 1; i >= 0; i-- {
@@ -601,6 +665,16 @@ func (a *BackendChatApp) handleStream(w http.ResponseWriter, r *http.Request, ch
 						}
 					}
 				}
+			}
+
+		case ab.StreamEventArtifactCreated, ab.StreamEventArtifactUpdated:
+			if ev.Artifact != nil {
+				d, _ := json.Marshal(ev.Artifact)
+				eventName := "artifact_created"
+				if ev.Type == ab.StreamEventArtifactUpdated {
+					eventName = "artifact_updated"
+				}
+				sseWrite(eventName, string(d))
 			}
 
 		case ab.StreamEventPlanProposed:
@@ -696,7 +770,7 @@ func (a *BackendChatApp) handleStream(w http.ResponseWriter, r *http.Request, ch
 func withCORS(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Access-Control-Allow-Origin", "*")
-		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
+		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Harness-Protocol, X-Harness-Event-Id, X-Harness-Signature")
 		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS")
 		if r.Method == http.MethodOptions {
 			w.WriteHeader(http.StatusNoContent)

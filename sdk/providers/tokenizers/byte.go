@@ -48,6 +48,12 @@ func (t *ByteTokenizer) Count(text string) int {
 	return int(float64(runes) / t.CharsPerToken)
 }
 
+// Encode is not supported — returns nil. Use TiktokenTokenizer for real encoding.
+func (t *ByteTokenizer) Encode(_ string) []int { return nil }
+
+// Decode is not supported — returns "". Use TiktokenTokenizer for real decoding.
+func (t *ByteTokenizer) Decode(_ []int) string { return "" }
+
 // Verify ByteTokenizer implements the SDK interface.
 var _ autobuild.Tokenizer = (*ByteTokenizer)(nil)
 
@@ -105,6 +111,12 @@ func (ClaudeTokenizer) Count(text string) int {
 	estimate := float64(words)*1.3 + float64(specials)*0.4 + float64(nonASCII)*0.6
 	return int(estimate)
 }
+
+// Encode is not supported — returns nil.
+func (ClaudeTokenizer) Encode(_ string) []int { return nil }
+
+// Decode is not supported — returns "".
+func (ClaudeTokenizer) Decode(_ []int) string { return "" }
 
 // Verify ClaudeTokenizer implements the SDK interface.
 var _ autobuild.Tokenizer = (*ClaudeTokenizer)(nil)

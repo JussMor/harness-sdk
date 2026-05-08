@@ -53,15 +53,29 @@ type Runtime struct {
 	sessionContext  SessionContextProvider
 	outputFilter    OutputFilter
 	compactor       Compactor
-	maxMemoryTokens int        // 0 = unlimited
+	maxMemoryTokens int          // 0 = unlimited
 	memoryRootsV2   []MemoryRoot // nil = use DefaultMemoryRoots
-	thinkingBudget  int          // 0 = disabled; >0 enables extended thinking
+	thinkingBudget  int            // 0 = disabled; >0 enables extended thinking
+	interruptGate   *InterruptGate // non-nil when human-in-the-loop / interrupts are active
+	webhooks        *WebhookDispatcher // non-nil when outbound webhooks are configured
 }
 
 // Tokenizer estimates token count for a string. Replace the default heuristic
 // with a real tokenizer (tiktoken, claude-tokenizer) for accurate budgets.
+//
+// Minimum implementation: Count. Implement Encode/Decode for accurate
+// truncation at token boundaries (required by evictMemoryToTokenBudget).
 type Tokenizer interface {
+	// Count returns the number of tokens in text.
 	Count(text string) int
+
+	// Encode converts text to a token ID sequence.
+	// Optional: return nil to fall back to character-boundary truncation.
+	Encode(text string) []int
+
+	// Decode converts a token ID sequence back to text.
+	// Optional: return "" if Encode is not implemented.
+	Decode(tokens []int) string
 }
 
 // HeuristicTokenizer is the default — chars/4. Good enough for English.
@@ -70,6 +84,27 @@ type Tokenizer interface {
 type HeuristicTokenizer struct{}
 
 func (HeuristicTokenizer) Count(text string) int { return len(text) / 4 }
+func (HeuristicTokenizer) Encode(text string) []int { return nil } // not supported
+func (HeuristicTokenizer) Decode(tokens []int) string { return "" } // not supported
+
+// TruncateToTokens truncates text to at most maxTokens tokens using the given
+// tokenizer. If Encode returns nil (heuristic tokenizer), falls back to
+// character-boundary truncation at maxTokens*4 characters.
+func TruncateToTokens(text string, maxTokens int, tok Tokenizer) string {
+	if tok.Count(text) <= maxTokens {
+		return text
+	}
+	tokens := tok.Encode(text)
+	if tokens != nil && len(tokens) > maxTokens {
+		return tok.Decode(tokens[:maxTokens])
+	}
+	// Fallback: character truncation
+	limit := maxTokens * 4
+	if limit > len(text) {
+		limit = len(text)
+	}
+	return text[:limit]
+}
 
 // ObservationFilter decides if a tool result should become an Observation.
 type ObservationFilter func(call ToolCallEntry, result ToolResult) Observation
@@ -173,6 +208,42 @@ func (r *Runtime) WithThinkingBudget(budgetTokens int) *Runtime {
 	r.thinkingBudget = budgetTokens
 	return r
 }
+
+// WithMaxSkillTokens caps how many tokens of skill content can be injected
+// into LayerSkills. When combined skill content exceeds this, it is truncated
+// at token boundaries using the configured tokenizer.
+//
+// Without this cap, loading many skills simultaneously can overflow the system
+// prompt context window. Recommended: 4000–8000 tokens.
+// Default 0 = no cap.
+func (r *Runtime) WithMaxSkillTokens(maxTokens int) *Runtime {
+	if r.engine.HasPrompt() {
+		r.engine.Prompt.SetMaxLayerTokens(LayerSkills, maxTokens)
+	}
+	return r
+}
+
+// WithWebhooks attaches a WebhookDispatcher to the runtime. Stream events
+// emitted by RunStream are forwarded to all matching subscriptions in the
+// store, signed with HMAC-SHA256.
+//
+// The returned dispatcher is owned by the runtime; call dispatcher.Close()
+// when shutting down the process to drain in-flight deliveries.
+//
+// Usage:
+//
+//	store := ab.NewInMemoryWebhookStore()
+//	dispatcher, runtime := ab.NewRuntime(engine).WithWebhooks(store)
+//	defer dispatcher.Close()
+func (r *Runtime) WithWebhooks(store WebhookStore) (*WebhookDispatcher, *Runtime) {
+	d := NewWebhookDispatcher(store, nil)
+	r.webhooks = d
+	return d, r
+}
+
+// Webhooks returns the dispatcher attached to the runtime, or nil if
+// outbound webhooks are not configured.
+func (r *Runtime) Webhooks() *WebhookDispatcher { return r.webhooks }
 
 // Run executes a conversation turn. The Conversation accumulates state
 // across calls — first call is "cold" (full orientation), subsequent calls
@@ -481,7 +552,17 @@ func (r *Runtime) warmRefresh(ctx context.Context, userMessage string, conv *Con
 					continue
 				}
 				if r.engine.HasPrompt() {
-					r.engine.Prompt.Append(LayerSkills, "# Skill: "+skill.Name+"\n\n"+skill.Content+"\n\n")
+					existing := r.engine.Prompt.Get(LayerSkills)
+					newContent := existing
+					if newContent != "" {
+						newContent += "\n\n"
+					}
+					newContent += "# Skill: " + skill.Name + "\n\n" + skill.Content + "\n\n"
+					cap := r.engine.Prompt.maxLayerTokens[LayerSkills]
+					if cap > 0 && r.tokenizer.Count(newContent) > cap {
+						newContent = TruncateToTokens(newContent, cap, r.tokenizer)
+					}
+					r.engine.Prompt.Set(LayerSkills, newContent)
 				}
 				conv.MarkSkillLoaded(skill.Name, m.Score, r.tokenizer.Count(skill.Content))
 			}
@@ -539,7 +620,17 @@ func (r *Runtime) matchAndLoadSkills(ctx context.Context, userMessage string, co
 		loadSkill(m.Skill.Name, 0)
 	}
 	if skillContent.Len() > 0 {
-		r.engine.Prompt.Set(LayerSkills, skillContent.String())
+		content := skillContent.String()
+		// Apply token cap on LayerSkills to prevent system prompt overflow
+		// when many skills are loaded simultaneously. Uses the same tokenizer
+		// as the rest of the budget enforcement.
+		if r.engine.HasPrompt() {
+			cap := r.engine.Prompt.maxLayerTokens[LayerSkills]
+			if cap > 0 && r.tokenizer.Count(content) > cap {
+				content = TruncateToTokens(content, cap, r.tokenizer)
+			}
+		}
+		r.engine.Prompt.Set(LayerSkills, content)
 	}
 	return nil
 }

@@ -31,6 +31,20 @@ type StreamEvent struct {
 	// SubagentResult is set when Type=StreamEventSubagentResult.
 	SubagentResult *SubagentResult `json:"subagent_result,omitempty"`
 
+	// ConfirmationRequest is set when Type=StreamEventConfirmationRequired.
+	// LEGACY: prefer Interrupt for new clients. Populated only when the
+	// underlying interrupt is InterruptKindApproval.
+	ConfirmationRequest *ApprovalRequest `json:"confirmation_request,omitempty"`
+
+	// Interrupt is set when Type=StreamEventInterruptRequired or
+	// Type=StreamEventInterruptResolved. Discriminate sub-variants on Kind.
+	Interrupt *InterruptRequest `json:"interrupt,omitempty"`
+
+	// Artifact is set when Type=StreamEventArtifactCreated or
+	// Type=StreamEventArtifactUpdated. Carries a typed payload (file or
+	// generative-UI component) the frontend should render alongside chat.
+	Artifact *Artifact `json:"artifact,omitempty"`
+
 	// Final is the complete accumulated response when Type=StreamEventDone.
 	Final *AgentLoopResult `json:"final,omitempty"`
 
@@ -50,6 +64,31 @@ const (
 	// Thinking content is the model's internal reasoning — not shown to users
 	// by default. Use for debugging, tracing, or advanced UX.
 	StreamEventThinking StreamEventType = "thinking"
+
+	// StreamEventConfirmationRequired is emitted when a tool call needs human
+	// approval. LEGACY alias for backward compatibility — emitted alongside
+	// StreamEventInterruptRequired whenever the interrupt is an Approval.
+	StreamEventConfirmationRequired StreamEventType = "confirmation_required"
+
+	// StreamEventConfirmationResolved is emitted after a confirmation_required
+	// is resolved. LEGACY alias of StreamEventInterruptResolved (Approval kind).
+	StreamEventConfirmationResolved StreamEventType = "confirmation_resolved"
+
+	// StreamEventInterruptRequired is emitted when the agent pauses awaiting
+	// human input. StreamEvent.Interrupt carries the full request — discriminate
+	// the kind via Interrupt.Kind (approval / question / form_input).
+	StreamEventInterruptRequired StreamEventType = "interrupt_required"
+
+	// StreamEventInterruptResolved is emitted when an interrupt is answered.
+	StreamEventInterruptResolved StreamEventType = "interrupt_resolved"
+
+	// StreamEventArtifactCreated is emitted when a tool/skill attaches a new
+	// artifact (file or component) to the turn via EmitArtifact.
+	StreamEventArtifactCreated StreamEventType = "artifact_created"
+
+	// StreamEventArtifactUpdated is emitted when an existing artifact's content
+	// or props change. The Artifact.ID matches a previously created artifact.
+	StreamEventArtifactUpdated StreamEventType = "artifact_updated"
 
 	// StreamEventToolCall is emitted when the LLM decides to call a tool.
 	// Tool execution happens between this event and the next StreamEventToolResult.
@@ -119,6 +158,27 @@ func (r *Runtime) RunStream(ctx context.Context, conv *Conversation, userMessage
 
 	streamProv, hasRealStream := r.engine.LLM.(StreamingLLMProvider)
 
+	// Install an artifact emitter on ctx so tools/skills running during this
+	// stream can call EmitArtifact(ctx, ...) and have their artifacts surface
+	// as StreamEventArtifactCreated events.
+	ctx = WithArtifactEmitter(ctx, func(a Artifact) {
+		select {
+		case <-ctx.Done():
+		case out <- StreamEvent{Type: StreamEventArtifactCreated, Artifact: &a}:
+		}
+	})
+
+	// Install an interrupt requester on ctx so tools can call
+	// RequestInterrupt(ctx, req) to pause the loop and wait for human input.
+	// Only wired when the runtime has an interrupt gate (typically installed
+	// via WithHumanApproval).
+	if r.interruptGate != nil {
+		gate := r.interruptGate
+		ctx = WithInterruptRequester(ctx, func(c context.Context, req InterruptRequest) (InterruptResponse, error) {
+			return gate.Wait(c, req)
+		})
+	}
+
 	go func() {
 		defer close(out)
 
@@ -150,7 +210,29 @@ func (r *Runtime) RunStream(ctx context.Context, conv *Conversation, userMessage
 		}
 	}()
 
-	return out, nil
+	// Fan-out tee: when outbound webhooks are configured, every emitted event
+	// is also published to subscribers. Tee runs in its own goroutine so a
+	// slow webhook subscriber does not stall the consumer SSE stream.
+	if r.webhooks == nil {
+		return out, nil
+	}
+	teed := make(chan StreamEvent, 64)
+	go func() {
+		defer close(teed)
+		for ev := range out {
+			_, _ = r.webhooks.PublishStreamEvent(ctx, ev)
+			select {
+			case <-ctx.Done():
+				// Drain remaining events without forwarding to avoid leaking
+				// the producer goroutine, but stop emitting downstream.
+				for range out {
+				}
+				return
+			case teed <- ev:
+			}
+		}
+	}()
+	return teed, nil
 }
 
 // runStreamInternal executes the full 6-phase lifecycle with real streaming
@@ -236,6 +318,39 @@ func (r *Runtime) runStreamInternal(
 
 	dispatcher := NewToolDispatcher(r.engine.Tools, r.engine.Sandbox)
 
+	// If interrupts are active, forward InterruptRequests to the stream as
+	// StreamEventInterruptRequired. For backward compatibility, Approval-kind
+	// interrupts are ALSO emitted as StreamEventConfirmationRequired so legacy
+	// frontends keep working unchanged. Runs in a separate goroutine because
+	// the gate's Wait() blocks the main loop until the human responds.
+	if r.interruptGate != nil {
+		go func() {
+			for req := range r.interruptGate.Requests() {
+				req := req
+				// New unified event — always emitted.
+				select {
+				case <-ctx.Done():
+					return
+				case out <- StreamEvent{Type: StreamEventInterruptRequired, Interrupt: &req}:
+				}
+				// Legacy event — only for Approval kind.
+				if req.Kind == InterruptKindApproval && req.Approval != nil {
+					legacy := ApprovalRequest{
+						ID:        req.ID,
+						ToolCall:  req.Approval.ToolCall,
+						Reason:    req.Reason,
+						CreatedAt: req.CreatedAt,
+					}
+					select {
+					case <-ctx.Done():
+						return
+					case out <- StreamEvent{Type: StreamEventConfirmationRequired, ConfirmationRequest: &legacy}:
+					}
+				}
+			}
+		}()
+	}
+
 	for turn := 0; turn < 50; turn++ {
 		if ctx.Err() != nil {
 			return ctx.Err()
@@ -310,6 +425,13 @@ func (r *Runtime) runStreamInternal(
 		for _, call := range turnToolCalls {
 			if r.safety != nil {
 				verdict := r.safety.Inspect(ctx, call)
+				// If HIL was involved, emit resolved event
+				if r.interruptGate != nil && (verdict.Decision == SafetyAllow || verdict.Decision == SafetyTransform) {
+					out <- StreamEvent{
+						Type:                StreamEventConfirmationResolved,
+						ConfirmationRequest: &ApprovalRequest{ToolCall: call},
+					}
+				}
 				if verdict.Decision == SafetyBlock {
 					// Emit blocked result as tool_result to the consumer
 					blocked := ToolResult{

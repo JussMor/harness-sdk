@@ -1,10 +1,10 @@
-import { ChatMain } from "@/components/chat-main"
-import type { SidebarChat } from "@/components/chat-sidebar"
-import { ChatSidebar } from "@/components/chat-sidebar"
-import { ChatAPI } from "@/features/chat/api"
-import type { Thread } from "@/features/chat/types"
 import { createFileRoute } from "@tanstack/react-router"
 import { useCallback, useEffect, useMemo, useState } from "react"
+import type { SidebarChat } from "@/components/chat-sidebar"
+import type { Thread } from "@/features/chat/types"
+import { ChatMain } from "@/components/chat-main"
+import { ChatSidebar } from "@/components/chat-sidebar"
+import { ChatAPI } from "@/features/chat/api"
 
 export const Route = createFileRoute("/")({
   component: IndexRoute,

@@ -66,9 +66,10 @@ func BuildLLMFromEnv() ab.LLMProvider {
 		)
 	}
 
-	// Ollama via SDK provider
-	ollamaModel := getenv("OLLAMA_MODEL", "llama3.1")
-	routedProviders["ollama"] = sdkllm.NewOllama(ollamaModel)
+	// Ollama via SDK provider — Chat + ChatStream (NDJSON), native tools, vision
+	ollamaProvider := sdkllm.NewOllama(getenv("OLLAMA_MODEL", "llama3.1"))
+	ollamaProvider.BaseURL = getenv("OLLAMA_BASE_URL", "http://localhost:11434")
+	routedProviders["ollama"] = ollamaProvider
 
 	// Ensure defaultProvider is available
 	if _, ok := routedProviders[defaultProvider]; !ok {

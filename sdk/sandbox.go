@@ -9,7 +9,14 @@ type SandboxDriver interface {
 	Create(ctx context.Context, cfg SandboxConfig) (id string, err error)
 
 	// Exec runs a shell command inside the sandbox identified by id.
+	// Blocks until the command exits. For long-running commands, use ExecStream.
 	Exec(ctx context.Context, id string, command string) (ExecResult, error)
+
+	// ExecStream runs a shell command and streams its output line by line.
+	// The returned channel closes when the command exits.
+	// Closing ctx cancels the command. Not all drivers support this —
+	// return nil to signal "not supported" (caller falls back to Exec).
+	ExecStream(ctx context.Context, id string, command string) (<-chan ExecOutput, error)
 
 	// WriteFile writes content to path inside the sandbox.
 	WriteFile(ctx context.Context, id string, path string, content string) error
@@ -25,6 +32,18 @@ type SandboxDriver interface {
 
 	// IP returns the reachable IP address of the sandbox.
 	IP(ctx context.Context, id string) (string, error)
+}
+
+// ExecOutput is a single chunk of streamed command output.
+type ExecOutput struct {
+	// Stream is "stdout" or "stderr".
+	Stream string `json:"stream"`
+
+	// Data is the raw text chunk (may be a partial line).
+	Data string `json:"data"`
+
+	// ExitCode is set when the command has finished (Stream == "exit").
+	ExitCode *int `json:"exit_code,omitempty"`
 }
 
 // SandboxConfig holds parameters for provisioning a new sandbox.

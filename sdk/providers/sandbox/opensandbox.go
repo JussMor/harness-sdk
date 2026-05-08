@@ -135,6 +135,60 @@ func (d *OpenSandboxDriver) Exec(ctx context.Context, sandboxID, command string)
 	return toExecResult(exec), nil
 }
 
+// ExecStream runs a shell command and streams output line by line.
+// Uses ExecutionHandlers from the OpenSandbox SDK for live stdout/stderr.
+func (d *OpenSandboxDriver) ExecStream(ctx context.Context, sandboxID, command string) (<-chan autobuild.ExecOutput, error) {
+	ci, err := d.resolve(ctx, sandboxID)
+	if err != nil {
+		return nil, err
+	}
+
+	out := make(chan autobuild.ExecOutput, 64)
+
+	handlers := &opensandbox.ExecutionHandlers{
+		OnStdout: func(msg opensandbox.OutputMessage) error {
+			select {
+			case out <- autobuild.ExecOutput{Stream: "stdout", Data: msg.Text}:
+			case <-ctx.Done():
+				return ctx.Err()
+			}
+			return nil
+		},
+		OnStderr: func(msg opensandbox.OutputMessage) error {
+			select {
+			case out <- autobuild.ExecOutput{Stream: "stderr", Data: msg.Text}:
+			case <-ctx.Done():
+				return ctx.Err()
+			}
+			return nil
+		},
+	}
+
+	go func() {
+		defer close(out)
+		exec, err := ci.Execute(ctx, "bash", command, handlers)
+		if err != nil {
+			select {
+			case out <- autobuild.ExecOutput{Stream: "stderr", Data: err.Error()}:
+			default:
+			}
+			return
+		}
+		exitCode := 0
+		if exec.ExitCode != nil {
+			exitCode = *exec.ExitCode
+		} else if exec.Error != nil {
+			exitCode = 1
+		}
+		select {
+		case out <- autobuild.ExecOutput{Stream: "exit", ExitCode: &exitCode}:
+		case <-ctx.Done():
+		}
+	}()
+
+	return out, nil
+}
+
 // ExecCode runs code in the given language using the CodeInterpreter.
 // Language examples: "python", "javascript", "bash".
 // State persists across calls within the same sandboxID (Python vars, imports, etc.)

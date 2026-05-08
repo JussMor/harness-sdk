@@ -20,25 +20,38 @@ const (
 type ChatMessage struct {
 	Role       Role            `json:"role"`
 	Content    string          `json:"content"`
-	Name       string          `json:"name,omitempty"`        // tool name when Role == RoleTool
+	Name       string          `json:"name,omitempty"`         // tool name when Role == RoleTool
 	ToolCallID string          `json:"tool_call_id,omitempty"` // links a tool result to a request
 	ToolCalls  []ToolCallEntry `json:"tool_calls,omitempty"`   // assistant requesting tool calls
 	Images     []ImageContent  `json:"images,omitempty"`       // attached images (vision-enabled models)
+	Documents  []DocumentContent `json:"documents,omitempty"`  // attached PDFs / text documents
 }
 
 // ImageContent represents an image attached to a chat message.
-// The provider decides how to encode it for the underlying API.
-// Either Source (base64) or URL must be set.
 type ImageContent struct {
-	// Source is the base64-encoded image data (without the data: prefix).
+	Source    string `json:"source,omitempty"`     // base64-encoded data (without data: prefix)
+	MediaType string `json:"media_type,omitempty"` // "image/jpeg", "image/png", "image/webp", "image/gif"
+	URL       string `json:"url,omitempty"`        // alternative to Source for URL-based images
+}
+
+// DocumentContent represents a PDF or text document attached to a chat message.
+// Anthropic supports this via type=document content blocks.
+type DocumentContent struct {
+	// Source is the base64-encoded document data.
 	Source string `json:"source,omitempty"`
 
-	// MediaType is the MIME type (e.g. "image/jpeg", "image/png", "image/webp", "image/gif").
+	// MediaType is the MIME type. Supported: "application/pdf", "text/plain".
 	MediaType string `json:"media_type,omitempty"`
 
-	// URL is an alternative to Source for providers that accept URL inputs.
-	// Anthropic supports URL-based images via type=url; OpenAI supports image_url.
+	// URL is an alternative to Source for URL-accessible documents.
 	URL string `json:"url,omitempty"`
+
+	// Title is an optional human-readable label shown in the context.
+	Title string `json:"title,omitempty"`
+
+	// CacheControl enables prompt caching for this document.
+	// Set to "ephemeral" to cache. Useful for large PDFs reused across turns.
+	CacheControl string `json:"cache_control,omitempty"`
 }
 
 // ToolCallEntry represents a single tool call requested by the LLM.
@@ -48,21 +61,48 @@ type ToolCallEntry struct {
 	Arguments string `json:"arguments"` // JSON string
 }
 
+// ToolChoice controls how the LLM selects tools.
+// When empty, the model decides automatically.
+type ToolChoice struct {
+	// Type is one of: "auto" (model decides), "any" (must use a tool),
+	// "tool" (must use the specific tool named in Name).
+	Type string `json:"type"`
+
+	// Name is required when Type == "tool".
+	Name string `json:"name,omitempty"`
+
+	// DisableParallelToolUse prevents the model from calling multiple tools
+	// in a single response. Only honored by providers that support it.
+	DisableParallelToolUse bool `json:"disable_parallel_tool_use,omitempty"`
+}
+
 // ChatRequest is sent to an LLM provider.
 type ChatRequest struct {
 	// Model is the model identifier (e.g. "claude-sonnet-4-20250514", "gpt-4o").
-	// If empty, the provider should use its default.
+	// If empty, the provider uses its own default.
 	Model string `json:"model,omitempty"`
 
 	// Messages is the conversation history.
 	Messages []ChatMessage `json:"messages"`
 
 	// Tools are the tool definitions available for the LLM to call.
-	// Populated from the ToolRegistry filtered by the active Mode.
 	Tools []ToolDef `json:"tools,omitempty"`
+
+	// ToolChoice controls how the LLM selects tools.
+	// Zero value = auto (model decides). Set Type="any" to force tool use,
+	// or Type="tool" + Name="bash" to force a specific tool.
+	ToolChoice *ToolChoice `json:"tool_choice,omitempty"`
 
 	// Temperature controls randomness. 0 = deterministic.
 	Temperature float64 `json:"temperature,omitempty"`
+
+	// TopP is nucleus sampling probability (0–1). Lower = more focused.
+	// Most providers honor either Temperature or TopP, not both.
+	TopP float64 `json:"top_p,omitempty"`
+
+	// TopK limits the vocabulary to the top-K tokens at each step.
+	// Supported by Anthropic and some other providers.
+	TopK int `json:"top_k,omitempty"`
 
 	// MaxTokens caps the response length.
 	MaxTokens int `json:"max_tokens,omitempty"`
@@ -72,14 +112,17 @@ type ChatRequest struct {
 	ReasoningEffort string `json:"reasoning_effort,omitempty"`
 
 	// ThinkingBudget is the maximum number of tokens the model can spend
-	// on internal reasoning before producing a response.
-	// Only honored by models that support extended thinking (Claude 3.7+).
-	// When > 0, the Anthropic provider adds a "thinking" block to the request.
+	// on internal reasoning. Only Claude 3.7+ honors this.
 	// MaxTokens must be greater than ThinkingBudget.
 	ThinkingBudget int `json:"thinking_budget,omitempty"`
 
 	// Stop sequences that terminate generation.
 	Stop []string `json:"stop,omitempty"`
+
+	// Metadata carries provider-specific extra fields.
+	// For Anthropic: {"user_id": "..."} for abuse tracking.
+	// For OpenAI: {"user": "..."}.
+	Metadata map[string]string `json:"metadata,omitempty"`
 }
 
 // ChatResponse is returned by an LLM provider.

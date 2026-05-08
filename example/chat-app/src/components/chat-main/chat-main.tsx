@@ -10,10 +10,14 @@ import type {
   BackendMessage,
   ChatMode,
   ProvidersResponse,
+  StreamComponentArtifact,
   StreamEvent,
+  StreamInterruptRequest,
   StreamPlanProposed,
   StreamSubagentResult,
 } from "@/features/chat/types"
+import { componentCatalog } from "@/lib/component-catalog"
+import { ArtifactRenderer } from "@harness/react"
 import {
   Bot,
   Brain,
@@ -24,6 +28,8 @@ import {
   LoaderCircle,
   RefreshCw,
   SendHorizontal,
+  Shield,
+  ShieldAlert,
   Sparkles,
   Square,
   ThumbsDown,
@@ -33,6 +39,7 @@ import {
 import { useCallback, useEffect, useMemo, useRef, useState } from "react"
 import ReactMarkdown from "react-markdown"
 import remarkGfm from "remark-gfm"
+import { InterruptDialog } from "./interrupt-dialog"
 import type { SubagentTrace, ToolTrace } from "./tool-trace"
 import { ToolTraceCard } from "./tool-trace"
 
@@ -93,6 +100,19 @@ export function ChatMain({
   const [providers, setProviders] = useState<Array<string>>([])
   const [selectedProvider, setSelectedProvider] = useState("")
 
+  // ── Human-in-the-Loop state ──────────────────────────────────────────────
+  const [hilEnabled, setHilEnabled] = useState(true)
+  const [pendingInterrupt, setPendingInterrupt] =
+    useState<StreamInterruptRequest | null>(null)
+
+  // ── Generative UI artifacts (component artifacts from the SDK) ─────────────
+  const [componentArtifacts, setComponentArtifacts] = useState<
+    Array<StreamComponentArtifact>
+  >([])
+  // Canvas-placement component currently mounted in the side panel.
+  const [canvasComponent, setCanvasComponent] =
+    useState<StreamComponentArtifact | null>(null)
+
   const streamControllerRef = useRef<AbortController | null>(null)
   const listEndRef = useRef<HTMLDivElement>(null)
 
@@ -101,6 +121,12 @@ export function ChatMain({
   const [allArtifacts, setAllArtifacts] = useState<Array<Artifact>>([])
   const [isArtifactStreaming, setIsArtifactStreaming] = useState(false)
   const detectorRef = useRef(createDetectorState())
+  // Pending file_write previews indexed by tool name. Populated on tool_call,
+  // consumed (and revealed in the canvas) only on tool_result so an interrupt
+  // rejection never leaves a phantom artifact in the UI.
+  const pendingFilePreviewsRef = useRef<
+    Array<{ path: string; content: string }>
+  >([])
 
   useEffect(() => {
     listEndRef.current?.scrollIntoView({ behavior: "smooth", block: "end" })
@@ -121,14 +147,39 @@ export function ChatMain({
     []
   )
 
+  // Resolve an interactive component's submission by POSTing the user's data
+  // to /api/interrupts/:token/resolve. The agent loop, paused via
+  // RequestInterrupt on the backend, receives the answer as the tool result.
+  const handleInteractionSubmit = useCallback(
+    async (interaction: { token: string; chat_id?: number }, data: unknown) => {
+      const cid = interaction.chat_id ?? chatID
+      if (!cid) return
+      try {
+        await api.resolveInterrupt(interaction.token, cid, {
+          approved: true,
+          answer: data,
+        })
+        setComponentArtifacts((prev) =>
+          prev.filter((a) => a.interaction?.token !== interaction.token)
+        )
+        setCanvasComponent((prev) =>
+          prev?.interaction?.token === interaction.token ? null : prev
+        )
+        pushTimeline("Form submitted", "success")
+      } catch (err) {
+        pushTimeline(
+          `Form submit failed: ${err instanceof Error ? err.message : String(err)}`,
+          "error"
+        )
+      }
+    },
+    [chatID, pushTimeline]
+  )
+
   const syncMessages = useCallback(
     async (targetChatID: number, signal?: AbortSignal) => {
       const payload = await api.listMessages(targetChatID, signal)
-      const next = payload
-        .filter(
-          (message) => message.role === "user" || message.role === "assistant"
-        )
-        .map(toChatMessage)
+      const next = payload.map(toChatMessage)
 
       // Preserve streaming-only fields (plan, subagentResults) that aren't
       // persisted in the backend but were accumulated during the stream.
@@ -362,23 +413,19 @@ export function ChatMain({
         )
         pushTimeline(`Tool call: ${toolName}`, "info")
 
-        // When file_write is called, show the content in the canvas immediately
+        // For file_write, stash the args so we can render the artifact AFTER
+        // tool_result fires (i.e. after the user approved the interrupt and
+        // the write actually happened). Showing it on tool_call would leak a
+        // preview even on rejection.
         if (toolName === "file_write" && event.data.args) {
           const args = event.data.args
           const content = (args.content as string) || ""
           const filePath = (args.path as string) || "file"
           if (content) {
-            const lang = inferLanguageFromPath(filePath)
-            const fileArtifact: Artifact = {
-              id: `file-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
-              language: lang,
+            pendingFilePreviewsRef.current.push({
+              path: filePath,
               content,
-              complete: true,
-              title: filePath.split("/").pop() || filePath,
-            }
-            setActiveArtifact(fileArtifact)
-            setAllArtifacts((prev) => [...prev, fileArtifact])
-            setIsArtifactStreaming(false)
+            })
           }
         }
         return
@@ -390,6 +437,27 @@ export function ChatMain({
           ? "error"
           : "success"
         pushTimeline(`Tool result: ${toolName}`, level)
+
+        // Reveal the file_write preview only now — and only on success.
+        if (toolName === "file_write" && !event.data.error) {
+          const next = pendingFilePreviewsRef.current.shift()
+          if (next) {
+            const fileArtifact: Artifact = {
+              id: `file-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+              language: inferLanguageFromPath(next.path),
+              content: next.content,
+              complete: true,
+              title: next.path.split("/").pop() || next.path,
+            }
+            setActiveArtifact(fileArtifact)
+            setAllArtifacts((prev) => [...prev, fileArtifact])
+            setIsArtifactStreaming(false)
+          }
+        } else if (toolName === "file_write" && event.data.error) {
+          // Drop the stashed preview on failure so a later success doesn't
+          // surface a stale entry.
+          pendingFilePreviewsRef.current.shift()
+        }
 
         const subagents = parseSubagentResult(toolName, event.data.content)
 
@@ -488,6 +556,80 @@ export function ChatMain({
         return
       }
 
+      if (event.type === "interrupt_required") {
+        const req = event.data
+        const label =
+          req.kind === "approval"
+            ? `Awaiting approval: ${req.approval?.tool_call?.name ?? "tool"}`
+            : req.kind === "question"
+              ? "Agent needs clarification"
+              : `Awaiting input: ${req.form?.title ?? "form"}`
+        pushTimeline(label, "info")
+        setPendingInterrupt(req)
+        return
+      }
+
+      if (event.type === "interrupt_resolved") {
+        setPendingInterrupt(null)
+        return
+      }
+
+      if (event.type === "confirmation_required") {
+        // Legacy event — wrap into the new InterruptRequest shape so the
+        // UI only needs to know about one HIL surface.
+        pushTimeline(`Awaiting approval: ${event.data.tool}`, "info")
+        setPendingInterrupt({
+          id: event.data.id,
+          kind: "approval",
+          reason: event.data.reason,
+          approval: {
+            tool_call: {
+              name: event.data.tool,
+              args: safeParseArgs(event.data.args),
+            },
+          },
+        })
+        return
+      }
+
+      if (event.type === "confirmation_resolved") {
+        pushTimeline(
+          `${event.data.approved ? "Approved" : "Rejected"}: ${event.data.tool}`,
+          event.data.approved ? "success" : "error"
+        )
+        setPendingInterrupt(null)
+        return
+      }
+
+      if (
+        event.type === "artifact_created" ||
+        event.type === "artifact_updated"
+      ) {
+        const a = event.data
+        if (a.kind !== "component") return
+        const placement = a.placement ?? "canvas"
+        if (placement === "canvas") {
+          // Mount in the dedicated side panel; close any open file canvas
+          // so the two surfaces don't fight for the same slot.
+          setCanvasComponent(a)
+          setActiveArtifact(null)
+          setIsArtifactStreaming(false)
+        } else {
+          setComponentArtifacts((prev) => {
+            const idx = prev.findIndex((x) => x.id === a.id)
+            if (idx === -1) return [...prev, a]
+            const next = prev.slice()
+            next[idx] = a
+            return next
+          })
+        }
+        pushTimeline(
+          `Rendered ${a.component?.name ?? "component"} (${placement})`,
+          "info"
+        )
+        return
+      }
+
       if (event.type === "done") {
         // Mark stream as done — syncMessages() after streamChat resolves
         // handles full message and artifact restoration from backend.
@@ -522,6 +664,7 @@ export function ChatMain({
 
     // Reset artifact detector for the new response
     detectorRef.current = createDetectorState()
+    pendingFilePreviewsRef.current = []
     setIsArtifactStreaming(false)
 
     const runID = `run-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`
@@ -553,6 +696,7 @@ export function ChatMain({
           mode: selectedMode,
           provider: selectedProvider || undefined,
           clientRunId: runID,
+          human_in_loop: hilEnabled,
         },
         {
           onEvent: (event) => handleStreamEvent(assistantMessageID, event),
@@ -616,7 +760,7 @@ export function ChatMain({
 
   return (
     <section
-      className={`chat-main-root ${activeArtifact ? "chat-main-root--with-canvas" : ""}`}
+      className={`chat-main-root ${activeArtifact || canvasComponent ? "chat-main-root--with-canvas" : ""}`}
     >
       <div className="chat-main-panel">
         {showGreeting && messages.length === 0 && (
@@ -678,7 +822,48 @@ export function ChatMain({
               </span>
             )}
           </div>
+
+          <button
+            type="button"
+            title={
+              hilEnabled
+                ? "Human-in-the-loop ON — click to disable"
+                : "Human-in-the-loop OFF — click to enable"
+            }
+            onClick={() => setHilEnabled((v) => !v)}
+            disabled={isStreaming}
+            className={`chat-hil-toggle ${hilEnabled ? "chat-hil-toggle--on" : ""}`}
+          >
+            {hilEnabled ? <ShieldAlert size={14} /> : <Shield size={14} />}
+            <span>{hilEnabled ? "HIL on" : "HIL off"}</span>
+          </button>
         </div>
+
+        {pendingInterrupt && (
+          <InterruptDialog
+            request={pendingInterrupt}
+            onResolve={async (response) => {
+              if (!chatID) return
+              try {
+                await api.confirm(
+                  chatID,
+                  pendingInterrupt.id,
+                  response.approved ?? false,
+                  response.modifiedArgs
+                )
+              } finally {
+                setPendingInterrupt(null)
+              }
+            }}
+            onCancel={() => setPendingInterrupt(null)}
+          />
+        )}
+
+        {
+          componentArtifacts.filter(
+            (a) => (a.placement ?? "canvas") === "canvas"
+          ).length > 0 && null /* canvas components rendered in side panel */
+        }
 
         <div className="chat-main-grid">
           <div className="chat-main-feed">
@@ -756,6 +941,22 @@ export function ChatMain({
                   )}
               </article>
             ))}
+
+            {componentArtifacts
+              .filter((a) => a.placement === "inline")
+              .map((a) => (
+                <div
+                  key={a.id}
+                  className="chat-bubble chat-bubble-assistant chat-inline-artifact"
+                >
+                  <ArtifactRenderer
+                    artifact={a as never}
+                    catalog={componentCatalog}
+                    onInteractionSubmit={handleInteractionSubmit}
+                  />
+                </div>
+              ))}
+
             <div ref={listEndRef} />
           </div>
 
@@ -863,6 +1064,35 @@ export function ChatMain({
             )
           }}
         />
+      )}
+
+      {/* Component Canvas — generative-UI components routed with placement="canvas" */}
+      {!activeArtifact && canvasComponent && (
+        <aside className="artifact-canvas">
+          <header className="artifact-canvas__header">
+            <div className="artifact-canvas__title">
+              <span>{canvasComponent.component?.name ?? "component"}</span>
+            </div>
+            <div className="artifact-canvas__actions">
+              <button
+                type="button"
+                className="artifact-canvas__btn"
+                onClick={() => setCanvasComponent(null)}
+                title="Close"
+                aria-label="Close component canvas"
+              >
+                ×
+              </button>
+            </div>
+          </header>
+          <div className="artifact-canvas__content" style={{ padding: 16 }}>
+            <ArtifactRenderer
+              artifact={canvasComponent as never}
+              catalog={componentCatalog}
+              onInteractionSubmit={handleInteractionSubmit}
+            />
+          </div>
+        </aside>
       )}
     </section>
   )
@@ -1227,6 +1457,11 @@ function SubagentResultCard({ result }: { result: StreamSubagentResult }) {
         {open ? <ChevronDown size={12} /> : <ChevronRight size={12} />}
         <Bot size={12} />
         <span className="subagent-card-id">{result.id}</span>
+        {result.model && (
+          <code className="subagent-card-model">
+            {result.model.split("-").slice(0, 2).join("-")}
+          </code>
+        )}
         <span className="subagent-card-meta">
           {result.turns > 0 && `${result.turns} turns · `}
           {result.duration_ms > 0 && formatDurationMs(result.duration_ms)}
@@ -1234,6 +1469,12 @@ function SubagentResultCard({ result }: { result: StreamSubagentResult }) {
       </button>
       {open && (
         <div className="subagent-card-body">
+          {result.system_prompt && (
+            <details className="subagent-card-prompt">
+              <summary>System prompt</summary>
+              <pre>{result.system_prompt}</pre>
+            </details>
+          )}
           <p className="subagent-card-task">
             <strong>Task:</strong> {result.task}
           </p>
@@ -1257,4 +1498,15 @@ function SubagentResultCard({ result }: { result: StreamSubagentResult }) {
 function formatDurationMs(ms: number): string {
   if (ms < 1000) return `${ms}ms`
   return `${(ms / 1000).toFixed(1)}s`
+}
+
+function safeParseArgs(raw: string): Record<string, unknown> | undefined {
+  try {
+    const v = JSON.parse(raw)
+    return typeof v === "object" && v !== null
+      ? (v as Record<string, unknown>)
+      : undefined
+  } catch {
+    return undefined
+  }
 }

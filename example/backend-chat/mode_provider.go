@@ -121,19 +121,22 @@ func newModeEngineWithDB(provider ab.LLMProvider, model string, logContext Runti
 		WithOutputFilter(ab.NewOutputFilterChain(
 			ab.DefaultSecretRedactionFilter(),
 		)).
-		// Verification: lightweight local check + intrinsic self-check markers
+		// Verification: local check (no extra LLM call)
 		WithVerification(ab.VerificationChain{Strategies: []ab.VerificationStrategy{
 			ab.LocalVerification{MustNotBeEmpty: true, MinLength: 5, NoHallucination: true},
 			ab.CompletionVerification{MinLength: 5},
-			ab.IntrinsicVerification{MinMarkers: 1},
 		}}).
 		WithMaxVerifyRetry(1).
-		// Compaction: episodic — preserves key decisions, summarizes the rest
+		// Compaction: episodic with differential scoring (pre-filters low-importance msgs)
 		WithCompactor(&ab.EpisodicCompactor{
-			Provider: provider,
-			Model:    model,
-			MaxWords: 400,
+			Provider:            provider,
+			Model:               model,
+			MaxWords:            400,
+			ImportanceThreshold: 0.25,
+			EpisodeThreshold:    0.65,
 		}).
+		// Skills: cap LayerSkills at 6k tokens to prevent system prompt overflow
+		WithMaxSkillTokens(6_000).
 		// Memory inference: extract persistent facts, deduplicated
 		WithMemoryWriter(&ab.InferredMemoryWriter{
 			Provider:        provider,
@@ -245,6 +248,15 @@ You are capable, direct, and honest. You help users with writing, coding, analys
 ` + tools + `
 
 These are the ONLY tools available to you. Do not reference, invent, or pretend to use any tool not listed above. If a user asks you to use a tool that is not listed, say clearly that it is not available.
+
+## Generative-UI components
+
+` + describeComponentCatalog() + `
+When the user asks to **display, show, render, or visualize** a domain UI (e.g. a patient chart, medication list, appointment form), call ` + "`render_component`" + ` with one of the names above. Do NOT write JSX/HTML files via ` + "`file_write`" + ` for these cases — the component code already exists in the frontend; you only supply props.
+
+When you need **structured input from the user that's better collected through a UI than a free-form question** (dates, picks, multi-field forms), call ` + "`await_component_input`" + ` instead. That tool renders the component AND pauses you until the user submits — its result is the user's data as JSON, which you reason against on the next turn.
+
+Use ` + "`file_write`" + ` only when the user explicitly asks for source code, scripts, or document files they want to download or edit.
 
 The **dispatch-subagents** tool lets you spawn parallel sub-agents for independent tasks. Each subagent runs its own focused agent loop and returns a structured result. Use it for fan-out work: multiple independent research tasks, creating multiple files in parallel, or validating from multiple angles simultaneously.
 

@@ -19,6 +19,10 @@ export interface SubagentTrace {
   stop_reason?: string
   duration_ms?: number
   error?: string
+  /** Model used by this subagent if overridden (e.g. "claude-haiku-4-5-20251001"). */
+  model?: string
+  /** Custom system prompt assigned to this subagent. */
+  system_prompt?: string
 }
 
 export interface ToolTrace {
@@ -139,6 +143,17 @@ function SubagentCard({ sub }: SubagentCardProps) {
 
       {open && (
         <div className="subagent-card-body">
+          {sub.model && (
+            <p className="subagent-card-model">
+              <strong>Model:</strong> <code>{sub.model}</code>
+            </p>
+          )}
+          {sub.system_prompt && (
+            <details className="subagent-card-prompt">
+              <summary>System prompt</summary>
+              <pre>{sub.system_prompt}</pre>
+            </details>
+          )}
           <p className="subagent-card-task">
             <strong>Task:</strong> {sub.task}
           </p>

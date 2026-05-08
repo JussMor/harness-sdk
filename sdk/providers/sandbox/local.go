@@ -138,4 +138,57 @@ func (s *LocalSandbox) get(id string) (*localInstance, error) {
 	return inst, nil
 }
 
+// ExecStream runs a command and streams stdout/stderr line by line.
+func (s *LocalSandbox) ExecStream(ctx context.Context, id string, command string) (<-chan autobuild.ExecOutput, error) {
+	inst, err := s.get(id)
+	if err != nil {
+		return nil, err
+	}
+
+	out := make(chan autobuild.ExecOutput, 64)
+	cmd := exec.CommandContext(ctx, "sh", "-c", command)
+	cmd.Dir = inst.dir
+
+	stdout, _ := cmd.StdoutPipe()
+	stderr, _ := cmd.StderrPipe()
+
+	if err := cmd.Start(); err != nil {
+		return nil, fmt.Errorf("local sandbox: start: %w", err)
+	}
+
+	go func() {
+		defer close(out)
+		buf := make([]byte, 4096)
+		// Drain stdout
+		go func() {
+			for {
+				n, err := stdout.Read(buf)
+				if n > 0 {
+					out <- autobuild.ExecOutput{Stream: "stdout", Data: string(buf[:n])}
+				}
+				if err != nil {
+					return
+				}
+			}
+		}()
+		// Drain stderr
+		for {
+			n, err := stderr.Read(buf)
+			if n > 0 {
+				out <- autobuild.ExecOutput{Stream: "stderr", Data: string(buf[:n])}
+			}
+			if err != nil {
+				break
+			}
+		}
+		exitCode := 0
+		if err := cmd.Wait(); err != nil {
+			exitCode = 1
+		}
+		out <- autobuild.ExecOutput{Stream: "exit", ExitCode: &exitCode}
+	}()
+
+	return out, nil
+}
+
 var _ autobuild.SandboxDriver = (*LocalSandbox)(nil)
