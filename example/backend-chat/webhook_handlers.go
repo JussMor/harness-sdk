@@ -178,9 +178,21 @@ func (a *BackendChatApp) handleInterruptResolve(w http.ResponseWriter, r *http.R
 		Answer:       body.Answer,
 		ModifiedArgs: body.ModifiedArgs,
 	}
+
+	// The path segment may be a plain interrupt ID (from the live SSE flow
+	// where the frontend passes InterruptRequest.ID) or a signed resolution
+	// token (from out-of-band webhooks/email links). Try the plain ID first
+	// — it's the common case for interactive frontends.
+	resp.ID = token
+	if gate.Respond(resp) {
+		writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+		return
+	}
+
+	// Not a pending plain ID — try as a signed resolution token.
 	if err := gate.ResolveByToken(token, resp); err != nil {
 		status := http.StatusGone
-		if strings.Contains(err.Error(), "signature") || strings.Contains(err.Error(), "expired") {
+		if strings.Contains(err.Error(), "signature") || strings.Contains(err.Error(), "expired") || strings.Contains(err.Error(), "malformed") {
 			status = http.StatusUnauthorized
 		}
 		writeErr(w, status, err)
