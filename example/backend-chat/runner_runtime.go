@@ -45,6 +45,10 @@ func (r *agentRuntime) buildToolRegistry() *ab.ToolRegistry {
 		reg.Register(r.newMemoryTool())
 	}
 	reg.Register(r.newSubagentDispatchTool())
+	reg.Register(r.newRenderComponentTool())
+	if r.chatID > 0 {
+		reg.Register(r.newAwaitComponentInputTool(r.chatID))
+	}
 	// Sandbox tools — only when OPEN_SANDBOX_API_KEY is configured
 	if isSandboxAvailable() && r.chatID > 0 {
 		reg.Register(r.newBashTool(r.chatID))
@@ -64,6 +68,7 @@ func (r *agentRuntime) buildSubagentToolRegistry() *ab.ToolRegistry {
 	if r.memory != nil {
 		reg.Register(r.newMemoryTool())
 	}
+	reg.Register(r.newRenderComponentTool())
 	if isSandboxAvailable() && r.chatID > 0 {
 		reg.Register(r.newBashTool(r.chatID))
 		reg.Register(r.newCodeInterpreterTool(r.chatID))

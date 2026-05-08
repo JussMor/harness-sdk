@@ -13,17 +13,32 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CONFIG="$SCRIPT_DIR/config.toml"
 
-# Activate venv if not already active (looks two levels up: backend-chat → example → repo root)
+# Activate venv if not already active. Search candidate locations relative to
+# this script: example/backend-chat/sandbox-files-init/start.sh
+#   1. example/backend-chat/.venv          (per-service)
+#   2. example/.venv                       (per-example tree)
+#   3. <repo-root>/.venv                   (project-wide, the typical layout)
 if [[ -z "${VIRTUAL_ENV:-}" ]]; then
-  VENV="$SCRIPT_DIR/../../.venv"
-  if [[ -f "$VENV/bin/activate" ]]; then
-    # shellcheck disable=SC1091
-    source "$VENV/bin/activate"
-  else
-    echo "ERROR: No virtual environment found at $VENV"
+  CANDIDATES=(
+    "$SCRIPT_DIR/../.venv"
+    "$SCRIPT_DIR/../../.venv"
+    "$SCRIPT_DIR/../../../.venv"
+  )
+  VENV=""
+  for c in "${CANDIDATES[@]}"; do
+    if [[ -f "$c/bin/activate" ]]; then
+      VENV="$c"
+      break
+    fi
+  done
+  if [[ -z "$VENV" ]]; then
+    echo "ERROR: No virtual environment found. Searched:"
+    for c in "${CANDIDATES[@]}"; do echo "  - $c"; done
     echo "Run: uv venv && uv pip install opensandbox-server  (from repo root)"
     exit 1
   fi
+  # shellcheck disable=SC1091
+  source "$VENV/bin/activate"
 fi
 
 # Pull required Docker images if missing
