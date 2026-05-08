@@ -119,6 +119,7 @@ func newModeEngineWithDB(provider ab.LLMProvider, model string, logContext Runti
 	// ── Runtime with every capability wired ──
 	runtime := ab.NewRuntime(engine).
 		WithMode(logContext.Mode).
+		WithModel(bareModel).
 		// Memory roots: labeled dirs matching Claude's profile/facts/project structure
 		WithMemoryRoots(memRoots...).
 		// Memory token cap: prevent enormous memory from overflowing context

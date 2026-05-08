@@ -532,6 +532,7 @@ func (r *Runtime) runStreamSubagents(ctx context.Context, executables []Executab
 			ID:       exec.ID,
 			Task:     task,
 			Engine:   r.engine,
+			Model:    r.model,
 			MaxTurns: 4,
 			Timeout:  30 * 1000000000, // 30s
 		})

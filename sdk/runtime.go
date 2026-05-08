@@ -34,6 +34,7 @@ import (
 type Runtime struct {
 	engine *Engine
 	mode   string
+	model  string // default model name for subagent fan-out (bare name, no routing prefix)
 
 	// Configurable behavior
 	maxSkills       int
@@ -130,6 +131,7 @@ func NewRuntime(engine *Engine) *Runtime {
 }
 
 func (r *Runtime) WithMode(modeID string) *Runtime              { r.mode = modeID; return r }
+func (r *Runtime) WithModel(m string) *Runtime                  { r.model = m; return r }
 func (r *Runtime) WithSkillThreshold(t float64) *Runtime        { r.skillThreshold = t; return r }
 func (r *Runtime) WithMaxSkills(n int) *Runtime                 { r.maxSkills = n; return r }
 func (r *Runtime) WithObservationFilter(f ObservationFilter) *Runtime { r.observationFilt = f; return r }
