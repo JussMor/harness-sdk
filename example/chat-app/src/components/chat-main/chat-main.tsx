@@ -177,7 +177,11 @@ export function ChatMain({
   )
 
   const syncMessages = useCallback(
-    async (targetChatID: number, signal?: AbortSignal) => {
+    async (
+      targetChatID: number,
+      signal?: AbortSignal,
+      finalizedAssistantId?: string
+    ) => {
       const payload = await api.listMessages(targetChatID, signal)
       const next = payload.map(toChatMessage)
 
@@ -190,23 +194,21 @@ export function ChatMain({
       setMessages((prev) => {
         const prevMap = new Map(prev.map((m) => [m.id, m]))
 
-        // Find the latest prev assistant message carrying streaming-only data.
-        let latestStreamFields:
-          | Pick<ChatMessage, "plan" | "subagentResults">
-          | undefined
-        for (let i = prev.length - 1; i >= 0; i--) {
-          const m = prev[i]
-          if (
-            m.role === "assistant" &&
-            (m.plan || (m.subagentResults && m.subagentResults.length > 0))
-          ) {
-            latestStreamFields = {
-              plan: m.plan,
-              subagentResults: m.subagentResults,
-            }
-            break
-          }
-        }
+        // Only carry streaming-only fields from the assistant message that
+        // belongs to the run we're finalizing right now.
+        const source = finalizedAssistantId
+          ? prev.find((m) => m.id === finalizedAssistantId)
+          : undefined
+        const streamFields =
+          source &&
+          source.role === "assistant" &&
+          (source.plan ||
+            (source.subagentResults && source.subagentResults.length > 0))
+            ? {
+                plan: source.plan,
+                subagentResults: source.subagentResults,
+              }
+            : undefined
 
         // Index of the last assistant message in next.
         let lastAssistantIdx = -1
@@ -228,8 +230,8 @@ export function ChatMain({
             }
           }
           // Graft streaming-only fields onto the freshly-persisted assistant message.
-          if (idx === lastAssistantIdx && latestStreamFields) {
-            return { ...m, ...latestStreamFields }
+          if (idx === lastAssistantIdx && streamFields) {
+            return { ...m, ...streamFields }
           }
           return m
         })
@@ -704,7 +706,7 @@ export function ChatMain({
         controller.signal
       )
 
-      await syncMessages(targetChatID)
+      await syncMessages(targetChatID, undefined, assistantMessageID)
       onChatsChanged?.()
       setStatusText("Completed")
 
