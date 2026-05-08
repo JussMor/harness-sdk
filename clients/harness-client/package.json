@@ -1,0 +1,27 @@
+{
+  "name": "@harness/client",
+  "version": "0.1.0",
+  "description": "Agnostic TypeScript client for the harness-sdk wire protocol. Types are generated from the Go SDK; transport/runtime layer is hand-written.",
+  "license": "MIT",
+  "type": "module",
+  "main": "./src/index.ts",
+  "module": "./src/index.ts",
+  "types": "./src/index.ts",
+  "exports": {
+    ".": "./src/index.ts",
+    "./generated": "./src/generated/index.ts",
+    "./adapters/agui": "./src/adapters/agui.ts"
+  },
+  "files": [
+    "src",
+    "README.md"
+  ],
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run"
+  },
+  "devDependencies": {
+    "typescript": "^5.6.0",
+    "vitest": "^2.1.0"
+  }
+}
