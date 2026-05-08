@@ -167,21 +167,18 @@ func (a *BackendChatApp) handleInterruptResolve(w http.ResponseWriter, r *http.R
 		return
 	}
 
-	gate, ok := hilRegistry.Get(body.ChatID)
+	gate, ok := ensureInterruptRegistry().Get(body.ChatID)
 	if !ok {
 		writeErr(w, http.StatusNotFound, fmt.Errorf("no pending interrupts for chat %d", body.ChatID))
 		return
 	}
 
-	// Resolve via the inner InterruptGate so all kinds (approval, question,
-	// form input) work uniformly, not just approvals.
 	resp := ab.InterruptResponse{
 		Approved:     body.Approved,
 		Answer:       body.Answer,
 		ModifiedArgs: body.ModifiedArgs,
 	}
-	if err := gate.Inner().ResolveByToken(token, resp); err != nil {
-		// 410 Gone = token valid but interrupt no longer pending; 401 = bad signature.
+	if err := gate.ResolveByToken(token, resp); err != nil {
 		status := http.StatusGone
 		if strings.Contains(err.Error(), "signature") || strings.Contains(err.Error(), "expired") {
 			status = http.StatusUnauthorized

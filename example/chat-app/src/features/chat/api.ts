@@ -227,37 +227,9 @@ export class ChatAPI {
     })
   }
 
-  // ── Human-in-the-loop ────────────────────────────────────────────────────────
-
-  /**
-   * Deliver a human approval or rejection to a paused agent loop.
-   * @param chatId    The chat whose agent is waiting.
-   * @param id        The ApprovalRequest.id from the confirmation_required event.
-   * @param approved  true to allow the tool call, false to reject.
-   * @param modifiedArgs  Optional JSON string to override tool arguments.
-   */
-  async confirm(
-    chatId: number,
-    id: string,
-    approved: boolean,
-    modifiedArgs?: string
-  ): Promise<void> {
-    await fetch(`${this.baseURL}/api/confirm`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        chat_id: chatId,
-        id,
-        approved,
-        modified_args: modifiedArgs ?? "",
-      }),
-    })
-  }
-
   /**
    * Resolve a generic interrupt (approval/question/form_input) using a
-   * resolution token issued by the backend. Supersedes confirm() for the
-   * new interrupt-based HIL flow but both endpoints coexist.
+   * resolution token issued by the backend.
    */
   async resolveInterrupt(
     token: string,
@@ -357,21 +329,6 @@ function adaptSSEEvent(type: string, dataText: string): StreamEvent | null {
           error?: string
         },
       }
-    case "confirmation_required":
-      return {
-        type: "confirmation_required",
-        data: parsed as {
-          id: string
-          tool: string
-          args: string
-          reason: string
-        },
-      }
-    case "confirmation_resolved":
-      return {
-        type: "confirmation_resolved",
-        data: parsed as { id: string; tool: string; approved: boolean },
-      }
     case "interrupt_required":
       return {
         type: "interrupt_required",
@@ -380,7 +337,7 @@ function adaptSSEEvent(type: string, dataText: string): StreamEvent | null {
     case "interrupt_resolved":
       return {
         type: "interrupt_resolved",
-        data: parsed as import("./types").StreamInterruptRequest,
+        data: parsed as { id: string; kind: string; approved?: boolean },
       }
     case "artifact_created":
       return {

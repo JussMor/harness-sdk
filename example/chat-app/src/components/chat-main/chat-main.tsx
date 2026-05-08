@@ -576,33 +576,6 @@ export function ChatMain({
         return
       }
 
-      if (event.type === "confirmation_required") {
-        // Legacy event — wrap into the new InterruptRequest shape so the
-        // UI only needs to know about one HIL surface.
-        pushTimeline(`Awaiting approval: ${event.data.tool}`, "info")
-        setPendingInterrupt({
-          id: event.data.id,
-          kind: "approval",
-          reason: event.data.reason,
-          approval: {
-            tool_call: {
-              name: event.data.tool,
-              args: safeParseArgs(event.data.args),
-            },
-          },
-        })
-        return
-      }
-
-      if (event.type === "confirmation_resolved") {
-        pushTimeline(
-          `${event.data.approved ? "Approved" : "Rejected"}: ${event.data.tool}`,
-          event.data.approved ? "success" : "error"
-        )
-        setPendingInterrupt(null)
-        return
-      }
-
       if (
         event.type === "artifact_created" ||
         event.type === "artifact_updated"
@@ -847,11 +820,10 @@ export function ChatMain({
             onResolve={async (response) => {
               if (!chatID) return
               try {
-                await api.confirm(
-                  chatID,
+                await api.resolveInterrupt(
                   pendingInterrupt.id,
-                  response.approved ?? false,
-                  response.modifiedArgs
+                  chatID,
+                  response,
                 )
               } finally {
                 setPendingInterrupt(null)
@@ -1500,15 +1472,4 @@ function SubagentResultCard({ result }: { result: StreamSubagentResult }) {
 function formatDurationMs(ms: number): string {
   if (ms < 1000) return `${ms}ms`
   return `${(ms / 1000).toFixed(1)}s`
-}
-
-function safeParseArgs(raw: string): Record<string, unknown> | undefined {
-  try {
-    const v = JSON.parse(raw)
-    return typeof v === "object" && v !== null
-      ? (v as Record<string, unknown>)
-      : undefined
-  } catch {
-    return undefined
-  }
 }

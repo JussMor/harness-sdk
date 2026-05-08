@@ -76,7 +76,6 @@ func main() {
 	mux.HandleFunc("/api/providers", app.handleProviders)
 	mux.HandleFunc("/api/chats", app.handleChats)
 	mux.HandleFunc("/api/chats/", app.handleChatRoutes)
-	mux.HandleFunc("/api/confirm", app.handleConfirm)
 	mux.HandleFunc("/api/webhooks", app.handleWebhooks)
 	mux.HandleFunc("/api/webhooks/", app.handleWebhookByID)
 	mux.HandleFunc("/api/interrupts/", app.handleInterruptResolve)
@@ -489,19 +488,17 @@ func (a *BackendChatApp) handleStream(w http.ResponseWriter, r *http.Request, ch
 		return
 	}
 
-	// Human-in-the-loop: wire approval gate when requested. Whether HIL is on
-	// or off we always register an ApprovalGate so its inner InterruptGate
-	// can be used by tools that need user input (e.g. `await_component_input`)
-	// regardless of the safety policy. When HIL is off we install a no-op
-	// policy so no tool call ever pauses for approval.
-	policy := func(ab.ToolCallEntry) (bool, string) { return false, "" }
+	// Interrupts: always wire an InterruptGate so tools like await_component_input
+	// can pause and ask for user input. When HIL is enabled, also prepend a
+	// HumanApprovalFilter that requires approval for dangerous tool calls.
+	gate := ab.NewInterruptGate(8)
+	agentRT.runtime = agentRT.runtime.WithInterrupts(gate)
 	if req.HumanInLoop {
-		policy = ab.DefaultApprovalPolicy
+		_, agentRT.runtime = agentRT.runtime.WithHumanApproval(ab.DefaultApprovalPolicy)
 	}
-	gate, updatedRuntime := agentRT.runtime.WithHumanApproval(policy)
-	agentRT.runtime = updatedRuntime
-	hilRegistry.Register(chatID, gate)
-	defer hilRegistry.Unregister(chatID)
+	// Register the gate so the token-resolve endpoint can deliver responses.
+	ensureInterruptRegistry().Register(chatID, gate)
+	defer ensureInterruptRegistry().Unregister(chatID)
 
 	conv, err := LoadOrCreateConversation(ctx, agentRT.convStore, chatID, history)
 	if err != nil {
@@ -545,25 +542,20 @@ func (a *BackendChatApp) handleStream(w http.ResponseWriter, r *http.Request, ch
 				sseWrite("thinking", string(d))
 			}
 
-		case ab.StreamEventConfirmationRequired:
-			if ev.ConfirmationRequest != nil {
-				d, _ := json.Marshal(map[string]any{
-					"id":     ev.ConfirmationRequest.ID,
-					"tool":   ev.ConfirmationRequest.ToolCall.Name,
-					"args":   ev.ConfirmationRequest.ToolCall.Arguments,
-					"reason": ev.ConfirmationRequest.Reason,
-				})
-				sseWrite("confirmation_required", string(d))
+		case ab.StreamEventInterruptRequired:
+			if ev.Interrupt != nil {
+				d, _ := json.Marshal(ev.Interrupt)
+				sseWrite("interrupt_required", string(d))
 			}
 
-		case ab.StreamEventConfirmationResolved:
-			if ev.ConfirmationRequest != nil {
+		case ab.StreamEventInterruptResolved:
+			if ev.Interrupt != nil {
 				d, _ := json.Marshal(map[string]any{
-					"id":      ev.ConfirmationRequest.ID,
-					"tool":    ev.ConfirmationRequest.ToolCall.Name,
+					"id":       ev.Interrupt.ID,
+					"kind":     string(ev.Interrupt.Kind),
 					"approved": true,
 				})
-				sseWrite("confirmation_resolved", string(d))
+				sseWrite("interrupt_resolved", string(d))
 			}
 
 		case ab.StreamEventToolCall:

@@ -452,9 +452,14 @@ func (r *agentRuntime) newSubagentDispatchTool() *ab.Tool {
 
 			// Default to the parent's effective model so subagents always
 			// send a valid model name to the LLM provider.
+			// Strip any routing prefix (e.g. "anthropic/claude-haiku-…" → "claude-haiku-…")
+			// so the Anthropic provider never receives a prefixed model string.
 			effectiveModel := model
 			if effectiveModel == "" {
 				effectiveModel = r.modelName
+			}
+			if _, modelOnly := ab.ParseModelRef(effectiveModel); modelOnly != "" {
+				effectiveModel = modelOnly
 			}
 			subs = append(subs, ab.Subagent{
 				ID:                id,
