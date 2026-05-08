@@ -1,12 +1,56 @@
-example/backend-chat/chat.db-shm
-example/backend-chat/chat.db-wal
-example/backend-chat/example/
-.vscode/
+# ── OS ───────────────────────────────────────────────────────────────────────
 .DS_Store
-example/.DS_Store
-example/backend-chat/.DS_Store
+Thumbs.db
+
+# ── Editor ───────────────────────────────────────────────────────────────────
+.vscode/
+.idea/
+*.swp
+
+# ── Node / pnpm ──────────────────────────────────────────────────────────────
+node_modules/
+dist/
+dist-ssr/
+build/
+.next/
+.turbo/
+.tanstack/
+.output/
+.nitro/
+.wrangler/
+.vinxi/
+__unconfig*
+coverage/
+*.tsbuildinfo
+*.local
+
+# ── Go ───────────────────────────────────────────────────────────────────────
+example/backend-chat/backend-chat
+*.test
+*.out
+
+# ── Python venvs (sandbox) ───────────────────────────────────────────────────
+.venv/
+__pycache__/
+*.pyc
+
+# ── Backend chat runtime data ────────────────────────────────────────────────
+example/backend-chat/*.db
+example/backend-chat/*.db-shm
+example/backend-chat/*.db-wal
+example/backend-chat/example/
+example/backend-chat/memory/project/
+example/backend-chat/memory/user/
+
+# ── Secrets ──────────────────────────────────────────────────────────────────
+.env
+.env.*
+!.env.example
 example/backend-chat/.env
 example/backend-chat/.env.*
 !example/backend-chat/.env.example
-example/backend-chat/memory/project/
-example/backend-chat/memory/user/
+
+# ── Misc ─────────────────────────────────────────────────────────────────────
+count.txt
+todos.json
+*.log
