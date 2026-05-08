@@ -94,16 +94,67 @@ export type StreamEvent =
   | { type: "plan_proposed"; data: StreamPlanProposed }
   | { type: "subagent_result"; data: StreamSubagentResult }
   | { type: "confirmation_required"; data: ConfirmationRequest }
-  | { type: "confirmation_resolved"; data: { id: string; tool: string; approved: boolean } }
+  | {
+      type: "confirmation_resolved"
+      data: { id: string; tool: string; approved: boolean }
+    }
+  | { type: "interrupt_required"; data: StreamInterruptRequest }
+  | { type: "interrupt_resolved"; data: StreamInterruptRequest }
+  | { type: "artifact_created"; data: StreamComponentArtifact }
+  | { type: "artifact_updated"; data: StreamComponentArtifact }
   | { type: "done"; data: StreamDone }
   | { type: "error"; data: { error?: string } }
+
+// ── Generic interrupt types (new HIL system) ─────────────────────────────────
+
+export type InterruptKind = "approval" | "question" | "form_input"
+
+export interface StreamInterruptRequest {
+  id: string
+  kind: InterruptKind
+  reason?: string
+  approval?: { tool_call?: { name?: string; args?: Record<string, unknown> } }
+  question?: { prompt: string; choices?: Array<string>; multi?: boolean }
+  form?: { title?: string; schema?: Record<string, unknown>; ui_hint?: string }
+}
+
+// ── Component artifact (generative UI) ───────────────────────────────────────
+
+export interface StreamComponentArtifact {
+  id: string
+  kind: "file" | "component"
+  /** Where the frontend should mount this artifact. Defaults to "canvas". */
+  placement?: "canvas" | "inline"
+  /** When present the rendered component should call onSubmit(data); the
+   *  renderer posts the result to /api/interrupts/:token/resolve. */
+  interaction?: {
+    token: string
+    chat_id?: number
+  }
+  /** Populated when kind === "component". */
+  component?: {
+    name: string
+    catalog_id?: string
+    props?: unknown
+    a2ui_surface?: unknown
+  }
+  /** Populated when kind === "file". */
+  file?: {
+    title?: string
+    language?: string
+    path?: string
+    content?: string
+    url?: string
+    version?: number
+  }
+}
 
 // ── Human-in-the-Loop types ───────────────────────────────────────────────────
 
 export interface ConfirmationRequest {
   id: string
   tool: string
-  args: string   // raw JSON string of tool arguments
+  args: string // raw JSON string of tool arguments
   reason: string
 }
 

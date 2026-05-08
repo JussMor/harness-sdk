@@ -12,6 +12,7 @@ import type {
   Thread,
   ThreadStatus,
 } from "@/features/chat/types"
+import { ProtocolVersion, parseSSE } from "@harness/client"
 
 function trimTrailingSlash(value: string): string {
   return value.replace(/\/+$/, "")
@@ -77,7 +78,10 @@ export class ChatAPI {
   ): Promise<void> {
     const response = await fetch(`${this.baseURL}/api/chats/${chatId}/stream`, {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: {
+        "Content-Type": "application/json",
+        "X-Harness-Protocol": ProtocolVersion,
+      },
       body: JSON.stringify(request),
       signal,
     })
@@ -91,21 +95,12 @@ export class ChatAPI {
       throw new Error("Streaming is not available in this browser")
     }
 
-    const reader = response.body.getReader()
-    const decoder = new TextDecoder()
-    let buffer = ""
-
-    for (;;) {
-      const { value, done } = await reader.read()
-      if (done) {
-        break
-      }
-      buffer += decoder.decode(value, { stream: true })
-      buffer = emitSSEEvents(buffer, callbacks.onEvent)
+    // SSE parsing delegated to @harness/client — single shared parser keeps
+    // the chat-app from drifting from the wire format.
+    for await (const sse of parseSSE(response.body)) {
+      const ev = adaptSSEEvent(sse.event, sse.data)
+      if (ev) callbacks.onEvent(ev)
     }
-
-    const tail = buffer + decoder.decode()
-    emitSSEEvents(tail, callbacks.onEvent)
   }
 
   // ── Artifact endpoints ──────────────────────────────────────────────────────
@@ -258,45 +253,42 @@ export class ChatAPI {
       }),
     })
   }
-}
 
-function emitSSEEvents(
-  raw: string,
-  onEvent: (event: StreamEvent) => void
-): string {
-  const chunks = raw.split("\n\n")
-  const pending = chunks.pop() ?? ""
-
-  for (const chunk of chunks) {
-    const event = parseChunk(chunk)
-    if (event) {
-      onEvent(event)
+  /**
+   * Resolve a generic interrupt (approval/question/form_input) using a
+   * resolution token issued by the backend. Supersedes confirm() for the
+   * new interrupt-based HIL flow but both endpoints coexist.
+   */
+  async resolveInterrupt(
+    token: string,
+    chatId: number,
+    response: {
+      approved?: boolean
+      answer?: unknown
+      modifiedArgs?: string
+    }
+  ): Promise<void> {
+    const r = await fetch(
+      `${this.baseURL}/api/interrupts/${encodeURIComponent(token)}/resolve`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          chat_id: chatId,
+          approved: response.approved ?? false,
+          answer: response.answer,
+          modified_args: response.modifiedArgs ?? "",
+        }),
+      }
+    )
+    if (!r.ok) {
+      const body = await r.text()
+      throw new Error(body || `resolveInterrupt failed (${r.status})`)
     }
   }
-
-  return pending
 }
 
-function parseChunk(chunk: string): StreamEvent | null {
-  const lines = chunk
-    .split("\n")
-    .map((line) => line.trim())
-    .filter(Boolean)
-
-  if (lines.length === 0) {
-    return null
-  }
-
-  const eventLine = lines.find((line) => line.startsWith("event:"))
-  const dataLine = lines.find((line) => line.startsWith("data:"))
-
-  if (!eventLine || !dataLine) {
-    return null
-  }
-
-  const type = eventLine.slice(6).trim()
-  const dataText = dataLine.slice(5).trim()
-
+function adaptSSEEvent(type: string, dataText: string): StreamEvent | null {
   let parsed: unknown = {}
   try {
     parsed = JSON.parse(dataText)
@@ -379,6 +371,26 @@ function parseChunk(chunk: string): StreamEvent | null {
       return {
         type: "confirmation_resolved",
         data: parsed as { id: string; tool: string; approved: boolean },
+      }
+    case "interrupt_required":
+      return {
+        type: "interrupt_required",
+        data: parsed as import("./types").StreamInterruptRequest,
+      }
+    case "interrupt_resolved":
+      return {
+        type: "interrupt_resolved",
+        data: parsed as import("./types").StreamInterruptRequest,
+      }
+    case "artifact_created":
+      return {
+        type: "artifact_created",
+        data: parsed as import("./types").StreamComponentArtifact,
+      }
+    case "artifact_updated":
+      return {
+        type: "artifact_updated",
+        data: parsed as import("./types").StreamComponentArtifact,
       }
     case "done":
       return {
