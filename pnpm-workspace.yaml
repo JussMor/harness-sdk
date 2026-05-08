@@ -1,0 +1,3 @@
+packages:
+  - "clients/*"
+  - "example/chat-app"

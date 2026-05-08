@@ -1,0 +1,25 @@
+name: protocol-drift
+
+# Fails when the committed clients/harness-client/src/generated/* differs
+# from a fresh tygo + gen-events run. This guarantees the TypeScript wire
+# types are always in lockstep with the Go SDK.
+
+on:
+  pull_request:
+    paths:
+      - "sdk/**"
+      - "clients/**"
+      - "scripts/gen-events/**"
+      - "Makefile"
+  push:
+    branches: [main]
+
+jobs:
+  drift-check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.22"
+      - run: make client-types-check
