@@ -49,6 +49,16 @@ func newModeEngineWithDB(provider ab.LLMProvider, model string, logContext Runti
 		memRoots = ab.DefaultMemoryRoots
 	}
 
+	// Strip routing prefix from model for providers that need a bare model name
+	// (e.g. "anthropic/claude-haiku-4-5-20251001" → "claude-haiku-4-5-20251001").
+	// The RoutedLLMProvider handles routing via the prefix; internal SDK components
+	// like EpisodicCompactor, InferredMemoryWriter, LLMPlanner call Chat() directly
+	// and must receive only the bare name.
+	bareModel := model
+	if _, modelOnly := ab.ParseModelRef(model); modelOnly != "" {
+		bareModel = modelOnly
+	}
+
 	rt := &agentRuntime{
 		chatID:      logContext.ChatID,
 		modelName:   model,
@@ -131,7 +141,7 @@ func newModeEngineWithDB(provider ab.LLMProvider, model string, logContext Runti
 		// Compaction: episodic with differential scoring (pre-filters low-importance msgs)
 		WithCompactor(&ab.EpisodicCompactor{
 			Provider:            provider,
-			Model:               model,
+			Model:               bareModel,
 			MaxWords:            400,
 			ImportanceThreshold: 0.25,
 			EpisodeThreshold:    0.65,
@@ -141,20 +151,20 @@ func newModeEngineWithDB(provider ab.LLMProvider, model string, logContext Runti
 		// Memory inference: extract persistent facts, deduplicated
 		WithMemoryWriter(&ab.InferredMemoryWriter{
 			Provider:        provider,
-			Model:           model,
+			Model:           bareModel,
 			MaxFacts:        3,
 			MinConfidence:   0.75,
 			DedupeThreshold: 0.6,
 		}).
 		// Planning: LLM-driven decision + executable DAG proposal
-		WithPlanner(&ab.LLMPlanner{Provider: provider, Model: model, MaxExecutables: 6}).
+		WithPlanner(&ab.LLMPlanner{Provider: provider, Model: bareModel, MaxExecutables: 6}).
 		WithAutoApprovePlan(true).
 		// Extended thinking for deep-work mode
 		WithThinkingBudget(resolveThinkingBudget(logContext.Mode)).
 		// Session context: inject time every turn
 		WithSessionContext(ab.LocalTimeSessionContext()).
 		// Tokenizer: auto-selects per model (gpt-4o→O200K, gpt-4→CL100K, claude→heuristic)
-		WithTokenizer(sdktokenizers.NewAutoForModel(model)).
+		WithTokenizer(sdktokenizers.NewAutoForModel(bareModel)).
 		// Persistence: SQLite conversation store
 		WithConversationStore(convStore).
 		// Wellbeing detection

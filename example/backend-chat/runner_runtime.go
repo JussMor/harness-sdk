@@ -450,28 +450,26 @@ func (r *agentRuntime) newSubagentDispatchTool() *ab.Tool {
 				model := strings.TrimSpace(asString(m["model"]))
 				allowWrites, _ := m["allow_memory_writes"].(bool)
 
-			// Default to the parent's effective model so subagents always
-			// send a valid model name to the LLM provider.
-			// Strip any routing prefix (e.g. "anthropic/claude-haiku-…" → "claude-haiku-…")
-			// so the Anthropic provider never receives a prefixed model string.
-			effectiveModel := model
-			if effectiveModel == "" {
-				effectiveModel = r.modelName
-			}
-			if _, modelOnly := ab.ParseModelRef(effectiveModel); modelOnly != "" {
-				effectiveModel = modelOnly
-			}
-			subs = append(subs, ab.Subagent{
-				ID:                id,
-				Task:              task,
-				Engine:            subEngine,
-				Mode:              strings.TrimSpace(asString(m["mode"])),
-				MaxTurns:          maxTurns,
-				Timeout:           timeout,
-				SystemPrompt:      systemPrompt,
-				Model:             effectiveModel,
-				AllowMemoryWrites: allowWrites,
-			})
+				// Strip routing prefix so the Anthropic provider always receives
+				// a bare model name (e.g. "claude-haiku-4-5-20251001", not "anthropic/...").
+				effectiveModel := model
+				if effectiveModel == "" {
+					effectiveModel = r.modelName
+				}
+				if _, modelOnly := ab.ParseModelRef(effectiveModel); modelOnly != "" {
+					effectiveModel = modelOnly
+				}
+				subs = append(subs, ab.Subagent{
+					ID:                id,
+					Task:              task,
+					Engine:            subEngine,
+					Mode:              strings.TrimSpace(asString(m["mode"])),
+					MaxTurns:          maxTurns,
+					Timeout:           timeout,
+					SystemPrompt:      systemPrompt,
+					Model:             effectiveModel,
+					AllowMemoryWrites: allowWrites,
+				})
 			}
 
 			results := ab.RunSubagentsInParallel(ctx, subs)

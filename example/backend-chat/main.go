@@ -698,18 +698,26 @@ func (a *BackendChatApp) handleStream(w http.ResponseWriter, r *http.Request, ch
 				if ev.SubagentResult.Error != nil {
 					errMsg = ev.SubagentResult.Error.Error()
 				}
-				d, _ := json.Marshal(map[string]any{
-					"id":          ev.SubagentResult.ID,
-					"task":        ev.SubagentResult.Task,
-					"output":      ev.SubagentResult.Output,
-					"turns":       ev.SubagentResult.Turns,
-					"stop_reason": ev.SubagentResult.StopReason,
-					"duration_ms": ev.SubagentResult.Duration.Milliseconds(),
-					"error":       errMsg,
-				})
+				payload := map[string]any{
+					"id":            ev.SubagentResult.ID,
+					"task":          ev.SubagentResult.Task,
+					"output":        ev.SubagentResult.Output,
+					"turns":         ev.SubagentResult.Turns,
+					"stop_reason":   ev.SubagentResult.StopReason,
+					"duration_ms":   ev.SubagentResult.Duration.Milliseconds(),
+					"error":         errMsg,
+				}
+				// Include model and system_prompt when set — frontend uses them for display
+				if ev.SubagentResult.Model != "" {
+					payload["model"] = ev.SubagentResult.Model
+				}
+				if ev.SubagentResult.SystemPrompt != "" {
+					payload["system_prompt"] = ev.SubagentResult.SystemPrompt
+				}
+				d, _ := json.Marshal(payload)
 				sseWrite("subagent_result", string(d))
-				log.Printf("stream.subagent_result chat_id=%d run_id=%s agent_id=%s",
-					chatID, runID, ev.SubagentResult.ID)
+				log.Printf("stream.subagent_result chat_id=%d run_id=%s agent_id=%s turns=%d",
+					chatID, runID, ev.SubagentResult.ID, ev.SubagentResult.Turns)
 			}
 
 		case ab.StreamEventDone:

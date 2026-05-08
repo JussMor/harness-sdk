@@ -63,15 +63,21 @@ type Subagent struct {
 
 // SubagentResult is what a subagent returns to its parent.
 type SubagentResult struct {
-	ID         string          `json:"id"`
-	Task       string          `json:"task"`
-	Output     string          `json:"output"`
-	Turns      int             `json:"turns"`
-	Usage      TokenUsage      `json:"usage"`
-	StopReason string          `json:"stop_reason"`
-	Duration   time.Duration   `json:"duration_ms"`
-	Error      error           `json:"-"`
-	Trace      []ReasoningStep `json:"trace,omitempty"`
+	ID           string          `json:"id"`
+	Task         string          `json:"task"`
+	Output       string          `json:"output"`
+	Turns        int             `json:"turns"`
+	Usage        TokenUsage      `json:"usage"`
+	StopReason   string          `json:"stop_reason"`
+	Duration     time.Duration   `json:"duration_ms"`
+	Error        error           `json:"-"`
+	Trace        []ReasoningStep `json:"trace,omitempty"`
+	// Model is the model name used by this subagent (bare, no routing prefix).
+	// Populated from Subagent.Model if set.
+	Model        string          `json:"model,omitempty"`
+	// SystemPrompt is the system prompt used by this subagent, if overridden.
+	// Populated from Subagent.SystemPrompt if set.
+	SystemPrompt string          `json:"system_prompt,omitempty"`
 }
 
 // Run executes the subagent task and returns the result.
@@ -141,6 +147,13 @@ func (s *Subagent) Run(ctx context.Context) *SubagentResult {
 	res.Usage = loopResult.TotalUsage
 	res.StopReason = loopResult.StopReason
 	res.Trace = loopResult.ReasoningTrace
+	// Surface the model and system prompt so callers can display them
+	if s.Model != "" {
+		res.Model = s.Model
+	}
+	if s.SystemPrompt != "" {
+		res.SystemPrompt = s.SystemPrompt
+	}
 
 	// Persist conversation for follow-ups when Conversation is set
 	if s.Conversation != nil {
