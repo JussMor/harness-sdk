@@ -202,19 +202,15 @@ func (r *agentRuntime) newAwaitComponentInputTool(chatID int64) *ab.Tool {
 
 			// Look up the runtime's interrupt gate so we can mint a resolution
 			// token the frontend will POST against.
-			gate, ok := hilRegistry.Get(chatID)
+			gate, ok := ensureInterruptRegistry().Get(chatID)
 			if !ok || gate == nil {
 				return "", fmt.Errorf("no interrupt gate for chat %d (must be wired in main.go)", chatID)
-			}
-			inner := gate.Inner()
-			if inner == nil {
-				return "", fmt.Errorf("interrupt gate has no inner gate")
 			}
 
 			// Use a fresh ID per call so the same component can be requested
 			// multiple times in the same turn without token clashes.
 			interruptID := fmt.Sprintf("int_form_%s_%d", name, time.Now().UnixNano())
-			token, err := inner.IssueResolutionToken(interruptID, 0)
+			token, err := gate.IssueResolutionToken(interruptID, 0)
 			if err != nil {
 				return "", fmt.Errorf("issue resolution token: %w", err)
 			}
