@@ -428,6 +428,14 @@ func RunAgentLoopWithEngine(ctx context.Context, engine *Engine, modeID string, 
 		// No mode but a builder exists — assemble what we have.
 		cfg.SystemPrompt = engine.Prompt.Build()
 	}
+	// Ensure resolvedModel reflects whatever the caller passed even when
+	// no mode is active (e.g. subagents with Mode=""). Without this the
+	// provider router below sees an empty model and falls back to the
+	// raw engine.LLM, which then receives a routing-stripped model name
+	// it cannot resolve (manifesting as `model: <nil>` 404s).
+	if resolvedModel == "" {
+		resolvedModel = cfg.Model
+	}
 
 	// Resolve provider using model for routing.
 	if cfg.Provider == nil {
@@ -436,6 +444,13 @@ func RunAgentLoopWithEngine(ctx context.Context, engine *Engine, modeID string, 
 			return nil, err
 		}
 		cfg.Provider = p
+		// Once we've resolved to a concrete provider, strip the routing
+		// prefix from the model so the underlying provider receives only
+		// the model name (e.g. "claude-haiku-4-5-20251001") instead of
+		// the routed reference ("anthropic/claude-haiku-4-5-20251001").
+		if _, modelOnly := ParseModelRef(cfg.Model); modelOnly != "" {
+			cfg.Model = modelOnly
+		}
 	}
 
 	if cfg.Tools == nil && engine.HasTools() {
