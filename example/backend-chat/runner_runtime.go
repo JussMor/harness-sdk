@@ -25,12 +25,14 @@ type agentRuntime struct {
 	skills         ab.SkillProvider
 	memory         ab.MemoryProvider
 	convStore      ab.ConversationStore
+	execCtx        *ab.InMemoryExecutionContext // task checklist (TodoWrite/TodoRead)
 }
 
 // ── Tool registries ──────────────────────────────────────────────────────────
 
 func (r *agentRuntime) buildToolRegistry() *ab.ToolRegistry {
 	reg := ab.NewToolRegistry()
+	reg.Register(r.newTodoTool())
 	// Prefer sandbox file tools when available to avoid writing local host files.
 	if !isSandboxAvailable() || r.chatID <= 0 {
 		reg.Register(r.newDocumentTool())
@@ -52,12 +54,18 @@ func (r *agentRuntime) buildToolRegistry() *ab.ToolRegistry {
 		reg.Register(r.newCodeInterpreterTool(r.chatID))
 		reg.Register(r.newFileWriteTool(r.chatID))
 		reg.Register(r.newFileReadTool(r.chatID))
+		reg.Register(r.newGlobTool(r.chatID))
+		reg.Register(r.newGrepTool(r.chatID))
+	} else {
+		reg.Register(r.newGlobTool(0))
+		reg.Register(r.newGrepTool(0))
 	}
 	return reg
 }
 
 func (r *agentRuntime) buildSubagentToolRegistry() *ab.ToolRegistry {
 	reg := ab.NewToolRegistry()
+	reg.Register(r.newTodoTool())
 	if !isSandboxAvailable() || r.chatID <= 0 {
 		reg.Register(r.newDocumentTool())
 	}
@@ -70,6 +78,11 @@ func (r *agentRuntime) buildSubagentToolRegistry() *ab.ToolRegistry {
 		reg.Register(r.newCodeInterpreterTool(r.chatID))
 		reg.Register(r.newFileWriteTool(r.chatID))
 		reg.Register(r.newFileReadTool(r.chatID))
+		reg.Register(r.newGlobTool(r.chatID))
+		reg.Register(r.newGrepTool(r.chatID))
+	} else {
+		reg.Register(r.newGlobTool(0))
+		reg.Register(r.newGrepTool(0))
 	}
 	return reg
 }
@@ -232,6 +245,208 @@ func (r *agentRuntime) newSkillsTool() *ab.Tool {
 				return fmt.Sprintf("Unloaded skill %s", skillName), nil
 			}
 			return "unsupported operation", nil
+		},
+	}
+}
+
+func (r *agentRuntime) newTodoTool() *ab.Tool {
+	return &ab.Tool{
+		Name:        "todo_write",
+		Description: "Manage the task checklist for the current session. Use this to track multi-step work so you always know what's done and what's next. Update the list as you go — mark items in_progress when you start them, completed when done.",
+		Category:    ab.ToolCategoryPlanning,
+		Parameters: ab.ToolFuncParams{
+			Type: "object",
+			Properties: map[string]ab.ToolParam{
+				"operation": {
+					Type:        "string",
+					Description: "One of: write (replace full list), read (get current list), mark_done (complete one item by id).",
+					Enum:        []string{"write", "read", "mark_done"},
+				},
+				"todos": {
+					Type:        "array",
+					Description: "For write: full list of todos. Each item must have id (string), content (string), status (pending|in_progress|completed).",
+					Items: &ab.ToolParam{
+						Type: "object",
+						Properties: map[string]ab.ToolParam{
+							"id":      {Type: "string", Description: "Unique identifier for this todo item."},
+							"content": {Type: "string", Description: "Description of the task."},
+							"status":  {Type: "string", Description: "pending, in_progress, or completed.", Enum: []string{"pending", "in_progress", "completed"}},
+						},
+					},
+				},
+				"id": {Type: "string", Description: "For mark_done: the todo item ID to mark as completed."},
+			},
+			Required: []string{"operation"},
+		},
+		Execute: func(_ context.Context, _ string, args map[string]any) (string, error) {
+			op := strings.ToLower(strings.TrimSpace(asString(args["operation"])))
+			switch op {
+			case "read":
+				todos := r.execCtx.Todos()
+				out, _ := json.Marshal(todos)
+				return string(out), nil
+			case "mark_done":
+				id := strings.TrimSpace(asString(args["id"]))
+				if id == "" {
+					return "", fmt.Errorf("id is required for mark_done")
+				}
+				r.execCtx.MarkDone(id)
+				return fmt.Sprintf("marked %q as completed", id), nil
+			case "write":
+				rawList, _ := args["todos"].([]any)
+				todos := make([]ab.Todo, 0, len(rawList))
+				for _, raw := range rawList {
+					m, ok := raw.(map[string]any)
+					if !ok {
+						continue
+					}
+					status := ab.TodoStatus(strings.ToLower(strings.TrimSpace(asString(m["status"]))))
+					if status == "" {
+						status = ab.TodoStatusPending
+					}
+					todos = append(todos, ab.Todo{
+						ID:      strings.TrimSpace(asString(m["id"])),
+						Content: strings.TrimSpace(asString(m["content"])),
+						Status:  status,
+					})
+				}
+				r.execCtx.SetTodos(todos)
+				out, _ := json.Marshal(todos)
+				return string(out), nil
+			}
+			return "unsupported operation", nil
+		},
+	}
+}
+
+func (r *agentRuntime) newGlobTool(chatID int64) *ab.Tool {
+	return &ab.Tool{
+		Name:        "glob",
+		Description: "List files matching a glob pattern. Use this to explore the workspace structure and find files before reading or editing them.",
+		Category:    ab.ToolCategoryWorkspace,
+		Parameters: ab.ToolFuncParams{
+			Type: "object",
+			Properties: map[string]ab.ToolParam{
+				"pattern": {Type: "string", Description: "Glob pattern to match (e.g. '**/*.go', 'src/**/*.ts', '*.json'). Relative to sandbox root."},
+			},
+			Required: []string{"pattern"},
+		},
+		Execute: func(ctx context.Context, _ string, args map[string]any) (string, error) {
+			pattern := strings.TrimSpace(asString(args["pattern"]))
+			if pattern == "" {
+				return "", fmt.Errorf("pattern is required")
+			}
+			if isSandboxAvailable() && chatID > 0 {
+				mgr := getSandboxManager()
+				sbID, err := mgr.getOrCreateSandbox(ctx, chatID)
+				if err != nil {
+					return "", fmt.Errorf("sandbox unavailable: %w", err)
+				}
+				// Use find to support ** patterns across all depths
+				safePattern := strings.ReplaceAll(pattern, "**", "*")
+				cmd := fmt.Sprintf("find . -path %q -not -path '*/\\.*' 2>/dev/null | sort | head -200", "./"+safePattern)
+				res, err := mgr.driver.Exec(ctx, sbID, cmd)
+				if err != nil {
+					return "", err
+				}
+				out := strings.TrimSpace(res.Stdout)
+				if out == "" {
+					return "no files matched", nil
+				}
+				return out, nil
+			}
+			// No sandbox fallback: local glob
+			matches, err := filepath.Glob(pattern)
+			if err != nil {
+				return "", fmt.Errorf("invalid pattern: %w", err)
+			}
+			if len(matches) == 0 {
+				return "no files matched", nil
+			}
+			return strings.Join(matches, "\n"), nil
+		},
+	}
+}
+
+func (r *agentRuntime) newGrepTool(chatID int64) *ab.Tool {
+	return &ab.Tool{
+		Name:        "grep",
+		Description: "Search for a pattern in files. Returns matching lines with file names and line numbers. Use this to find definitions, usages, and references across the workspace.",
+		Category:    ab.ToolCategoryWorkspace,
+		Parameters: ab.ToolFuncParams{
+			Type: "object",
+			Properties: map[string]ab.ToolParam{
+				"pattern": {Type: "string", Description: "Text or regular expression to search for."},
+				"path":    {Type: "string", Description: "Directory or file to search in. Defaults to '.' (entire workspace)."},
+				"include": {Type: "string", Description: "Glob to restrict search to specific file types (e.g. '*.go', '*.ts')."},
+			},
+			Required: []string{"pattern"},
+		},
+		Execute: func(ctx context.Context, _ string, args map[string]any) (string, error) {
+			pattern := strings.TrimSpace(asString(args["pattern"]))
+			if pattern == "" {
+				return "", fmt.Errorf("pattern is required")
+			}
+			searchPath := strings.TrimSpace(asString(args["path"]))
+			if searchPath == "" {
+				searchPath = "."
+			}
+			include := strings.TrimSpace(asString(args["include"]))
+
+			if isSandboxAvailable() && chatID > 0 {
+				mgr := getSandboxManager()
+				sbID, err := mgr.getOrCreateSandbox(ctx, chatID)
+				if err != nil {
+					return "", fmt.Errorf("sandbox unavailable: %w", err)
+				}
+				cmd := fmt.Sprintf("grep -rn --max-count=5 -e %q %q", pattern, searchPath)
+				if include != "" {
+					cmd += fmt.Sprintf(" --include=%q", include)
+				}
+				cmd += " 2>/dev/null | head -100"
+				res, err := mgr.driver.Exec(ctx, sbID, cmd)
+				if err != nil {
+					return "", err
+				}
+				out := strings.TrimSpace(res.Stdout)
+				if out == "" {
+					return "no matches found", nil
+				}
+				return out, nil
+			}
+			// No sandbox fallback: local filesystem walk
+			var results []string
+			err := filepath.Walk(searchPath, func(path string, info os.FileInfo, err error) error {
+				if err != nil || info.IsDir() {
+					return nil
+				}
+				if include != "" {
+					matched, _ := filepath.Match(include, filepath.Base(path))
+					if !matched {
+						return nil
+					}
+				}
+				data, readErr := os.ReadFile(path)
+				if readErr != nil {
+					return nil
+				}
+				for i, line := range strings.Split(string(data), "\n") {
+					if strings.Contains(line, pattern) {
+						results = append(results, fmt.Sprintf("%s:%d:%s", path, i+1, line))
+						if len(results) >= 100 {
+							return filepath.SkipAll
+						}
+					}
+				}
+				return nil
+			})
+			if err != nil {
+				return "", err
+			}
+			if len(results) == 0 {
+				return "no matches found", nil
+			}
+			return strings.Join(results, "\n"), nil
 		},
 	}
 }
