@@ -36,7 +36,9 @@ func (r *agentRuntime) buildToolRegistry() *ab.ToolRegistry {
 	if !isSandboxAvailable() || r.chatID <= 0 {
 		reg.Register(r.newDocumentTool())
 	}
-	// SDK_V3_REMOVE: skills tool removed; will return as agnostic SkillTool v3.
+	if tool := r.newSkillsTool(); tool != nil {
+		reg.Register(tool)
+	}
 	if r.memory != nil {
 		reg.Register(r.newMemoryTool())
 	}
@@ -164,8 +166,33 @@ func (r *agentRuntime) newMemoryTool() *ab.Tool {
 }
 
 func (r *agentRuntime) newSkillsTool() *ab.Tool {
-	// SDK_V3_REMOVE: stubbed during demolition. Replace with agnostic SkillTool v3.
-	return nil
+	root := resolveSkillsRoot()
+	if root == "" {
+		return nil
+	}
+	return ab.NewSkillTool(ab.SkillToolConfig{
+		Sources: []ab.SkillSource{
+			&ab.FilesystemSkillSource{Root: root, Label: "backend-skills"},
+		},
+		SessionIDFn:         func() string { return fmt.Sprintf("chat-%d", r.chatID) },
+		ContextWindowTokens: 128_000,
+		// BashExecutor: TODO wire to sandbox bash when chatID > 0
+	})
+}
+
+// resolveSkillsRoot picks the first existing skills directory.
+func resolveSkillsRoot() string {
+	candidates := []string{
+		"skills",
+		filepath.Join("example", "backend-chat", "skills"),
+		filepath.Join("..", "backend-chat", "skills"),
+	}
+	for _, c := range candidates {
+		if info, err := os.Stat(c); err == nil && info.IsDir() {
+			return c
+		}
+	}
+	return ""
 }
 
 func (r *agentRuntime) newTodoTool() *ab.Tool {
