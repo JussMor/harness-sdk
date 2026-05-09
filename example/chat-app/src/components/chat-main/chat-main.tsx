@@ -237,22 +237,33 @@ export function ChatMain({
         })
       })
 
-      // Reconstruct artifacts from persisted metadata
-      const restored: Array<Artifact> = []
-      for (const msg of payload) {
-        if (msg.metadata?.artifacts) {
-          for (const a of msg.metadata.artifacts) {
-            restored.push({
-              id: `restored-${msg.id}-${restored.length}`,
-              language: a.language,
-              content: a.content,
-              complete: true,
-              title: a.path.split("/").pop() || a.path,
-            })
-          }
-        }
+      // Reconstruct artifacts from the artifacts API (real DB UUIDs + latest content).
+      // This ensures onSaveVersion can target the correct DB record and version
+      // navigation works after a page reload.
+      try {
+        const dbArtifacts = await api.listArtifacts(targetChatID)
+        const restored: Array<Artifact> = dbArtifacts.map((a) => ({
+          id: a.id,
+          language: a.language,
+          content: a.latestContent ?? "",
+          complete: true,
+          title: a.title || `${a.language} artifact`,
+        }))
+        setAllArtifacts(restored)
+        // If the currently-displayed artifact was a temp local one (e.g. "file-…"),
+        // replace it with its DB counterpart so save operations have a real ID.
+        setActiveArtifact((prev) => {
+          if (!prev) return prev
+          const match = restored.find(
+            (r) =>
+              r.id === prev.id ||
+              (r.language === prev.language && r.title === prev.title)
+          )
+          return match ?? prev
+        })
+      } catch {
+        // Non-fatal — keep whatever was already in allArtifacts from the stream.
       }
-      setAllArtifacts(restored)
     },
     [api]
   )
@@ -1053,7 +1064,18 @@ export function ChatMain({
             setIsArtifactStreaming(false)
           }}
           onSaveVersion={async (artifactId, newContent) => {
-            // Update local state immediately
+            // Persist the new version to the backend (best-effort).
+            // Only works for artifacts with real DB UUIDs (not temp local IDs).
+            const isDbId =
+              artifactId.length === 36 && artifactId.includes("-")
+            if (isDbId) {
+              try {
+                await api.addArtifactVersion(artifactId, newContent)
+              } catch {
+                // Non-fatal — local state still reflects the edit.
+              }
+            }
+            // Always update local state so the canvas stays in sync.
             setAllArtifacts((prev) =>
               prev.map((a) =>
                 a.id === artifactId ? { ...a, content: newContent } : a

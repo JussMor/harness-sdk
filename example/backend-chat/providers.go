@@ -126,6 +126,15 @@ func InsertMessage(ctx context.Context, db *sql.DB, chatID int64, role, content,
 	return getMessage(ctx, db, id)
 }
 
+func UpdateMessageMetadata(ctx context.Context, db *sql.DB, msgID int64, meta MessageMetadata) error {
+	raw, err := json.Marshal(meta)
+	if err != nil {
+		return err
+	}
+	_, err = db.ExecContext(ctx, `UPDATE messages SET metadata = ? WHERE id = ?`, string(raw), msgID)
+	return err
+}
+
 func ListMessages(ctx context.Context, db *sql.DB, chatID int64) ([]Message, error) {
 	rows, err := db.QueryContext(ctx, `SELECT id, chat_id, role, content, model, COALESCE(metadata, '{}'), created_at FROM messages WHERE chat_id = ? ORDER BY id ASC`, chatID)
 	if err != nil {

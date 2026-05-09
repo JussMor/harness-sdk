@@ -67,7 +67,9 @@ func (a *BackendChatApp) handleArtifactRoutes(w http.ResponseWriter, r *http.Req
 func (a *BackendChatApp) handleChatArtifacts(w http.ResponseWriter, r *http.Request, chatID int64) {
 	switch r.Method {
 	case http.MethodGet:
-		arts, err := ListArtifactsForChat(r.Context(), a.db, chatID)
+		// Include the latest version's content so the frontend can restore
+		// the artifact canvas without extra per-artifact round-trips.
+		arts, err := ListArtifactsWithLatestContent(r.Context(), a.db, chatID)
 		if err != nil {
 			writeErr(w, http.StatusInternalServerError, err)
 			return
