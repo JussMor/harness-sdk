@@ -26,6 +26,29 @@ type agentRuntime struct {
 	memory         ab.MemoryProvider
 	convStore      ab.ConversationStore
 	execCtx        *ab.InMemoryExecutionContext // task checklist (TodoWrite/TodoRead)
+
+	// memoryViewed tracks which "scope:path" pairs the LLM has read this run.
+	// memory_create requires that MEMORY.md was viewed first — mirrors Claude
+	// Code's FileWriteTool.MUST_READ_FIRST contract: the only reliable way to
+	// stop the model from creating duplicates is to make create() fail unless
+	// the index was actually inspected.
+	memoryViewedMu sync.Mutex
+	memoryViewed   map[string]bool
+}
+
+func (r *agentRuntime) markMemoryViewed(scope ab.Scope, path string) {
+	r.memoryViewedMu.Lock()
+	defer r.memoryViewedMu.Unlock()
+	if r.memoryViewed == nil {
+		r.memoryViewed = make(map[string]bool)
+	}
+	r.memoryViewed[string(scope)+":"+path] = true
+}
+
+func (r *agentRuntime) hasMemoryViewed(scope ab.Scope, path string) bool {
+	r.memoryViewedMu.Lock()
+	defer r.memoryViewedMu.Unlock()
+	return r.memoryViewed[string(scope)+":"+path]
 }
 
 // ── Tool registries ──────────────────────────────────────────────────────────
@@ -41,7 +64,9 @@ func (r *agentRuntime) buildToolRegistry() *ab.ToolRegistry {
 		reg.Register(r.newSkillsTool())
 	}
 	if r.memory != nil {
-		reg.Register(r.newMemoryTool())
+		for _, t := range r.newMemoryTools() {
+			reg.Register(t)
+		}
 	}
 	reg.Register(r.newSubagentDispatchTool())
 	reg.Register(r.newRenderComponentTool())
@@ -70,7 +95,9 @@ func (r *agentRuntime) buildSubagentToolRegistry() *ab.ToolRegistry {
 		reg.Register(r.newDocumentTool())
 	}
 	if r.memory != nil {
-		reg.Register(r.newMemoryTool())
+		for _, t := range r.newMemoryTools() {
+			reg.Register(t)
+		}
 	}
 	reg.Register(r.newRenderComponentTool())
 	if isSandboxAvailable() && r.chatID > 0 {
@@ -89,79 +116,284 @@ func (r *agentRuntime) buildSubagentToolRegistry() *ab.ToolRegistry {
 
 // ── Tool definitions ─────────────────────────────────────────────────────────
 
-func (r *agentRuntime) newMemoryTool() *ab.Tool {
+// newMemoryTools returns the 5 individual memory tools that mirror Claude
+// Code's Read/Edit/Write/Glob model — separate verbs, separate descriptions,
+// strict validation. The LLM picks the right one instead of guessing which
+// "operation" enum value goes with which params (which was the source of
+// the Failed tool calls in the monolithic version).
+func (r *agentRuntime) newMemoryTools() []*ab.Tool {
+	return []*ab.Tool{
+		r.memoryViewTool(),
+		r.memoryCreateTool(),
+		r.memoryStrReplaceTool(),
+		r.memoryDeleteTool(),
+		r.memoryListTool(),
+	}
+}
+
+func memoryScopeParam() ab.ToolParam {
+	return ab.ToolParam{
+		Type:        "string",
+		Description: "Scope: 'user' for cross-project memory (preferences, role), 'project' for chat-specific memory.",
+		Enum:        []string{"user", "project"},
+	}
+}
+
+// requireScope returns an explicit error rather than silently defaulting,
+// because silent defaults caused user-scope writes to land in project.
+func requireScope(value string) (ab.Scope, error) {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "user":
+		return ab.ScopeUser, nil
+	case "project":
+		return ab.ScopeProject, nil
+	default:
+		return "", fmt.Errorf("scope must be 'user' or 'project' (got %q)", value)
+	}
+}
+
+// validateMemoryWritePath rejects unsafe or special paths before any write.
+//   - Must be non-empty and end in .md (memory files are markdown).
+//   - Must not be the entrypoint MEMORY.md (use memory_str_replace to update
+//     the index — recreating it would clobber the curated index).
+//   - Must not contain ".." (path traversal) or absolute path roots.
+func validateMemoryWritePath(path string) error {
+	p := strings.TrimSpace(path)
+	if p == "" {
+		return fmt.Errorf("path is required")
+	}
+	if !strings.HasSuffix(strings.ToLower(p), ".md") {
+		return fmt.Errorf("path must end in .md (got %q)", p)
+	}
+	if strings.Contains(p, "..") {
+		return fmt.Errorf("path must not contain '..'")
+	}
+	base := p
+	if i := strings.LastIndex(p, "/"); i >= 0 {
+		base = p[i+1:]
+	}
+	if strings.EqualFold(base, ab.EntrypointName) {
+		return fmt.Errorf("%s is the always-loaded index and cannot be created/recreated; use memory_str_replace to update it", ab.EntrypointName)
+	}
+	return nil
+}
+
+func (r *agentRuntime) memoryViewTool() *ab.Tool {
 	return &ab.Tool{
-		Name:        "memory-operations",
-		Description: "View and edit persistent memory in user or project scope.",
+		Name:        "memory_view",
+		Description: "Read a memory file or list a memory directory. **You MUST call this on /MEMORY.md before any memory_create** — it is how you avoid duplicates.",
 		Category:    ab.ToolCategoryMemory,
 		Parameters: ab.ToolFuncParams{
 			Type: "object",
 			Properties: map[string]ab.ToolParam{
-				"operation": {
-					Type:        "string",
-					Description: "One of: view, create, str_replace, delete, rename, list, search.",
-					Enum:        []string{"view", "create", "str_replace", "delete", "rename", "list", "search"},
-				},
-				"scope":   {Type: "string", Description: "user or project", Enum: []string{"user", "project", "*"}},
-				"path":    {Type: "string", Description: "Memory path."},
-				"content": {Type: "string", Description: "File content for create."},
-				"oldStr":  {Type: "string", Description: "Old string for str_replace."},
-				"newStr":  {Type: "string", Description: "New string for str_replace."},
-				"oldPath": {Type: "string", Description: "Source path for rename."},
-				"newPath": {Type: "string", Description: "Destination path for rename."},
-				"query":   {Type: "string", Description: "Query text for search."},
+				"scope": memoryScopeParam(),
+				"path":  {Type: "string", Description: "Path within the scope, e.g. '/MEMORY.md' or '/feedback_testing.md'. Use '/' for the scope root listing."},
 			},
-			Required: []string{"operation"},
+			Required: []string{"scope", "path"},
 		},
 		Execute: func(ctx context.Context, _ string, args map[string]any) (string, error) {
 			if r.memory == nil {
-				return "memory provider not configured", nil
+				return "", fmt.Errorf("memory provider not configured")
 			}
-			op := strings.ToLower(strings.TrimSpace(asString(args["operation"])))
-			scope := parseMemoryScope(asString(args["scope"]))
+			scope, err := requireScope(asString(args["scope"]))
+			if err != nil {
+				return "", err
+			}
+			path := asString(args["path"])
+			out, err := r.memory.View(ctx, scope, path)
+			if err != nil {
+				return "", err
+			}
+			r.markMemoryViewed(scope, path)
+			return out, nil
+		},
+	}
+}
 
-			switch op {
-			case "view":
-				out, err := r.memory.View(ctx, scope, asString(args["path"]))
-				return out, err
-			case "create":
-				if err := r.memory.Create(ctx, ensureWritableScope(scope), asString(args["path"]), asString(args["content"])); err != nil {
-					return "", err
-				}
-				return "memory created", nil
-			case "str_replace":
-				if err := r.memory.StrReplace(ctx, ensureWritableScope(scope), asString(args["path"]), asString(args["oldStr"]), asString(args["newStr"])); err != nil {
-					return "", err
-				}
-				return "memory updated", nil
-			case "delete":
-				if err := r.memory.Delete(ctx, ensureWritableScope(scope), asString(args["path"])); err != nil {
-					return "", err
-				}
-				return "memory deleted", nil
-			case "rename":
-				if err := r.memory.Rename(ctx, ensureWritableScope(scope), asString(args["oldPath"]), asString(args["newPath"])); err != nil {
-					return "", err
-				}
-				return "memory renamed", nil
-			case "list":
-				items, err := r.memory.List(ctx, scope, asString(args["path"]))
-				if err != nil {
-					return "", err
-				}
-				return strings.Join(items, "\n"), nil
-			case "search":
-				entries, err := r.memory.Search(ctx, scope, asString(args["query"]))
-				if err != nil {
-					return "", err
-				}
-				lines := make([]string, 0, len(entries))
-				for _, e := range entries {
-					lines = append(lines, fmt.Sprintf("- [%s] %s", e.Scope, e.Path))
-				}
-				return strings.Join(lines, "\n"), nil
+func (r *agentRuntime) memoryCreateTool() *ab.Tool {
+	return &ab.Tool{
+		Name:        "memory_create",
+		Description: "Create a new memory file. ALWAYS read MEMORY.md first to ensure the topic isn't already covered by an existing file — duplicates pollute recall. Content must start with YAML frontmatter (name, description, type).",
+		Category:    ab.ToolCategoryMemory,
+		Parameters: ab.ToolFuncParams{
+			Type: "object",
+			Properties: map[string]ab.ToolParam{
+				"scope":   memoryScopeParam(),
+				"path":    {Type: "string", Description: "Path ending in .md, e.g. '/feedback_testing.md'. Cannot be /MEMORY.md."},
+				"content": {Type: "string", Description: "Full file content including YAML frontmatter (---\\nname: ...\\ndescription: ...\\ntype: user|feedback|project|reference\\n---\\n\\nbody)."},
+			},
+			Required: []string{"scope", "path", "content"},
+		},
+		Execute: func(ctx context.Context, _ string, args map[string]any) (string, error) {
+			if r.memory == nil {
+				return "", fmt.Errorf("memory provider not configured")
 			}
-			return "unsupported operation", nil
+			scope, err := requireScope(asString(args["scope"]))
+			if err != nil {
+				return "", err
+			}
+			path := asString(args["path"])
+			if err := validateMemoryWritePath(path); err != nil {
+				return "", err
+			}
+			content := asString(args["content"])
+			if !strings.HasPrefix(strings.TrimSpace(content), "---") {
+				return "", fmt.Errorf("content must begin with YAML frontmatter delimited by --- lines")
+			}
+			name, desc, mtype := extractMemoryFrontmatterFields(content)
+			if name == "" {
+				return "", fmt.Errorf("frontmatter must include a 'name' field")
+			}
+			if desc == "" {
+				return "", fmt.Errorf("frontmatter must include a 'description' field")
+			}
+			if !isValidMemoryType(mtype) {
+				return "", fmt.Errorf("frontmatter 'type' must be one of: user, feedback, project, reference (got %q)", mtype)
+			}
+			// Read-before-write enforcement (Claude Code FileWriteTool pattern).
+			// Per-scope: each scope (user, project) has its OWN MEMORY.md index
+			// and must be viewed independently before its first write.
+			if !r.hasMemoryViewed(scope, "/"+ab.EntrypointName) {
+				return "", fmt.Errorf(
+					"read-before-write violation. Each scope has its own MEMORY.md index. Before creating in scope=%s you must call: memory_view {scope: %q, path: \"/%s\"}. Then retry this memory_create call. (Reading another scope's MEMORY.md does NOT count.)",
+					scope, string(scope), ab.EntrypointName,
+				)
+			}
+			// Duplicate detection: scan headers and reject if a sibling file has
+			// a clearly similar description. Forces the model to update instead
+			// of creating a parallel file with a slightly different name.
+			if scanner, ok := r.memory.(ab.MemoryHeaderScanner); ok {
+				headers, _ := scanner.ScanHeaders(ctx, scope, "/")
+				for _, h := range headers {
+					if h.Path == path {
+						continue
+					}
+					if memoryDescriptionsCollide(h.Description, desc) {
+						return "", fmt.Errorf("a similar memory already exists at %s%s (description: %q). Use memory_view to read it then memory_str_replace to update it \u2014 do not create a parallel file", scope, h.Path, h.Description)
+					}
+				}
+			}
+			if err := r.memory.Create(ctx, scope, path, content); err != nil {
+				return "", err
+			}
+			indexNote := upsertMemoryIndex(ctx, r.memory, scope, path, name, desc, mtype)
+			return fmt.Sprintf(
+				"created %s%s\n<system-reminder>%s. The MEMORY.md index was updated automatically; do not call memory_str_replace on it for this entry. If the description is wrong, fix the file's frontmatter via memory_str_replace and re-create.</system-reminder>",
+				scope, path, indexNote,
+			), nil
+		},
+	}
+}
+
+func (r *agentRuntime) memoryStrReplaceTool() *ab.Tool {
+	return &ab.Tool{
+		Name:        "memory_str_replace",
+		Description: "Edit a memory file by replacing an exact substring. The old_str must appear EXACTLY once in the file. Use this to update existing memories or to add lines to MEMORY.md.",
+		Category:    ab.ToolCategoryMemory,
+		Parameters: ab.ToolFuncParams{
+			Type: "object",
+			Properties: map[string]ab.ToolParam{
+				"scope":   memoryScopeParam(),
+				"path":    {Type: "string", Description: "Path of the existing memory file to edit."},
+				"old_str": {Type: "string", Description: "Exact substring to replace. Must match exactly once."},
+				"new_str": {Type: "string", Description: "Replacement text."},
+			},
+			Required: []string{"scope", "path", "old_str", "new_str"},
+		},
+		Execute: func(ctx context.Context, _ string, args map[string]any) (string, error) {
+			if r.memory == nil {
+				return "", fmt.Errorf("memory provider not configured")
+			}
+			scope, err := requireScope(asString(args["scope"]))
+			if err != nil {
+				return "", err
+			}
+			path := asString(args["path"])
+			if strings.TrimSpace(path) == "" {
+				return "", fmt.Errorf("path is required")
+			}
+			if err := r.memory.StrReplace(ctx, scope, path, asString(args["old_str"]), asString(args["new_str"])); err != nil {
+				return "", err
+			}
+			return "updated " + string(scope) + path, nil
+		},
+	}
+}
+
+func (r *agentRuntime) memoryDeleteTool() *ab.Tool {
+	return &ab.Tool{
+		Name:        "memory_delete",
+		Description: "Delete a memory file. Also remove its line from MEMORY.md afterwards via memory_str_replace.",
+		Category:    ab.ToolCategoryMemory,
+		Parameters: ab.ToolFuncParams{
+			Type: "object",
+			Properties: map[string]ab.ToolParam{
+				"scope": memoryScopeParam(),
+				"path":  {Type: "string", Description: "Path of the memory file to delete. Cannot delete MEMORY.md."},
+			},
+			Required: []string{"scope", "path"},
+		},
+		Execute: func(ctx context.Context, _ string, args map[string]any) (string, error) {
+			if r.memory == nil {
+				return "", fmt.Errorf("memory provider not configured")
+			}
+			scope, err := requireScope(asString(args["scope"]))
+			if err != nil {
+				return "", err
+			}
+			path := asString(args["path"])
+			base := path
+			if i := strings.LastIndex(path, "/"); i >= 0 {
+				base = path[i+1:]
+			}
+			if strings.EqualFold(base, ab.EntrypointName) {
+				return "", fmt.Errorf("%s cannot be deleted", ab.EntrypointName)
+			}
+			if err := r.memory.Delete(ctx, scope, path); err != nil {
+				return "", err
+			}
+			indexNote := removeMemoryIndexEntry(ctx, r.memory, scope, path)
+			return fmt.Sprintf(
+				"deleted %s%s\n<system-reminder>%s.</system-reminder>",
+				scope, path, indexNote,
+			), nil
+		},
+	}
+}
+
+func (r *agentRuntime) memoryListTool() *ab.Tool {
+	return &ab.Tool{
+		Name:        "memory_list",
+		Description: "List memory files in a scope. Useful before creating a new file to spot existing topics.",
+		Category:    ab.ToolCategoryMemory,
+		Parameters: ab.ToolFuncParams{
+			Type: "object",
+			Properties: map[string]ab.ToolParam{
+				"scope": memoryScopeParam(),
+				"path":  {Type: "string", Description: "Optional subdirectory; defaults to '/'."},
+			},
+			Required: []string{"scope"},
+		},
+		Execute: func(ctx context.Context, _ string, args map[string]any) (string, error) {
+			if r.memory == nil {
+				return "", fmt.Errorf("memory provider not configured")
+			}
+			scope, err := requireScope(asString(args["scope"]))
+			if err != nil {
+				return "", err
+			}
+			path := asString(args["path"])
+			if strings.TrimSpace(path) == "" {
+				path = "/"
+			}
+			items, err := r.memory.List(ctx, scope, path)
+			if err != nil {
+				return "", err
+			}
+			if len(items) == 0 {
+				return "(empty)", nil
+			}
+			return strings.Join(items, "\n"), nil
 		},
 	}
 }
@@ -488,22 +720,182 @@ func (r *agentRuntime) newDocumentTool() *ab.Tool {
 
 // ── helpers ──────────────────────────────────────────────────────────────────
 
-func parseMemoryScope(value string) ab.Scope {
-	switch strings.ToLower(strings.TrimSpace(value)) {
-	case "user":
-		return ab.ScopeUser
-	case "*", "all":
-		return ab.Scope("*")
-	default:
-		return ab.ScopeProject
+// extractMemoryFrontmatterFields pulls name/description/type from the YAML
+// frontmatter at the top of a memory file. Empty strings if absent.
+func extractMemoryFrontmatterFields(content string) (name, description, mtype string) {
+	trimmed := strings.TrimLeft(content, " \t\n\r")
+	if !strings.HasPrefix(trimmed, "---") {
+		return "", "", ""
 	}
+	lines := strings.Split(trimmed, "\n")
+	for i := 1; i < len(lines); i++ {
+		line := lines[i]
+		if strings.TrimSpace(line) == "---" {
+			break
+		}
+		colon := strings.Index(line, ":")
+		if colon < 0 {
+			continue
+		}
+		key := strings.TrimSpace(line[:colon])
+		val := strings.Trim(strings.TrimSpace(line[colon+1:]), "\"'")
+		switch strings.ToLower(key) {
+		case "name":
+			name = val
+		case "description":
+			description = val
+		case "type":
+			mtype = val
+		}
+	}
+	return name, description, mtype
 }
 
-func ensureWritableScope(scope ab.Scope) ab.Scope {
-	if scope == ab.Scope("*") {
-		return ab.ScopeProject
+func isValidMemoryType(t string) bool {
+	for _, m := range ab.AllMemoryTypes {
+		if string(m) == t {
+			return true
+		}
 	}
-	return scope
+	return false
+}
+
+// memoryDescriptionsCollide reports whether two memory descriptions cover
+// substantially the same topic. Uses a token-overlap (Jaccard) heuristic
+// — cheap, no embeddings required. Threshold 0.5 is intentionally lenient
+// because a false positive forces the model to update an existing file
+// (correct behavior) while a false negative lets a duplicate slip through.
+func memoryDescriptionsCollide(a, b string) bool {
+	if strings.TrimSpace(a) == "" || strings.TrimSpace(b) == "" {
+		return false
+	}
+	tokensA := memoryDescTokens(a)
+	tokensB := memoryDescTokens(b)
+	if len(tokensA) == 0 || len(tokensB) == 0 {
+		return false
+	}
+	var inter int
+	for tok := range tokensA {
+		if tokensB[tok] {
+			inter++
+		}
+	}
+	union := len(tokensA) + len(tokensB) - inter
+	if union == 0 {
+		return false
+	}
+	return float64(inter)/float64(union) >= 0.5
+}
+
+// memoryDescTokens lowercases, splits on non-letters, and drops short
+// stopwords so common words like "the" / "and" don't bloat the union.
+func memoryDescTokens(s string) map[string]bool {
+	out := make(map[string]bool)
+	var b strings.Builder
+	flush := func() {
+		w := b.String()
+		b.Reset()
+		if len(w) < 4 {
+			return
+		}
+		out[w] = true
+	}
+	for _, r := range strings.ToLower(s) {
+		if (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') {
+			b.WriteRune(r)
+		} else {
+			flush()
+		}
+	}
+	flush()
+	return out
+}
+
+// upsertMemoryIndex appends (or replaces) a one-line pointer in MEMORY.md
+// for the given memory file. Lines are uniquely keyed by the file path so
+// repeated creates/updates don't accumulate duplicates. Returns a short
+// human-readable note for the tool result.
+func upsertMemoryIndex(ctx context.Context, mem ab.MemoryProvider, scope ab.Scope, path, name, desc, mtype string) string {
+	indexPath := "/" + ab.EntrypointName
+	rel := strings.TrimPrefix(path, "/")
+	newLine := fmt.Sprintf("- [%s] [%s](%s) — %s", mtype, name, rel, desc)
+
+	current, err := mem.View(ctx, scope, indexPath)
+	if err != nil || strings.TrimSpace(current) == "" {
+		// Index doesn't exist yet — create a minimal one.
+		seed := fmt.Sprintf("# %s memory index\n\n%s\n", scope, newLine)
+		if cerr := mem.Create(ctx, scope, indexPath, seed); cerr == nil {
+			return "indexed in MEMORY.md"
+		}
+		return "created (could not seed MEMORY.md)"
+	}
+
+	// Look for an existing line that points to the same file (any line that
+	// contains the rel path inside () — robust to mtype/desc updates).
+	marker := "(" + rel + ")"
+	if idx := strings.Index(current, marker); idx >= 0 {
+		// Find the full line containing the marker.
+		lineStart := strings.LastIndex(current[:idx], "\n") + 1
+		lineEnd := idx + len(marker)
+		if nl := strings.Index(current[lineEnd:], "\n"); nl >= 0 {
+			lineEnd += nl
+		} else {
+			lineEnd = len(current)
+		}
+		oldLine := current[lineStart:lineEnd]
+		if oldLine == newLine {
+			return "already indexed in MEMORY.md"
+		}
+		if err := mem.StrReplace(ctx, scope, indexPath, oldLine, newLine); err == nil {
+			return "updated entry in MEMORY.md"
+		}
+		return "indexed (line update failed)"
+	}
+
+	// Append a new line. Find a unique anchor (the trailing newline of the
+	// current content) so StrReplace's "must appear once" rule is satisfied.
+	if strings.HasSuffix(current, "\n") {
+		anchor := current[len(current)-1:]
+		if err := mem.StrReplace(ctx, scope, indexPath, anchor, "\n"+newLine+"\n"); err == nil {
+			return "indexed in MEMORY.md"
+		}
+	}
+	// Fall back to a delete+create (preserves content + appends).
+	updated := strings.TrimRight(current, "\n") + "\n" + newLine + "\n"
+	if err := mem.Delete(ctx, scope, indexPath); err == nil {
+		if cerr := mem.Create(ctx, scope, indexPath, updated); cerr == nil {
+			return "indexed in MEMORY.md"
+		}
+	}
+	return "indexed (append failed)"
+}
+
+// removeMemoryIndexEntry deletes the line in MEMORY.md that points to the
+// given file path. No-op if MEMORY.md doesn't exist or has no such entry.
+func removeMemoryIndexEntry(ctx context.Context, mem ab.MemoryProvider, scope ab.Scope, path string) string {
+	indexPath := "/" + ab.EntrypointName
+	rel := strings.TrimPrefix(path, "/")
+	current, err := mem.View(ctx, scope, indexPath)
+	if err != nil || current == "" {
+		return "removed from index (no MEMORY.md)"
+	}
+	marker := "(" + rel + ")"
+	idx := strings.Index(current, marker)
+	if idx < 0 {
+		return "no MEMORY.md entry to remove"
+	}
+	lineStart := strings.LastIndex(current[:idx], "\n") + 1
+	lineEnd := idx + len(marker)
+	if nl := strings.Index(current[lineEnd:], "\n"); nl >= 0 {
+		lineEnd += nl + 1 // include the newline
+	} else {
+		lineEnd = len(current)
+	}
+	oldLine := current[lineStart:lineEnd]
+	if err := mem.StrReplace(ctx, scope, indexPath, oldLine, ""); err != nil {
+		return "removed file (could not update MEMORY.md)"
+	}
+	return "removed entry from MEMORY.md"
 }
 
 func asString(value any) string {
@@ -588,7 +980,9 @@ func (r *agentRuntime) newSubagentDispatchTool() *ab.Tool {
 			if isSandboxAvailable() && r.chatID > 0 {
 				subReg := ab.NewToolRegistry()
 				if r.memory != nil {
-					subReg.Register(r.newMemoryTool())
+					for _, t := range r.newMemoryTools() {
+						subReg.Register(t)
+					}
 				}
 				subReg.Register(r.newBashTool(r.chatID))
 				subReg.Register(r.newCodeInterpreterTool(r.chatID))

@@ -34,6 +34,9 @@ type Runtime struct {
 	compactor       Compactor
 	maxMemoryTokens int
 	memoryRootsV2   []MemoryRoot
+	entrypointName  string         // file name (e.g. MEMORY.md) prepended per scope; "" = disabled
+	recaller        MemoryRecaller // optional LLM filter over the header manifest
+	recallMax       int            // cap on number of files surfaced via recall (0 = no cap)
 	thinkingBudget  int
 	interruptGate   *InterruptGate
 }
@@ -87,12 +90,18 @@ func TruncateToTokens(text string, maxTokens int, tok Tokenizer) string {
 type MemoryTriggerDetector func(message string) (content string, detected bool)
 
 // NewRuntime creates a Runtime over an Engine with sensible defaults.
+//
+// Memory writes are tool-driven: the LLM calls memory_create / memory_str_replace
+// / memory_delete. There is no auto-write fallback — silent regex-based writers
+// fight the taxonomy + MEMORY.md index discipline (they bypass dedup, types,
+// and the read-before-write contract). Use WithMemoryTrigger to opt back in if
+// you really want regex-based intent detection.
 func NewRuntime(engine *Engine) *Runtime {
 	return &Runtime{
 		engine:         engine,
 		maxSkills:      3,
 		skillThreshold: 0.3,
-		memoryTrigger:  DefaultMemoryTriggerDetector,
+		memoryTrigger:  nil,
 		safety:         nil,
 		tokenizer:      HeuristicTokenizer{},
 	}
@@ -138,6 +147,33 @@ func (r *Runtime) WithMaxMemoryTokens(n int) *Runtime {
 // Default: DefaultMemoryRoots (user/profile, user/facts, project/).
 func (r *Runtime) WithMemoryRoots(roots ...MemoryRoot) *Runtime {
 	r.memoryRootsV2 = roots
+	return r
+}
+
+// WithMemoryEntrypoint enables loading a single index file (e.g. "MEMORY.md")
+// from the root of each scope before the scoped roots. The entrypoint is
+// truncated via TruncateEntrypoint (line + byte caps) and a freshness warning
+// is appended when caps fire. Default "" = disabled.
+//
+// Pass EntrypointName for the canonical "MEMORY.md" name.
+func (r *Runtime) WithMemoryEntrypoint(name string) *Runtime {
+	r.entrypointName = name
+	return r
+}
+
+// WithMemoryRecaller installs an LLM-side selector that filters the header
+// manifest down to the files that are clearly relevant to the user's query.
+// Without it the orientation surfaces the full manifest (descriptions only)
+// so the LLM sees the inventory and can open files via memory_view itself.
+func (r *Runtime) WithMemoryRecaller(rec MemoryRecaller) *Runtime {
+	r.recaller = rec
+	return r
+}
+
+// WithMaxRecalledMemories caps how many memory files the recall step
+// surfaces in LayerMemory. Default 5 when a recaller is configured.
+func (r *Runtime) WithMaxRecalledMemories(n int) *Runtime {
+	r.recallMax = n
 	return r
 }
 
@@ -268,18 +304,67 @@ func (r *Runtime) orientation(ctx context.Context, userMessage string, conv *Con
 			roots = DefaultMemoryRoots
 		}
 		var memContent strings.Builder
-		for _, root := range roots {
-			content, err := r.engine.Memory.View(ctx, root.Scope, root.Path)
-			if err != nil || strings.TrimSpace(content) == "" {
-				continue
-			}
-			if root.Label != "" {
+
+		// Entrypoint: load <scope>/<entrypointName> once per unique scope and
+		// prepend it. The entrypoint is the always-loaded INDEX of memory —
+		// pointers to topical files, not the topical files themselves.
+		if r.entrypointName != "" {
+			seenScopes := map[Scope]bool{}
+			for _, root := range roots {
+				if seenScopes[root.Scope] {
+					continue
+				}
+				seenScopes[root.Scope] = true
+				raw, err := r.engine.Memory.View(ctx, root.Scope, "/"+r.entrypointName)
+				if err != nil || strings.TrimSpace(raw) == "" {
+					continue
+				}
+				trunc := TruncateEntrypoint(raw)
 				memContent.WriteString("## ")
-				memContent.WriteString(root.Label)
+				memContent.WriteString(string(root.Scope))
+				memContent.WriteString(" memory index (`")
+				memContent.WriteString(r.entrypointName)
+				memContent.WriteString("`)\n\n")
+				memContent.WriteString(trunc.Content)
 				memContent.WriteString("\n\n")
 			}
-			memContent.WriteString(strings.TrimSpace(content))
-			memContent.WriteString("\n\n")
+		}
+
+		// Header manifest: per scope, scan all .md files (frontmatter only),
+		// optionally filter via the recaller, and surface as a compact list so
+		// the LLM knows what's available without loading bodies.
+		if scanner, ok := r.engine.Memory.(MemoryHeaderScanner); ok {
+			seen := map[Scope]bool{}
+			for _, root := range roots {
+				if seen[root.Scope] {
+					continue
+				}
+				seen[root.Scope] = true
+				headers, err := scanner.ScanHeaders(ctx, root.Scope, "/")
+				if err != nil || len(headers) == 0 {
+					continue
+				}
+				selected := headers
+				if r.recaller != nil {
+					maxN := r.recallMax
+					if maxN <= 0 {
+						maxN = 5
+					}
+					picked, err := r.recaller.Recall(ctx, RecallOptions{
+						Query:      userMessage,
+						Headers:    headers,
+						MaxResults: maxN,
+					})
+					if err == nil && len(picked) > 0 {
+						selected = picked
+					}
+				}
+				memContent.WriteString("## ")
+				memContent.WriteString(string(root.Scope))
+				memContent.WriteString(" memory inventory\n\n")
+				memContent.WriteString(FormatMemoryManifest(selected))
+				memContent.WriteString("\n")
+			}
 		}
 		if memContent.Len() > 0 {
 			memStr := memContent.String()
@@ -560,23 +645,10 @@ func (r *Runtime) handleMemoryTrigger(ctx context.Context, content string, rr *R
 		return
 	}
 
-	existing, _ := r.engine.Memory.Search(ctx, ScopeUser, content)
-	for _, entry := range existing {
-		if entry.Content == "" || entry.Path == "" {
-			continue
-		}
-		if stringSimilarity(entry.Content, content) >= 0.5 {
-			if err := r.engine.Memory.StrReplace(ctx, ScopeUser, entry.Path, entry.Content, content); err == nil {
-				rr.MemoryWritten = append(rr.MemoryWritten, entry.Path)
-				return
-			}
-		}
-	}
-
-	path := fmt.Sprintf("/facts/%d.md", time.Now().UnixNano())
-	if err := r.engine.Memory.Create(ctx, ScopeUser, path, content); err == nil {
-		rr.MemoryWritten = append(rr.MemoryWritten, path)
-	}
+	// No fallback create here. The new model relies on the LLM invoking
+	// memory_create / memory_str_replace as tool calls so type, frontmatter,
+	// MEMORY.md indexing, and dedup all happen. Regex-based silent writes to
+	// /facts/{nano}.md bypassed all of that and produced orphaned junk files.
 }
 
 // ── RuntimeResult ─────────────────────────────────────────────────────────────

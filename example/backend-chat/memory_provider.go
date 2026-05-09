@@ -11,29 +11,18 @@ import (
 	sdkmemory "github.com/everfaz/autobuild-sdk/providers/memory"
 )
 
-// loadBackendMemory initializes the FilesystemMemory provider from the SDK.
-// It creates the standard directory structure expected by DefaultMemoryRoots:
+// loadBackendMemory initializes the FilesystemMemory provider.
 //
-//	{root}/user/profile/    — user preferences, identity
-//	{root}/user/facts/      — inferred and explicit facts about the user
-//	{root}/project/         — project context, decisions, workflow state
-func loadBackendMemory() (ab.MemoryProvider, []ab.MemoryRoot, error) {
+// Memory follows the Claude Code model: each scope has a single MEMORY.md
+// index plus topical files written by the LLM via memory tools. No directory
+// scaffolding is created — NewFilesystem ensures user/ and project/ exist;
+// everything else is the LLM's responsibility.
+func loadBackendMemory() (ab.MemoryProvider, error) {
 	root := resolveMemoryRoot()
-
-	dirs := []string{
-		filepath.Join(root, "user", "profile"),
-		filepath.Join(root, "user", "facts"),
-		filepath.Join(root, "project"),
-	}
-	for _, dir := range dirs {
-		if err := os.MkdirAll(dir, 0o755); err != nil {
-			return nil, nil, fmt.Errorf("create memory dir %s: %w", dir, err)
-		}
-	}
 
 	provider, err := sdkmemory.NewFilesystem(root)
 	if err != nil {
-		return nil, nil, fmt.Errorf("filesystem memory: %w", err)
+		return nil, fmt.Errorf("filesystem memory: %w", err)
 	}
 
 	var mem ab.MemoryProvider = provider
@@ -45,7 +34,7 @@ func loadBackendMemory() (ab.MemoryProvider, []ab.MemoryRoot, error) {
 		log.Printf("backend memory: root=%s (BM25 search)", root)
 	}
 
-	return mem, ab.DefaultMemoryRoots, nil
+	return mem, nil
 }
 
 // resolveMemoryRoot finds or creates the memory directory.

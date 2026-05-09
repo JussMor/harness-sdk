@@ -46,6 +46,16 @@ type MemoryProvider interface {
 	Search(ctx context.Context, scope Scope, query string) ([]MemoryEntry, error)
 }
 
+// MemoryHeaderScanner is an optional capability some MemoryProviders expose
+// to enable cheap recall: read only the frontmatter (name, description, type)
+// plus mtime of every memory file under a path, without loading bodies.
+//
+// The runtime probes for this via type assertion. Providers that do not
+// implement it fall back to entrypoint-only memory (no manifest).
+type MemoryHeaderScanner interface {
+	ScanHeaders(ctx context.Context, scope Scope, path string) ([]MemoryHeader, error)
+}
+
 // MemoryRoot is one directory read during orientation.
 // Having multiple labeled roots mirrors how Claude separates
 // user preferences, facts, and project context.

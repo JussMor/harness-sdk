@@ -180,6 +180,110 @@ func (m *FilesystemMemory) List(_ context.Context, scope autobuild.Scope, path s
 	return paths, nil
 }
 
+// ScanHeaders implements autobuild.MemoryHeaderScanner.
+//
+// For each .md file under path it reads only the head of the file (enough
+// for the YAML frontmatter), parses name/description/type, and pairs it
+// with the file's mtime. Bodies are not loaded — this is the cheap step
+// that feeds memory recall (manifest the LLM scans before opening files).
+//
+// Files without frontmatter still appear, with Description="" so the model
+// can still see the file exists. The MEMORY.md entrypoint and the
+// preferences pin (if any) are excluded from the manifest to avoid
+// duplicating things already in the prompt.
+func (m *FilesystemMemory) ScanHeaders(_ context.Context, scope autobuild.Scope, path string) ([]autobuild.MemoryHeader, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	scopeRoot := filepath.Join(m.Root, string(scope))
+	dir := m.scopePath(scope, path)
+	out := make([]autobuild.MemoryHeader, 0, 16)
+
+	err := filepath.Walk(dir, func(p string, info os.FileInfo, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		if info.IsDir() {
+			return nil
+		}
+		if !strings.HasSuffix(strings.ToLower(p), ".md") {
+			return nil
+		}
+		rel, _ := filepath.Rel(scopeRoot, p)
+		relSlash := "/" + filepath.ToSlash(rel)
+
+		// Skip the entrypoint itself — already injected separately.
+		if strings.EqualFold(filepath.Base(p), autobuild.EntrypointName) {
+			return nil
+		}
+
+		head, err := readFileHead(p, 4096)
+		if err != nil {
+			return nil // best-effort; skip unreadable files
+		}
+		desc, mtype := extractHeaderFrontmatter(head)
+
+		out = append(out, autobuild.MemoryHeader{
+			Path:        relSlash,
+			Scope:       scope,
+			Type:        autobuild.MemoryType(mtype),
+			Description: desc,
+			UpdatedAt:   info.ModTime(),
+		})
+		return nil
+	})
+	if err != nil && !os.IsNotExist(err) {
+		return nil, err
+	}
+	// Newest first.
+	sort.Slice(out, func(i, j int) bool {
+		return out[i].UpdatedAt.After(out[j].UpdatedAt)
+	})
+	return out, nil
+}
+
+// readFileHead reads at most maxBytes from a file — enough to capture the
+// YAML frontmatter without loading the whole body.
+func readFileHead(path string, maxBytes int) (string, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return "", err
+	}
+	defer f.Close()
+	buf := make([]byte, maxBytes)
+	n, _ := f.Read(buf)
+	return string(buf[:n]), nil
+}
+
+// extractHeaderFrontmatter pulls just the description and type fields out
+// of a markdown head — keeps this provider zero-dependency and avoids
+// importing the SDK's loader. Returns ("", "") when no frontmatter found.
+func extractHeaderFrontmatter(head string) (description, mtype string) {
+	lines := strings.Split(head, "\n")
+	if len(lines) < 3 || strings.TrimSpace(lines[0]) != "---" {
+		return "", ""
+	}
+	for i := 1; i < len(lines); i++ {
+		line := lines[i]
+		if strings.TrimSpace(line) == "---" {
+			break
+		}
+		colon := strings.Index(line, ":")
+		if colon < 0 {
+			continue
+		}
+		key := strings.TrimSpace(line[:colon])
+		val := strings.TrimSpace(line[colon+1:])
+		switch strings.ToLower(key) {
+		case "description":
+			description = strings.Trim(val, "\"'")
+		case "type":
+			mtype = strings.Trim(val, "\"'")
+		}
+	}
+	return description, mtype
+}
+
 // Search finds entries containing query terms, ranked by BM25 score.
 // Falls back to substring match for single-word queries.
 func (m *FilesystemMemory) Search(ctx context.Context, scope autobuild.Scope, query string) ([]autobuild.MemoryEntry, error) {

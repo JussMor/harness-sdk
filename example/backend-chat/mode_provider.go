@@ -28,10 +28,9 @@ func newModeEngineWithDB(provider ab.LLMProvider, model string, logContext Runti
 		backendSkillsProvider, backendSkillsErr = loadBackendSkills()
 	})
 	skills := backendSkillsProvider
-	memory, memRoots, err := loadBackendMemory()
+	memory, err := loadBackendMemory()
 	if err != nil {
 		memory = nil
-		memRoots = ab.DefaultMemoryRoots
 	}
 
 	// Strip routing prefix from model for providers that need a bare model name.
@@ -77,6 +76,9 @@ func newModeEngineWithDB(provider ab.LLMProvider, model string, logContext Runti
 
 	// ── System prompt builder ──
 	engine.Prompt.Set(ab.LayerCore, buildCorePrompt(rt))
+	engine.Prompt.Set(ab.LayerBehavior, ab.BuildMemoryGuidance(ab.MemoryGuidanceOptions{
+		MemoryDir: "memory/",
+	}))
 	// LayerMemory, LayerSkills, LayerSession → filled by Runtime at orientation
 
 	// ── Conversation store ──
@@ -92,7 +94,16 @@ func newModeEngineWithDB(provider ab.LLMProvider, model string, logContext Runti
 	runtime := ab.NewRuntime(engine).
 		WithMode(logContext.Mode).
 		WithModel(bareModel).
-		WithMemoryRoots(memRoots...).
+		WithMemoryRoots(
+			ab.MemoryRoot{Scope: ab.ScopeUser, Path: "/"},
+			ab.MemoryRoot{Scope: ab.ScopeProject, Path: "/"},
+		).
+		WithMemoryEntrypoint(ab.EntrypointName).
+		WithMemoryRecaller(&ab.LLMMemoryRecaller{
+			Provider: provider,
+			Model:    bareModel,
+		}).
+		WithMaxRecalledMemories(5).
 		WithMaxMemoryTokens(8_000).
 		WithSafety(ab.NewSafetyChain(
 			ab.DefaultDangerousCommandFilter(),
@@ -104,13 +115,6 @@ func newModeEngineWithDB(provider ab.LLMProvider, model string, logContext Runti
 			MaxWords: 200,
 		}).
 		WithMaxSkillTokens(6_000).
-		WithMemoryWriter(&ab.InferredMemoryWriter{
-			Provider:        provider,
-			Model:           bareModel,
-			MaxFacts:        3,
-			MinConfidence:   0.75,
-			DedupeThreshold: 0.6,
-		}).
 		WithThinkingBudget(resolveThinkingBudget(logContext.Mode)).
 		WithSessionContext(ab.LocalTimeSessionContext()).
 		WithTokenizer(sdktokenizers.NewAutoForModel(bareModel)).
