@@ -131,6 +131,7 @@ type MessageMetadata struct {
 }
 
 type MetadataToolCall struct {
+	ID     string `json:"id,omitempty"`
 	Name   string `json:"name"`
 	Args   any    `json:"args,omitempty"`
 	Result string `json:"result,omitempty"`
@@ -579,7 +580,8 @@ func (a *BackendChatApp) handleStream(w http.ResponseWriter, r *http.Request, ch
 
 	var fullResponse strings.Builder
 	var streamMeta MessageMetadata
-	var lastToolCall string // track last tool_call name for pairing with result
+	// callIndex maps ToolCallEntry.ID → index in streamMeta.ToolCalls for O(1) pairing.
+	callIndex := make(map[string]int)
 	// Pending file_write artifacts queued at tool_call time. Only committed to
 	// streamMeta.Artifacts when the matching tool_result reports success — this
 	// prevents rejected/blocked file writes from leaking into the canvas.
@@ -632,12 +634,11 @@ func (a *BackendChatApp) handleStream(w http.ResponseWriter, r *http.Request, ch
 					parsedArgs = ev.ToolCall.Arguments // fallback to raw string
 				}
 				d, _ := json.Marshal(map[string]any{
+					"id":   ev.ToolCall.ID,
 					"name": ev.ToolCall.Name,
 					"args": parsedArgs,
 				})
 				sseWrite("tool_call", string(d))
-
-				lastToolCall = ev.ToolCall.Name
 
 				// Queue file_write as a pending artifact. We only commit it to
 				// streamMeta.Artifacts (which is what gets persisted + emitted as
@@ -657,8 +658,10 @@ func (a *BackendChatApp) handleStream(w http.ResponseWriter, r *http.Request, ch
 					}
 				}
 
-				// Track tool call in metadata
+				// Track tool call — record index for ID-based result pairing.
+				callIndex[ev.ToolCall.ID] = len(streamMeta.ToolCalls)
 				streamMeta.ToolCalls = append(streamMeta.ToolCalls, MetadataToolCall{
+					ID:   ev.ToolCall.ID,
 					Name: ev.ToolCall.Name,
 					Args: parsedArgs,
 				})
@@ -685,15 +688,11 @@ func (a *BackendChatApp) handleStream(w http.ResponseWriter, r *http.Request, ch
 					}
 				}
 
-				// Pair result with last matching tool call in metadata
-				for i := len(streamMeta.ToolCalls) - 1; i >= 0; i-- {
-					if streamMeta.ToolCalls[i].Name == ev.ToolResult.Name && streamMeta.ToolCalls[i].Result == "" {
-						streamMeta.ToolCalls[i].Result = ev.ToolResult.Content
-						streamMeta.ToolCalls[i].Error = ev.ToolResult.Error != nil
-						break
-					}
+				// Pair result with its originating tool call by ID (O(1), handles duplicates).
+				if i, ok := callIndex[ev.ToolResult.ToolCallID]; ok {
+					streamMeta.ToolCalls[i].Result = ev.ToolResult.Content
+					streamMeta.ToolCalls[i].Error = ev.ToolResult.Error != nil
 				}
-				_ = lastToolCall // used above
 
 				// For sandbox tools, emit structured sandbox_output event
 				if isSandboxOutput(ev.ToolResult.Name, agentRT.tools) {
