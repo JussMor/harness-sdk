@@ -170,4 +170,4 @@ func (p *fileSkillProvider) Remove(skillID string) {
 	}
 }
 
-var _ ab.ReloadableSkillProvider = (*fileSkillProvider)(nil)
+var _ ab.SkillProvider = (*fileSkillProvider)(nil)

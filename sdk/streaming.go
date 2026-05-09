@@ -2,7 +2,6 @@ package autobuild
 
 import (
 	"context"
-	"fmt"
 	"strings"
 	"sync"
 )
@@ -25,16 +24,8 @@ type StreamEvent struct {
 	// ToolResult is set when Type=StreamEventToolResult.
 	ToolResult *ToolResult `json:"tool_result,omitempty"`
 
-	// Plan is set when Type=StreamEventPlanProposed.
-	Plan *Plan `json:"plan,omitempty"`
-
 	// SubagentResult is set when Type=StreamEventSubagentResult.
 	SubagentResult *SubagentResult `json:"subagent_result,omitempty"`
-
-	// ConfirmationRequest is set when Type=StreamEventConfirmationRequired.
-	// LEGACY: prefer Interrupt for new clients. Populated only when the
-	// underlying interrupt is InterruptKindApproval.
-	ConfirmationRequest *ApprovalRequest `json:"confirmation_request,omitempty"`
 
 	// Interrupt is set when Type=StreamEventInterruptRequired or
 	// Type=StreamEventInterruptResolved. Discriminate sub-variants on Kind.
@@ -61,18 +52,7 @@ const (
 
 	// StreamEventThinking is an incremental chunk of extended thinking content.
 	// Only emitted when ThinkingBudget > 0 and the provider supports it.
-	// Thinking content is the model's internal reasoning — not shown to users
-	// by default. Use for debugging, tracing, or advanced UX.
 	StreamEventThinking StreamEventType = "thinking"
-
-	// StreamEventConfirmationRequired is emitted when a tool call needs human
-	// approval. LEGACY alias for backward compatibility — emitted alongside
-	// StreamEventInterruptRequired whenever the interrupt is an Approval.
-	StreamEventConfirmationRequired StreamEventType = "confirmation_required"
-
-	// StreamEventConfirmationResolved is emitted after a confirmation_required
-	// is resolved. LEGACY alias of StreamEventInterruptResolved (Approval kind).
-	StreamEventConfirmationResolved StreamEventType = "confirmation_resolved"
 
 	// StreamEventInterruptRequired is emitted when the agent pauses awaiting
 	// human input. StreamEvent.Interrupt carries the full request — discriminate
@@ -101,14 +81,8 @@ const (
 	// (one request/response cycle within the agent loop).
 	StreamEventTurnComplete StreamEventType = "turn_complete"
 
-	// StreamEventPlanProposed fires when the alignment phase proposes an
-	// execution plan. Consumers can display plan status or trigger custom
-	// subagent orchestration at the application layer.
-	StreamEventPlanProposed StreamEventType = "plan_proposed"
-
-	// StreamEventSubagentResult fires once per subagent as they complete
-	// during plan fan-out execution. Consumers can stream partial results
-	// to the user as each parallel task finishes.
+	// StreamEventSubagentResult fires once per subagent as they complete.
+	// Consumers can stream partial results to the user as each parallel task finishes.
 	StreamEventSubagentResult StreamEventType = "subagent_result"
 
 	// StreamEventDone fires once when the entire agent loop has finished.
@@ -139,28 +113,21 @@ type StreamingLLMProvider interface {
 // RunStream is the streaming counterpart of Runtime.Run. It returns a
 // channel of StreamEvents that emit as the agent works.
 //
-// Phases run identically to Run (orientation → alignment → preparation →
-// execution → verification → closure). Streaming only affects the LLM
-// generation inside Execution — text deltas flow token by token as the
-// model produces them.
-//
 // If the wired LLMProvider implements StreamingLLMProvider, real token-level
 // streaming occurs. Otherwise, falls back to sentence-chunked emission of the
 // full response — same API contract, degraded UX.
 //
 // Tool calls still execute synchronously during streaming:
-//   StreamEventToolCall  → tool dispatch begins
-//   StreamEventToolResult → tool returned, next LLM turn starts streaming
-//   StreamEventDelta     → model generating response to tool result
-//   StreamEventDone      → all turns complete
+//
+//	StreamEventToolCall  → tool dispatch begins
+//	StreamEventToolResult → tool returned, next LLM turn starts streaming
+//	StreamEventDelta     → model generating response to tool result
+//	StreamEventDone      → all turns complete
 func (r *Runtime) RunStream(ctx context.Context, conv *Conversation, userMessage string) (<-chan StreamEvent, error) {
 	out := make(chan StreamEvent, 64)
 
 	streamProv, hasRealStream := r.engine.LLM.(StreamingLLMProvider)
 
-	// Install an artifact emitter on ctx so tools/skills running during this
-	// stream can call EmitArtifact(ctx, ...) and have their artifacts surface
-	// as StreamEventArtifactCreated events.
 	ctx = WithArtifactEmitter(ctx, func(a Artifact) {
 		select {
 		case <-ctx.Done():
@@ -168,10 +135,6 @@ func (r *Runtime) RunStream(ctx context.Context, conv *Conversation, userMessage
 		}
 	})
 
-	// Install an interrupt requester on ctx so tools can call
-	// RequestInterrupt(ctx, req) to pause the loop and wait for human input.
-	// Only wired when the runtime has an interrupt gate (typically installed
-	// via WithHumanApproval).
 	if r.interruptGate != nil {
 		gate := r.interruptGate
 		ctx = WithInterruptRequester(ctx, func(c context.Context, req InterruptRequest) (InterruptResponse, error) {
@@ -183,7 +146,6 @@ func (r *Runtime) RunStream(ctx context.Context, conv *Conversation, userMessage
 		defer close(out)
 
 		if !hasRealStream {
-			// Fallback: run normally, emit sentence chunks
 			result, err := r.Run(ctx, conv, userMessage)
 			if err != nil {
 				out <- StreamEvent{Type: StreamEventError, Error: err}
@@ -201,43 +163,15 @@ func (r *Runtime) RunStream(ctx context.Context, conv *Conversation, userMessage
 			return
 		}
 
-		// Real streaming path:
-		// 1. Run all phases except Execution normally
-		// 2. In Execution, intercept the LLM call to use ChatStream
-		// 3. Handle tool calls (dispatch → next streaming turn) in a loop
 		if err := r.runStreamInternal(ctx, conv, userMessage, streamProv, out); err != nil {
 			out <- StreamEvent{Type: StreamEventError, Error: err}
 		}
 	}()
 
-	// Fan-out tee: when outbound webhooks are configured, every emitted event
-	// is also published to subscribers. Tee runs in its own goroutine so a
-	// slow webhook subscriber does not stall the consumer SSE stream.
-	if r.webhooks == nil {
-		return out, nil
-	}
-	teed := make(chan StreamEvent, 64)
-	go func() {
-		defer close(teed)
-		for ev := range out {
-			_, _ = r.webhooks.PublishStreamEvent(ctx, ev)
-			select {
-			case <-ctx.Done():
-				// Drain remaining events without forwarding to avoid leaking
-				// the producer goroutine, but stop emitting downstream.
-				for range out {
-				}
-				return
-			case teed <- ev:
-			}
-		}
-	}()
-	return teed, nil
+	return out, nil
 }
 
-// runStreamInternal executes the full 6-phase lifecycle with real streaming
-// in the Execution phase. Tool calls are dispatched synchronously between
-// streaming turns.
+// runStreamInternal executes orientation, streaming execution, and closure.
 func (r *Runtime) runStreamInternal(
 	ctx context.Context,
 	conv *Conversation,
@@ -245,64 +179,23 @@ func (r *Runtime) runStreamInternal(
 	streamProv StreamingLLMProvider,
 	out chan<- StreamEvent,
 ) error {
-	// ── Phases 0-2: identical to Run ──
 	conv.AppendUser(userMessage)
 
-	if r.wellbeing != nil {
-		signal := r.wellbeing.Detect(userMessage)
-		if signal.Detected && signal.Severity >= WellbeingSeverityHigh {
-			resp := wellbeingResponse(signal)
-			out <- StreamEvent{Type: StreamEventDelta, Delta: resp}
-			out <- StreamEvent{Type: StreamEventDone}
-			conv.AppendAssistant(resp)
-			conv.IncrementTurn()
-			if r.store != nil {
-				_ = r.store.Save(ctx, conv)
-			}
-			return nil
-		}
-	}
-
-	if r.engine.HasExecution() {
-		_ = r.engine.Execution.SetPhase(ctx, PhaseOrientation)
-	}
 	if conv.IsCold() {
 		rr := &RuntimeResult{}
 		if err := r.orientation(ctx, userMessage, conv, rr); err != nil {
-			return fmt.Errorf("orientation: %w", err)
+			return err
 		}
 	} else {
 		if err := r.warmRefresh(ctx, userMessage, conv); err != nil {
-			return fmt.Errorf("warm refresh: %w", err)
+			return err
 		}
 	}
 
-	_ = r.advancePhase(ctx, PhaseAlignment)
-	// Alignment: planner (non-streaming, cheap)
-	if r.planner != nil && r.engine.HasExecution() && r.planner.ShouldPlan(ctx, userMessage, conv) {
-		plan, _ := r.planner.Propose(ctx, userMessage, conv)
-		if plan != nil {
-			if _, err := r.engine.Execution.Propose(ctx, *plan); err == nil && r.autoApprovePlan {
-				_ = r.engine.Execution.Approve(ctx, true)
-			}
-			out <- StreamEvent{Type: StreamEventPlanProposed, Plan: plan}
-		}
-	}
-
-	_ = r.advancePhase(ctx, PhasePreparation)
 	prepRR := &RuntimeResult{}
 	if err := r.preparation(ctx, conv, prepRR); err != nil {
-		return fmt.Errorf("preparation: %w", err)
+		return err
 	}
-
-	_ = r.advancePhase(ctx, PhaseExecution)
-
-	// ── Streaming Execution loop ──
-	// Mirrors agent_loop.go but uses ChatStream instead of Chat.
-	var finalResponse string
-	var totalUsage TokenUsage
-	var dispatchedSubagents bool // tracks if dispatch-subagents tool was called
-	messages := conv.Messages
 
 	// Build system prompt once
 	systemPrompt := ""
@@ -317,38 +210,23 @@ func (r *Runtime) runStreamInternal(
 
 	dispatcher := NewToolDispatcher(r.engine.Tools, r.engine.Sandbox)
 
-	// If interrupts are active, forward InterruptRequests to the stream as
-	// StreamEventInterruptRequired. For backward compatibility, Approval-kind
-	// interrupts are ALSO emitted as StreamEventConfirmationRequired so legacy
-	// frontends keep working unchanged. Runs in a separate goroutine because
-	// the gate's Wait() blocks the main loop until the human responds.
+	// Forward interrupt requests to the stream
 	if r.interruptGate != nil {
 		go func() {
 			for req := range r.interruptGate.Requests() {
 				req := req
-				// New unified event — always emitted.
 				select {
 				case <-ctx.Done():
 					return
 				case out <- StreamEvent{Type: StreamEventInterruptRequired, Interrupt: &req}:
 				}
-				// Legacy event — only for Approval kind.
-				if req.Kind == InterruptKindApproval && req.Approval != nil {
-					legacy := ApprovalRequest{
-						ID:        req.ID,
-						ToolCall:  req.Approval.ToolCall,
-						Reason:    req.Reason,
-						CreatedAt: req.CreatedAt,
-					}
-					select {
-					case <-ctx.Done():
-						return
-					case out <- StreamEvent{Type: StreamEventConfirmationRequired, ConfirmationRequest: &legacy}:
-					}
-				}
 			}
 		}()
 	}
+
+	var finalResponse string
+	var totalUsage TokenUsage
+	messages := conv.Messages
 
 	for turn := 0; turn < 50; turn++ {
 		if ctx.Err() != nil {
@@ -365,10 +243,9 @@ func (r *Runtime) runStreamInternal(
 
 		events, err := streamProv.ChatStream(ctx, req)
 		if err != nil {
-			return fmt.Errorf("stream turn %d: %w", turn, err)
+			return err
 		}
 
-		// Collect this turn's output
 		var turnText strings.Builder
 		var turnToolCalls []ToolCallEntry
 		var turnDone bool
@@ -377,7 +254,6 @@ func (r *Runtime) runStreamInternal(
 			switch ev.Type {
 			case StreamEventDelta:
 				turnText.WriteString(ev.Delta)
-				// Forward to consumer
 				select {
 				case <-ctx.Done():
 					return ctx.Err()
@@ -397,50 +273,28 @@ func (r *Runtime) runStreamInternal(
 				turnDone = true
 
 			case StreamEventError:
-				return fmt.Errorf("stream event error: %w", ev.Error)
+				return ev.Error
 			}
 		}
 
-		// Append assistant turn to message history
-		assistantMsg := ChatMessage{
+		messages = append(messages, ChatMessage{
 			Role:      RoleAssistant,
 			Content:   turnText.String(),
 			ToolCalls: turnToolCalls,
-		}
-		messages = append(messages, assistantMsg)
+		})
 		if turnText.Len() > 0 {
 			finalResponse = turnText.String()
 		}
 
-		// If no tool calls, we're done
 		if len(turnToolCalls) == 0 || !turnDone {
 			break
 		}
 
-		// Track if the LLM already dispatched subagents via tool call
-		for _, tc := range turnToolCalls {
-			if tc.Name == "dispatch-subagents" {
-				dispatchedSubagents = true
-				break
-			}
-		}
-
-		// Dispatch tool calls — apply safety filter before each call
-		var sandboxID string
-		// Filter tool calls through safety
 		var allowedCalls []ToolCallEntry
 		for _, call := range turnToolCalls {
 			if r.safety != nil {
 				verdict := r.safety.Inspect(ctx, call)
-				// If HIL was involved, emit resolved event
-				if r.interruptGate != nil && (verdict.Decision == SafetyAllow || verdict.Decision == SafetyTransform) {
-					out <- StreamEvent{
-						Type:                StreamEventConfirmationResolved,
-						ConfirmationRequest: &ApprovalRequest{ToolCall: call},
-					}
-				}
 				if verdict.Decision == SafetyBlock {
-					// Emit blocked result as tool_result to the consumer
 					blocked := ToolResult{
 						Name:       call.Name,
 						ToolCallID: call.ID,
@@ -461,18 +315,9 @@ func (r *Runtime) runStreamInternal(
 			allowedCalls = append(allowedCalls, call)
 		}
 
-		results := dispatcher.DispatchParallel(ctx, allowedCalls, sandboxID)
-		for i, result := range results {
-			// Apply observation recording
-			if r.engine.HasObservations() && r.observationFilt != nil && i < len(allowedCalls) {
-				obs := r.observationFilt(allowedCalls[i], result)
-				if obs.Content != "" {
-					_ = r.engine.Observations.Record(ctx, obs)
-				}
-			}
-			// Emit tool result event
+		results := dispatcher.DispatchParallel(ctx, allowedCalls, "")
+		for _, result := range results {
 			out <- StreamEvent{Type: StreamEventToolResult, ToolResult: &result}
-			// Append to messages for next turn
 			messages = append(messages, ChatMessage{
 				Role:       RoleTool,
 				Content:    result.Content,
@@ -481,37 +326,8 @@ func (r *Runtime) runStreamInternal(
 		}
 	}
 
-	// Apply output filter to final response
-	if r.outputFilter != nil && finalResponse != "" {
-		verdict := r.outputFilter.Inspect(ctx, finalResponse)
-		switch verdict.Decision {
-		case OutputBlock:
-			finalResponse = "[output blocked: " + verdict.Reason + "]"
-		case OutputTransform:
-			finalResponse = verdict.NewOutput
-		}
-	}
-
-	// ── Subagent fan-out from proposed plan ──
-	// Only fan out if: (a) the plan exists in ExecutionContext, (b) it has been
-	// approved, (c) the LLM didn't already handle subagents via dispatch-subagents
-	// tool, and (d) there are still ≥2 executables that haven't been dispatched.
-	if !dispatchedSubagents && r.engine.HasExecution() {
-		if activePlan := r.engine.Execution.ActivePlan(); activePlan != nil && activePlan.Approved {
-			ready := activePlan.NextReady()
-			if len(ready) >= 2 {
-				r.runStreamSubagents(ctx, ready, out)
-			}
-		}
-	}
-
-	// ── Phases 4-5: Verification + Closure ──
-	_ = r.advancePhase(ctx, PhaseVerification)
-	_ = r.advancePhase(ctx, PhaseClosure)
-
 	conv.AppendAssistant(finalResponse)
 
-	// Closure: memory writes
 	closureRR := &RuntimeResult{}
 	_ = r.closure(ctx, userMessage, &AgentLoopResult{
 		FinalContent: finalResponse,
@@ -525,52 +341,6 @@ func (r *Runtime) runStreamInternal(
 
 	out <- StreamEvent{Type: StreamEventDone}
 	return nil
-}
-
-// runStreamSubagents executes plan executables as parallel subagents, emitting
-// a StreamEventSubagentResult as each one completes.
-func (r *Runtime) runStreamSubagents(ctx context.Context, executables []Executable, out chan<- StreamEvent) {
-	// Build subagents from ready executables
-	agents := make([]Subagent, 0, len(executables))
-	for _, exec := range executables {
-		task := strings.TrimSpace(exec.Description)
-		if task == "" {
-			task = strings.TrimSpace(exec.Name)
-		}
-		if task == "" {
-			continue
-		}
-		agents = append(agents, Subagent{
-			ID:       exec.ID,
-			Task:     task,
-			Engine:   r.engine,
-			Model:    r.model,
-			MaxTurns: 4,
-			Timeout:  30 * 1000000000, // 30s
-		})
-	}
-	if len(agents) < 2 {
-		return
-	}
-
-	// Run in parallel, emit results as they arrive via a channel
-	results := make(chan *SubagentResult, len(agents))
-	var wg sync.WaitGroup
-	wg.Add(len(agents))
-	for i := range agents {
-		go func(agent Subagent) {
-			defer wg.Done()
-			results <- agent.Run(ctx)
-		}(agents[i])
-	}
-	go func() {
-		wg.Wait()
-		close(results)
-	}()
-
-	for res := range results {
-		out <- StreamEvent{Type: StreamEventSubagentResult, SubagentResult: res}
-	}
 }
 
 // buildRequestMessages prepends a system message to the conversation history.
@@ -595,7 +365,6 @@ func chunkBySentence(text string) []string {
 	for i, r := range text {
 		current.WriteRune(r)
 		if r == '.' || r == '!' || r == '?' || r == '\n' {
-			// Look ahead for whitespace or end
 			next := i + 1
 			if next >= len(text) || text[next] == ' ' || text[next] == '\n' || text[next] == '\t' {
 				chunk := strings.TrimSpace(current.String())

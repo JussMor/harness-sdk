@@ -11,21 +11,15 @@ import (
 	sdkmemory "github.com/everfaz/autobuild-sdk/providers/memory"
 )
 
-// loadBackendMemory initializes the LayeredFilesystemMemory provider from
-// the SDK. It creates the standard directory structure expected by
-// DefaultMemoryRoots:
+// loadBackendMemory initializes the FilesystemMemory provider from the SDK.
+// It creates the standard directory structure expected by DefaultMemoryRoots:
 //
 //	{root}/user/profile/    — user preferences, identity
 //	{root}/user/facts/      — inferred and explicit facts about the user
 //	{root}/project/         — project context, decisions, workflow state
-//
-// Returns a LayeredMemoryProvider (superset of MemoryProvider), and separately
-// returns the MemoryRoot configuration so the Runtime can inject labeled
-// sections into LayerMemory during orientation.
 func loadBackendMemory() (ab.MemoryProvider, []ab.MemoryRoot, error) {
 	root := resolveMemoryRoot()
 
-	// Create all subdirs that DefaultMemoryRoots will read
 	dirs := []string{
 		filepath.Join(root, "user", "profile"),
 		filepath.Join(root, "user", "facts"),
@@ -37,21 +31,18 @@ func loadBackendMemory() (ab.MemoryProvider, []ab.MemoryRoot, error) {
 		}
 	}
 
-	provider, err := sdkmemory.NewLayeredFilesystem(root)
+	provider, err := sdkmemory.NewFilesystem(root)
 	if err != nil {
-		return nil, nil, fmt.Errorf("layered filesystem memory: %w", err)
+		return nil, nil, fmt.Errorf("filesystem memory: %w", err)
 	}
 
-	// Wrap with Hybrid search (BM25 + vector via RRF)
 	var mem ab.MemoryProvider = provider
 	if apiKey := os.Getenv("VOYAGE_API_KEY"); apiKey != "" {
 		embedder := sdkembedders.NewVoyage(apiKey, "voyage-3")
 		mem = ab.NewHybridMemorySearch(provider, embedder)
 		log.Printf("backend memory: root=%s (hybrid BM25+Voyage search)", root)
 	} else {
-		embedder := sdkembedders.NewLocal(384)
-		mem = ab.NewHybridMemorySearch(provider, embedder)
-		log.Printf("backend memory: root=%s (hybrid BM25+local-embedder search)", root)
+		log.Printf("backend memory: root=%s (BM25 search)", root)
 	}
 
 	return mem, ab.DefaultMemoryRoots, nil

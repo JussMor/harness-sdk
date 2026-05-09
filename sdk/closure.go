@@ -20,13 +20,12 @@ type InferredMemoryWriter struct {
 
 // InferredFact is one memorable fact extracted from a turn.
 type InferredFact struct {
-	Content    string      `json:"content"`
-	Layer      MemoryLayer `json:"layer"`
-	Scope      Scope       `json:"scope"`
-	Confidence float64     `json:"confidence"`
-	Reason     string      `json:"reason"`
-	Path       string      `json:"path,omitempty"`
-	Merged     bool        `json:"merged,omitempty"`
+	Content    string  `json:"content"`
+	Scope      Scope   `json:"scope"`
+	Confidence float64 `json:"confidence"`
+	Reason     string  `json:"reason"`
+	Path       string  `json:"path,omitempty"`
+	Merged     bool    `json:"merged,omitempty"`
 }
 
 // Extract runs inference and returns facts above MinConfidence.
@@ -102,7 +101,6 @@ User: ` + userSnip + "\nAssistant: " + respSnip
 		}
 		facts = append(facts, InferredFact{
 			Content:    raw.Content,
-			Layer:      MemoryLayerInferred,
 			Scope:      scope,
 			Confidence: raw.Confidence,
 			Reason:     raw.Reason,

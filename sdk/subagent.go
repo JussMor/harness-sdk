@@ -11,9 +11,6 @@ import (
 // sharing state with the parent through a persistent Conversation.
 //
 // Key properties:
-//   - Own observation store (not shared with parent)
-//   - Memory is read-only by default — subagents enrich observations but
-//     don't write to parent memory without explicit opt-in
 //   - Configurable system prompt, mode, model, and tool set
 //   - Persistent conversation — the coordinator can send follow-up messages
 //     to the same subagent and it retains context from previous turns
@@ -35,7 +32,6 @@ type Subagent struct {
 
 	// Engine is a (possibly stripped-down) Engine for this subagent.
 	// Typically shares LLM and Memory with parent but has restricted Tools.
-	// Memory reads are always allowed; writes only happen if AllowMemoryWrites=true.
 	Engine *Engine
 
 	// Mode is the active mode for the subagent (e.g. "research", "validator").
@@ -50,10 +46,6 @@ type Subagent struct {
 
 	// Timeout caps wall-clock duration. Default 60s.
 	Timeout time.Duration
-
-	// AllowMemoryWrites lets the subagent write to the shared MemoryProvider.
-	// Default false — subagents are read-only to prevent polluting parent memory.
-	AllowMemoryWrites bool
 
 	// Conversation is the persistent conversation for this subagent.
 	// When set, the subagent retains state across multiple Run() calls,
@@ -102,12 +94,7 @@ func (s *Subagent) Run(ctx context.Context) *SubagentResult {
 	subCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
-	// Build a memory-safe engine copy when writes are not allowed
 	engine := s.Engine
-	if engine != nil && engine.Memory != nil && !s.AllowMemoryWrites {
-		// Wrap engine to make memory read-only
-		engine = s.readOnlyMemoryEngine(engine)
-	}
 
 	systemPrompt := s.SystemPrompt
 	if systemPrompt == "" {
@@ -181,36 +168,6 @@ func (s *Subagent) SendFollowUp(ctx context.Context, message string) *SubagentRe
 	result := s.Run(ctx)
 	s.Task = orig
 	return result
-}
-
-// readOnlyMemoryEngine returns an engine copy with a read-only memory wrapper.
-// Writes (Create, StrReplace, Delete, Rename) are silently dropped.
-func (s *Subagent) readOnlyMemoryEngine(e *Engine) *Engine {
-	if e == nil || e.Memory == nil {
-		return e
-	}
-	copy := *e
-	copy.Memory = &readOnlyMemory{inner: e.Memory}
-	return &copy
-}
-
-// readOnlyMemory wraps a MemoryProvider and silently drops all write operations.
-type readOnlyMemory struct {
-	inner MemoryProvider
-}
-
-func (m *readOnlyMemory) View(ctx context.Context, scope Scope, path string) (string, error) {
-	return m.inner.View(ctx, scope, path)
-}
-func (m *readOnlyMemory) Create(_ context.Context, _ Scope, _ string, _ string) error { return nil }
-func (m *readOnlyMemory) StrReplace(_ context.Context, _ Scope, _, _, _ string) error { return nil }
-func (m *readOnlyMemory) Delete(_ context.Context, _ Scope, _ string) error            { return nil }
-func (m *readOnlyMemory) Rename(_ context.Context, _ Scope, _, _ string) error         { return nil }
-func (m *readOnlyMemory) List(ctx context.Context, scope Scope, path string) ([]string, error) {
-	return m.inner.List(ctx, scope, path)
-}
-func (m *readOnlyMemory) Search(ctx context.Context, scope Scope, query string) ([]MemoryEntry, error) {
-	return m.inner.Search(ctx, scope, query)
 }
 
 // RunSubagentsInParallel runs multiple subagents concurrently and returns

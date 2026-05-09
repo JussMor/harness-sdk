@@ -4,27 +4,25 @@ import "context"
 
 // Scope identifies the persistence boundary of a memory entry.
 //
-// The three scopes mirror Claude's memory model:
-//   - User    → cross-project, holds preferences and profile data
-//   - Project → per-project, holds schemas, decisions, workflow state
-//   - Session → ephemeral, tied to current conversation (use ObservationStore)
+// Mirrors Claude's two persistent memory scopes:
+//   - User    → cross-project; holds preferences and profile data
+//   - Project → per-project; holds schemas, decisions, workflow state
 type Scope string
 
 const (
 	ScopeUser    Scope = "user"
 	ScopeProject Scope = "project"
-	ScopeSession Scope = "session" // delegated to ObservationStore
 )
 
 // MemoryProvider abstracts persistent key/value storage that survives across
-// conversations and threads.
+// conversations. Operations map directly to the tools Claude Code uses to
+// manage CLAUDE.md and user memory files.
 //
 // Note: Insert by line number was removed — use StrReplace instead.
-// Line numbers go stale the moment the file changes, which makes them
-// dangerous for an agent doing concurrent edits.
+// Line numbers go stale the moment the file changes.
 type MemoryProvider interface {
 	// View returns the content at path. If path is a directory, returns a
-	// listing. scope=\"*\" returns both scopes (read-only).
+	// listing. scope="*" returns both scopes (read-only).
 	View(ctx context.Context, scope Scope, path string) (string, error)
 
 	// Create writes a new file at path with the given content.
@@ -48,18 +46,6 @@ type MemoryProvider interface {
 	Search(ctx context.Context, scope Scope, query string) ([]MemoryEntry, error)
 }
 
-// MemoryUpdateIntent describes what a memory trigger wants to do.
-// Beyond simple Create, the trigger can request Replace or Delete —
-// this is how "I no longer work at X" becomes a delete, not a new fact.
-type MemoryUpdateIntent struct {
-	Layer      MemoryLayer // Explicit/Inferred/Session
-	Content    string      // new fact content
-	Op         string      // "create", "replace", "delete"
-	OldContent string      // for "replace" ops — used with StrReplace
-	Path       string      // for "delete" and "replace"; runtime assigns for "create"
-	Scope      Scope       // user or project; defaults to ScopeUser
-}
-
 // MemoryRoot is one directory read during orientation.
 // Having multiple labeled roots mirrors how Claude separates
 // user preferences, facts, and project context.
@@ -79,13 +65,11 @@ var DefaultMemoryRoots = []MemoryRoot{
 
 // MemoryEntry represents a single memory file with its metadata.
 type MemoryEntry struct {
-	Path       string      `json:"path"`
-	Scope      Scope       `json:"scope"`
-	Content    string      `json:"content,omitempty"`
-	Layer      MemoryLayer `json:"layer,omitempty"`      // Explicit/Inferred/Session
-	Confidence float64     `json:"confidence,omitempty"` // 0-1, 0 = unknown
-	Source     string      `json:"source,omitempty"`     // "user", "inferred", "tool"
-	UpdatedAt  int64       `json:"updated_at,omitempty"` // Unix nano
+	Path      string  `json:"path"`
+	Scope     Scope   `json:"scope"`
+	Content   string  `json:"content,omitempty"`
+	Source    string  `json:"source,omitempty"` // "user", "inferred", "tool"
+	UpdatedAt int64   `json:"updated_at,omitempty"` // Unix nano
 }
 
 // MemorySearchResult is a ranked result from a memory search.

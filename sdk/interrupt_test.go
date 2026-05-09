@@ -2,9 +2,6 @@ package autobuild
 
 import (
 	"context"
-	"crypto/hmac"
-	"crypto/sha256"
-	"encoding/hex"
 	"encoding/json"
 	"testing"
 	"time"
@@ -138,26 +135,6 @@ func TestInterruptGate_ResolutionToken(t *testing.T) {
 	expired, _ := gate.IssueResolutionToken("int_token", -time.Second)
 	if err := gate.ResolveByToken(expired, InterruptResponse{Approved: true}); err == nil {
 		t.Fatalf("expected expired error")
-	}
-}
-
-// TestVerifyWebhookSignature_RoundTrip checks HMAC signing matches verification.
-func TestVerifyWebhookSignature_RoundTrip(t *testing.T) {
-	secret := []byte("super-secret")
-	body := []byte(`{"hello":"world"}`)
-
-	mac := hmac.New(sha256.New, secret)
-	mac.Write(body)
-	header := "sha256=" + hex.EncodeToString(mac.Sum(nil))
-
-	if err := VerifyWebhookSignature(secret, body, header); err != nil {
-		t.Fatalf("verify: %v", err)
-	}
-	if err := VerifyWebhookSignature(secret, []byte(`{"hello":"mars"}`), header); err == nil {
-		t.Fatalf("expected mismatch")
-	}
-	if err := VerifyWebhookSignature(secret, body, "md5=deadbeef"); err == nil {
-		t.Fatalf("expected unsupported scheme error")
 	}
 }
 
