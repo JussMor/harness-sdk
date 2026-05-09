@@ -1136,6 +1136,13 @@ function toChatMessage(message: BackendMessage): ChatMessage {
     })
   )
 
+  // Restore subagentResults from dispatch-subagents tool traces so they
+  // survive page reload. SubagentTrace and StreamSubagentResult share the
+  // same shape so the cast is safe.
+  const subagentResults = traces
+    .flatMap((t) => t.subagents ?? [])
+    .map((s) => s as unknown as StreamSubagentResult)
+
   return {
     id: String(message.id),
     role: message.role,
@@ -1143,6 +1150,7 @@ function toChatMessage(message: BackendMessage): ChatMessage {
     model: message.model,
     pending: false,
     traces: traces.length > 0 ? traces : undefined,
+    subagentResults: subagentResults.length > 0 ? subagentResults : undefined,
   }
 }
 

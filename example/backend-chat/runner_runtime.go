@@ -659,6 +659,12 @@ func (r *agentRuntime) newSubagentDispatchTool() *ab.Tool {
 					"stop_reason": res.StopReason,
 					"duration_ms": res.Duration.Milliseconds(),
 				}
+				if res.Model != "" {
+					entry["model"] = res.Model
+				}
+				if res.SystemPrompt != "" {
+					entry["system_prompt"] = res.SystemPrompt
+				}
 				if res.Error != nil {
 					entry["error"] = res.Error.Error()
 					if isTimeoutError(res.Error) {
