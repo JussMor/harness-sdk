@@ -141,13 +141,18 @@ type SecretLeakFilter struct {
 
 // DefaultSecretLeakFilter returns a filter with common secret prefixes.
 // Add your own via the Patterns field.
+//
+// Patterns must be specific enough to avoid false positives — short two-letter
+// prefixes (e.g. raw "AC" or "SK") are intentionally omitted because they
+// match arbitrary English/Spanish text. To detect Twilio/SendGrid keys add
+// length-anchored regex via a custom filter.
 func DefaultSecretLeakFilter() *SecretLeakFilter {
 	return &SecretLeakFilter{
 		Patterns: []string{
 			// Anthropic
 			"sk-ant-",
 			// OpenAI
-			"sk-proj-", "sk-",
+			"sk-proj-",
 			// GitHub
 			"ghp_", "github_pat_", "ghs_", "gho_",
 			// AWS
@@ -160,14 +165,13 @@ func DefaultSecretLeakFilter() *SecretLeakFilter {
 			"xoxb-", "xoxp-", "xoxa-",
 			// Stripe
 			"sk_live_", "rk_live_", "sk_test_",
-			// Cloudflare
-			"eyJhbGciOiJSUzI1NiIsImtpZCI6Ikp", // Cloudflare JWT prefix
-			// SendGrid / Twilio / other SaaS
-			"SG.", "AC", "SK",
-			// Generic high-entropy patterns
+			// SendGrid
+			"SG.",
+			// Private keys
 			"-----BEGIN RSA PRIVATE KEY-----",
 			"-----BEGIN OPENSSH PRIVATE KEY-----",
 			"-----BEGIN EC PRIVATE KEY-----",
+			"-----BEGIN PRIVATE KEY-----",
 		},
 	}
 }

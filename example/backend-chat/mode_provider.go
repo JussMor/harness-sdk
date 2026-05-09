@@ -70,6 +70,7 @@ func newModeEngineWithDB(provider ab.LLMProvider, model string, logContext Runti
 	subEngine := ab.New(
 		ab.WithLLM(provider),
 		ab.WithToolRegistry(rt.buildSubagentToolRegistry()),
+		ab.WithPrompt(ab.NewSystemPromptBuilder()),
 	)
 	subEngine.Prompt.Set(ab.LayerCore, buildCorePrompt(rt))
 	rt.subagentEngine = subEngine
