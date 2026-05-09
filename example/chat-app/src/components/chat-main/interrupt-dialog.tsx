@@ -47,7 +47,7 @@ export function InterruptDialog({
   return null
 }
 
-function ApprovalView({ request, onResolve, onCancel }: InterruptDialogProps) {
+function ApprovalView({ request, onResolve }: InterruptDialogProps) {
   const tool = request.approval?.tool_call?.name ?? "unknown"
   const args = request.approval?.tool_call?.args
   return (
@@ -70,11 +70,6 @@ function ApprovalView({ request, onResolve, onCancel }: InterruptDialogProps) {
         >
           Approve
         </button>
-        {onCancel && (
-          <button className="rounded px-3 py-1" onClick={onCancel}>
-            Dismiss
-          </button>
-        )}
       </div>
     </div>
   )

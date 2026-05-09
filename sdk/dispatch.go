@@ -105,10 +105,18 @@ func (d *ToolDispatcher) Dispatch(ctx context.Context, call ToolCallEntry, sandb
 			if reason == "" {
 				reason = "permission denied"
 			}
+			// Make the failure unmistakable to the LLM. Sonnet-class models
+			// otherwise tend to gloss over a soft "error: ..." tool result
+			// and claim success in the next assistant turn. The explicit
+			// directive below mirrors Claude Code's permission-deny payload.
+			content := fmt.Sprintf(
+				"<tool_use_error>The user did not approve this %s call. Reason: %s.\n\nThe tool was NOT executed. Do NOT claim success. Do NOT retry the same call. Acknowledge the rejection and ask the user how to proceed (or stop).</tool_use_error>",
+				tool.Name, reason,
+			)
 			return ToolResult{
 				ToolCallID: call.ID,
 				Name:       call.Name,
-				Content:    fmt.Sprintf("error: %s", reason),
+				Content:    content,
 				Error:      fmt.Errorf("%s", reason),
 			}
 		case PermissionBehaviorAllow:

@@ -869,7 +869,22 @@ export function ChatMain({
                 setPendingInterrupt(null)
               }
             }}
-            onCancel={() => setPendingInterrupt(null)}
+            onCancel={async () => {
+              // Dismiss === Reject. Without sending a denial the backend
+              // gate stays blocked, the agent loop hangs forever, and the
+              // model never gets a tool result.
+              if (chatID) {
+                try {
+                  await api.resolveInterrupt(pendingInterrupt.id, chatID, {
+                    approved: false,
+                  })
+                } catch {
+                  // best-effort: still clear the dialog so the user
+                  // doesn't get stuck
+                }
+              }
+              setPendingInterrupt(null)
+            }}
           />
         )}
 
