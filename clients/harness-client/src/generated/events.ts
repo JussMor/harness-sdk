@@ -6,14 +6,11 @@
 export type StreamEventName =
   | "artifact_created"
   | "artifact_updated"
-  | "confirmation_required"
-  | "confirmation_resolved"
   | "delta"
   | "done"
   | "error"
   | "interrupt_required"
   | "interrupt_resolved"
-  | "plan_proposed"
   | "subagent_result"
   | "thinking"
   | "tool_call"
@@ -23,14 +20,11 @@ export type StreamEventName =
 export const StreamEventNames = [
   "artifact_created",
   "artifact_updated",
-  "confirmation_required",
-  "confirmation_resolved",
   "delta",
   "done",
   "error",
   "interrupt_required",
   "interrupt_resolved",
-  "plan_proposed",
   "subagent_result",
   "thinking",
   "tool_call",

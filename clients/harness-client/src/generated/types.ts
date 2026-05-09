@@ -1558,20 +1558,6 @@ export interface Observation {
   created_at: string;
   expires_at?: string; // nil = lives for session duration
 }
-/**
- * ObservationStore holds session-scoped observations and makes them
- * retrievable by relevance. This is the agent's "working memory" —
- * facts actively useful right now, not worth persisting forever.
- */
-export type ObservationStore = unknown;
-/**
- * InMemoryObservationStore is a simple keyword-matching ObservationStore.
- * Suitable for single-process use. Replace with a vector store for
- * semantic search in production.
- */
-export interface InMemoryObservationStore {
-}
-
 //////////
 // source: options.go
 
@@ -1579,59 +1565,6 @@ export interface InMemoryObservationStore {
  * Option is a functional option for configuring an [Engine].
  */
 export type Option = unknown;
-
-//////////
-// source: plan.go
-
-/**
- * ExecutableStatus tracks progress of a single executable in a plan's DAG.
- * State machine:
- * 	planned ──→ queued ──→ in_progress ──→ in_review ──→ completed
- * 	                           │                            ↑
- * 	                           └────────────────────────────┘
- * 	                           (non-PR work skips in_review)
- * 	From any non-terminal state:
- * 	  → failed     (unrecoverable error)
- * 	  → blocked    (external dependency)
- * 	  → cancelled  (no longer needed)
- */
-export type ExecutableStatus = string;
-export const ExecStatusPlanned: ExecutableStatus = "planned";
-export const ExecStatusQueued: ExecutableStatus = "queued";
-export const ExecStatusNotStarted: ExecutableStatus = "not_started"; // alias for planned (backward compat)
-export const ExecStatusInProgress: ExecutableStatus = "in_progress";
-export const ExecStatusInReview: ExecutableStatus = "in_review";
-export const ExecStatusCompleted: ExecutableStatus = "completed";
-export const ExecStatusFailed: ExecutableStatus = "failed";
-export const ExecStatusBlocked: ExecutableStatus = "blocked";
-export const ExecStatusCancelled: ExecutableStatus = "cancelled";
-/**
- * Executable is a unit of work in a plan's DAG. Each executable maps to a
- * child-thread agent that plans, codes, tests, PRs, and merges.
- */
-export interface Executable {
-  id: string;
-  name: string;
-  description?: string;
-  dependencies?: string[]; // IDs of executables that must complete first
-  status: ExecutableStatus;
-  thread_id?: string;
-  result?: string;
-  retries?: number /* int */;
-  max_retries?: number /* int */;
-}
-/**
- * Plan is a structured proposal for complex work: a title, objective,
- * and a DAG of executables with dependency relationships.
- */
-export interface Plan {
-  id: string;
-  title: string;
-  objective: string;
-  executables: Executable[];
-  approved: boolean;
-  auto_approve?: boolean;
-}
 
 //////////
 // source: protocol.go
@@ -2362,19 +2295,9 @@ export interface StreamEvent {
    */
   tool_result?: ToolResult;
   /**
-   * Plan is set when Type=StreamEventPlanProposed.
-   */
-  plan?: Plan;
-  /**
    * SubagentResult is set when Type=StreamEventSubagentResult.
    */
   subagent_result?: SubagentResult;
-  /**
-   * ConfirmationRequest is set when Type=StreamEventConfirmationRequired.
-   * LEGACY: prefer Interrupt for new clients. Populated only when the
-   * underlying interrupt is InterruptKindApproval.
-   */
-  confirmation_request?: ApprovalRequest;
   /**
    * Interrupt is set when Type=StreamEventInterruptRequired or
    * Type=StreamEventInterruptResolved. Discriminate sub-variants on Kind.
@@ -2406,17 +2329,6 @@ export const StreamEventDelta: StreamEventType = "delta";
  * by default. Use for debugging, tracing, or advanced UX.
  */
 export const StreamEventThinking: StreamEventType = "thinking";
-/**
- * StreamEventConfirmationRequired is emitted when a tool call needs human
- * approval. LEGACY alias for backward compatibility — emitted alongside
- * StreamEventInterruptRequired whenever the interrupt is an Approval.
- */
-export const StreamEventConfirmationRequired: StreamEventType = "confirmation_required";
-/**
- * StreamEventConfirmationResolved is emitted after a confirmation_required
- * is resolved. LEGACY alias of StreamEventInterruptResolved (Approval kind).
- */
-export const StreamEventConfirmationResolved: StreamEventType = "confirmation_resolved";
 /**
  * StreamEventInterruptRequired is emitted when the agent pauses awaiting
  * human input. StreamEvent.Interrupt carries the full request — discriminate
@@ -2451,12 +2363,6 @@ export const StreamEventToolResult: StreamEventType = "tool_result";
  * (one request/response cycle within the agent loop).
  */
 export const StreamEventTurnComplete: StreamEventType = "turn_complete";
-/**
- * StreamEventPlanProposed fires when the alignment phase proposes an
- * execution plan. Consumers can display plan status or trigger custom
- * subagent orchestration at the application layer.
- */
-export const StreamEventPlanProposed: StreamEventType = "plan_proposed";
 /**
  * StreamEventSubagentResult fires once per subagent as they complete
  * during plan fan-out execution. Consumers can stream partial results
@@ -2988,122 +2894,4 @@ export interface IntrinsicVerification {
    */
   CustomMarkers: string[];
 }
-/**
- * PhaseSignal describes why a phase should advance. Runtime uses signals
- * instead of mechanically calling Advance() after every function — this
- * matches how Claude actually moves between phases (based on LLM output,
- * not elapsed time).
- */
-export type PhaseSignal = string;
-/**
- * SignalOrientationDone fires after memory is read and skills are loaded.
- */
-export const SignalOrientationDone: PhaseSignal = "orientation_done";
-/**
- * SignalPlanProposed fires when the LLM emitted a plan.
- */
-export const SignalPlanProposed: PhaseSignal = "plan_proposed";
-/**
- * SignalPlanApproved fires when the user (or auto-approve) accepted.
- */
-export const SignalPlanApproved: PhaseSignal = "plan_approved";
-/**
- * SignalAlignmentDone fires when no plan is needed or plan is approved.
- */
-export const SignalAlignmentDone: PhaseSignal = "alignment_done";
-/**
- * SignalPreparationDone fires after checkpoint and budget verification.
- */
-export const SignalPreparationDone: PhaseSignal = "preparation_done";
-/**
- * SignalExecutionComplete fires when the agent loop returns "complete".
- */
-export const SignalExecutionComplete: PhaseSignal = "execution_complete";
-/**
- * SignalVerificationPassed fires when VerificationStrategy.Pass is true.
- */
-export const SignalVerificationPassed: PhaseSignal = "verification_passed";
-/**
- * SignalVerificationFailed fires when verification fails.
- * Runtime decides whether to retry Execution or surface the error.
- */
-export const SignalVerificationFailed: PhaseSignal = "verification_failed";
-/**
- * SignalClosureDone fires after memory writes complete.
- */
-export const SignalClosureDone: PhaseSignal = "closure_done";
-/**
- * PhaseTransition describes a state change driven by a signal.
- */
-export interface PhaseTransition {
-  From: Phase;
-  To: Phase;
-  Signal: PhaseSignal;
-  Reason: string;
-}
 
-//////////
-// source: webhook.go
-
-/**
- * WebhookSubscription describes a single outbound endpoint.
- */
-export interface WebhookSubscription {
-  /**
-   * ID is a stable identifier (typically a uuid). The dispatcher uses it
-   * for logging and the WebhookStore uses it for indexing.
-   */
-  id: string;
-  /**
-   * URL is the target HTTPS endpoint. Plain HTTP is allowed but discouraged.
-   */
-  url: string;
-  /**
-   * Secret is the HMAC key. Generate with crypto/rand and never log it.
-   */
-  secret: string;
-  /**
-   * EventFilter restricts which StreamEventTypes are delivered.
-   * Empty/nil = deliver all events the dispatcher knows about.
-   */
-  event_filter?: StreamEventType[];
-  /**
-   * Headers is an optional set of additional headers attached to every
-   * request (e.g. for vendor-specific routing).
-   */
-  headers?: { [key: string]: string};
-  /**
-   * Active is false to pause delivery without unregistering.
-   */
-  active: boolean;
-}
-/**
- * WebhookEvent is the JSON payload posted to subscriber URLs.
- */
-export interface WebhookEvent {
-  id: string;
-  version: string;
-  type: StreamEventType;
-  timestamp: string;
-  data?: unknown;
-}
-/**
- * WebhookStore persists subscriptions. The default in-process store is
- * fine for development; production deployments should back it with a
- * durable database so subscriptions survive restarts.
- */
-export type WebhookStore = unknown;
-/**
- * InMemoryWebhookStore is a process-local store, suitable for tests and
- * single-replica deployments.
- */
-export interface InMemoryWebhookStore {
-}
-/**
- * WebhookDispatcher publishes events to all matching subscriptions with
- * HMAC-signed payloads, idempotency keys, and exponential-backoff retries.
- * One dispatcher serves the whole runtime; events from many concurrent
- * streams converge into a single delivery queue.
- */
-export interface WebhookDispatcher {
-}
