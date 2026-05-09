@@ -139,9 +139,11 @@ type MetadataToolCall struct {
 }
 
 type MetadataArtifact struct {
+	ID       string `json:"id,omitempty"`
 	Path     string `json:"path"`
 	Language string `json:"language"`
 	Content  string `json:"content"`
+	Title    string `json:"title,omitempty"`
 }
 
 func (a *BackendChatApp) handleHealth(w http.ResponseWriter, _ *http.Request) {
@@ -763,7 +765,7 @@ func (a *BackendChatApp) handleStream(w http.ResponseWriter, r *http.Request, ch
 			}
 
 		case ab.StreamEventDone:
-			// Persist assistant message with metadata
+			// Persist assistant message with metadata (artifacts without IDs yet).
 			var metaOpt []MessageMetadata
 			if len(streamMeta.ToolCalls) > 0 || len(streamMeta.Artifacts) > 0 {
 				metaOpt = []MessageMetadata{streamMeta}
@@ -771,14 +773,19 @@ func (a *BackendChatApp) handleStream(w http.ResponseWriter, r *http.Request, ch
 			assistantMsg, _ := InsertMessage(ctx, a.db, chatID, "assistant", fullResponse.String(), effectiveModel, metaOpt...)
 			_ = a.pub.PublishChatMessage(ctx, chatID, assistantMsg)
 
-			// Auto-persist artifacts detected from stream (file_write tool calls)
-			// and emit as unified SDK Artifact shape via "artifact_created".
-			for _, metaArt := range streamMeta.Artifacts {
+			// Auto-persist artifacts detected from stream (file_write tool calls),
+			// emit as unified SDK Artifact shape via "artifact_created", and patch
+			// the artifact ID back into streamMeta so the message metadata is complete.
+			metaUpdated := false
+			for i, metaArt := range streamMeta.Artifacts {
 				art, ver, err := CreateArtifact(ctx, a.db, a.r2,
 					chatID, &assistantMsg.ID,
 					metaArt.Language, metaArt.Path, metaArt.Content,
 				)
 				if err == nil {
+					streamMeta.Artifacts[i].ID = art.ID
+					streamMeta.Artifacts[i].Title = art.Title
+					metaUpdated = true
 					unified := ab.Artifact{
 						ID:        art.ID,
 						Kind:      ab.ArtifactKindFile,
@@ -796,6 +803,11 @@ func (a *BackendChatApp) handleStream(w http.ResponseWriter, r *http.Request, ch
 					d, _ := json.Marshal(unified)
 					sseWrite("artifact_created", string(d))
 				}
+			}
+			// Patch message metadata with the real artifact UUIDs so they survive
+			// page reloads — the initial InsertMessage call didn't have them yet.
+			if metaUpdated {
+				_ = UpdateMessageMetadata(ctx, a.db, assistantMsg.ID, streamMeta)
 			}
 
 			d, _ := json.Marshal(map[string]any{"runId": runID, "messageId": assistantMsg.ID})

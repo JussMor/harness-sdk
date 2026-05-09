@@ -195,6 +195,8 @@ export interface ArtifactRecord {
   title: string
   createdAt: string
   versions?: Array<ArtifactVersion>
+  /** Most recent version content, populated by the list endpoint. */
+  latestContent?: string
 }
 
 export interface ArtifactStorageResponse {

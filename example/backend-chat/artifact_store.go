@@ -69,6 +69,9 @@ type ArtifactRecord struct {
 
 	// Populated on read
 	Versions []ArtifactVersionRecord `json:"versions,omitempty"`
+	// LatestContent holds the most recent version's content when requested
+	// via ListArtifactsWithLatestContent. Omitted on plain list calls.
+	LatestContent string `json:"latestContent,omitempty"`
 }
 
 type ArtifactVersionRecord struct {
@@ -203,6 +206,44 @@ func ListArtifactsForChat(ctx context.Context, db *sql.DB, chatID int64) ([]Arti
 		var a ArtifactRecord
 		var msgID sql.NullInt64
 		if err := rows.Scan(&a.ID, &a.ChatID, &msgID, &a.Language, &a.Title, &a.CreatedAt); err != nil {
+			return nil, err
+		}
+		if msgID.Valid {
+			a.MessageID = &msgID.Int64
+		}
+		arts = append(arts, a)
+	}
+	return arts, rows.Err()
+}
+
+// ListArtifactsWithLatestContent returns all artifacts for a chat, each
+// populated with the content of its most recent version. This is used when
+// restoring the artifact list after a page reload.
+func ListArtifactsWithLatestContent(ctx context.Context, db *sql.DB, chatID int64) ([]ArtifactRecord, error) {
+	rows, err := db.QueryContext(ctx, `
+		SELECT a.id, a.chat_id, a.message_id, a.language, a.title, a.created_at,
+		       COALESCE(av.content, '')
+		FROM artifacts a
+		LEFT JOIN artifact_versions av
+		  ON av.artifact_id = a.id
+		  AND av.version = (
+		        SELECT MAX(v2.version)
+		        FROM artifact_versions v2
+		        WHERE v2.artifact_id = a.id
+		      )
+		WHERE a.chat_id = ?
+		ORDER BY a.created_at ASC`, chatID,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var arts []ArtifactRecord
+	for rows.Next() {
+		var a ArtifactRecord
+		var msgID sql.NullInt64
+		if err := rows.Scan(&a.ID, &a.ChatID, &msgID, &a.Language, &a.Title, &a.CreatedAt, &a.LatestContent); err != nil {
 			return nil, err
 		}
 		if msgID.Valid {
