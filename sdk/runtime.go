@@ -385,6 +385,23 @@ func (r *Runtime) execution(ctx context.Context, conv *Conversation, rr *Runtime
 		cfg.SystemPrompt = r.engine.Prompt.Build()
 	}
 
+	// Inject per-turn dynamic reminders (skills listing, agents listing, …)
+	// as <system-reminder> blocks appended to the system prompt. Without this
+	// the LLM is unaware of the lazy-loaded skills/agents catalog and tells
+	// the user it has none.
+	if r.engine.HasTools() {
+		if blocks, err := r.engine.Tools.CollectDynamicReminders(ctx); err == nil && len(blocks) > 0 {
+			reminder := SystemReminder(JoinSystemReminders(blocks...))
+			if reminder != "" {
+				if cfg.SystemPrompt != "" {
+					cfg.SystemPrompt += "\n\n" + reminder
+				} else {
+					cfg.SystemPrompt = reminder
+				}
+			}
+		}
+	}
+
 	loopResult, err := RunAgentLoopWithEngine(ctx, r.engine, r.mode, cfg, conv.Messages)
 	if err != nil {
 		return nil, err

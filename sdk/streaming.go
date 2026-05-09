@@ -209,6 +209,22 @@ func (r *Runtime) runStreamInternal(
 		systemPrompt = r.engine.Prompt.Build()
 	}
 
+	// Inject per-turn dynamic reminders (skills, agents, …) as a
+	// <system-reminder> appended to the system prompt. Same rationale as
+	// the non-streaming path in runtime.go.
+	if r.engine.HasTools() {
+		if blocks, err := r.engine.Tools.CollectDynamicReminders(ctx); err == nil && len(blocks) > 0 {
+			reminder := SystemReminder(JoinSystemReminders(blocks...))
+			if reminder != "" {
+				if systemPrompt != "" {
+					systemPrompt += "\n\n" + reminder
+				} else {
+					systemPrompt = reminder
+				}
+			}
+		}
+	}
+
 	dispatcher := NewToolDispatcher(r.engine.Tools, r.engine.Sandbox)
 	if r.permissions != nil {
 		dispatcher.WithPermissions(r.permissions)

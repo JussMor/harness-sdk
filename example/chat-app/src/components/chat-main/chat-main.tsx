@@ -471,6 +471,43 @@ export function ChatMain({
           pendingFilePreviewsRef.current.shift()
         }
 
+        // dispatch-subagents — surface every file each subagent wrote so
+        // they show up in the canvas alongside files written directly by
+        // the parent agent. The backend tracks them via fileWriteTracker
+        // and embeds them under `files_created` in the tool result.
+        if (
+          toolName === "dispatch-subagents" &&
+          !event.data.error &&
+          event.data.content
+        ) {
+          try {
+            const parsed = JSON.parse(event.data.content) as {
+              files_created?: Array<{ path?: string; content?: string }>
+            }
+            const files = parsed.files_created ?? []
+            if (files.length > 0) {
+              const newArtifacts: Array<Artifact> = files
+                .filter((f) => f && f.path && f.content)
+                .map((f) => ({
+                  id: `subagent-${Date.now()}-${Math.random()
+                    .toString(36)
+                    .slice(2, 8)}`,
+                  language: inferLanguageFromPath(f.path!),
+                  content: f.content!,
+                  complete: true,
+                  title: f.path!.split("/").pop() || f.path!,
+                }))
+              if (newArtifacts.length > 0) {
+                setAllArtifacts((prev) => [...prev, ...newArtifacts])
+                setActiveArtifact(newArtifacts[newArtifacts.length - 1])
+                setIsArtifactStreaming(false)
+              }
+            }
+          } catch {
+            // tool may have returned a non-JSON error string — ignore
+          }
+        }
+
         const subagents = parseSubagentResult(toolName, event.data.content)
 
         setMessages((prev) =>

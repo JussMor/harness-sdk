@@ -96,6 +96,31 @@ func (r *agentRuntime) newMemoryTool() *ab.Tool {
 		Name:        "memory-operations",
 		Description: "View and edit persistent memory in user or project scope.",
 		Category:    ab.ToolCategoryMemory,
+		// DynamicReminder lists the memory files the model can read from /
+		// write to. Without this the model has no way to know what's already
+		// saved and tends to either skip writes ("yo le mencione algo y nunca
+		// guardo en memoria") or duplicate facts.
+		DynamicReminder: func(ctx context.Context) (string, error) {
+			if r.memory == nil {
+				return "", nil
+			}
+			var b strings.Builder
+			b.WriteString("Persistent memory you can read or update via `memory-operations`:\n")
+			any := false
+			for _, sc := range []ab.Scope{ab.ScopeUser, ab.ScopeProject} {
+				items, err := r.memory.List(ctx, sc, "")
+				if err != nil || len(items) == 0 {
+					continue
+				}
+				any = true
+				fmt.Fprintf(&b, "- [%s] %s\n", sc, strings.Join(items, ", "))
+			}
+			if !any {
+				b.WriteString("- (no memory files yet — empty store)\n")
+			}
+			b.WriteString("\nWhen the user shares a persistent fact about themselves, their preferences, their project, or a key decision: save it with `memory-operations` (operation=\"create\" for new, \"str_replace\" to update). Read existing entries before duplicating.")
+			return b.String(), nil
+		},
 		Parameters: ab.ToolFuncParams{
 			Type: "object",
 			Properties: map[string]ab.ToolParam{
@@ -232,6 +257,30 @@ func (r *agentRuntime) newTodoTool() *ab.Tool {
 		Name:        "todo_write",
 		Description: "Manage the task checklist for the current session. Use this to track multi-step work so you always know what's done and what's next. Update the list as you go — mark items in_progress when you start them, completed when done.",
 		Category:    ab.ToolCategoryPlanning,
+		// DynamicReminder injects the current task list as a per-turn
+		// <system-reminder>, mirroring Claude Code's TodoWrite reminder.
+		// This keeps the model honest about what's done vs. pending without
+		// requiring an explicit `read` call before every reasoning turn.
+		DynamicReminder: func(_ context.Context) (string, error) {
+			todos := r.execCtx.Todos()
+			if len(todos) == 0 {
+				return "Current task checklist is empty. Use `todo_write` (operation=\"write\") to create one when starting any task that needs more than two distinct steps.", nil
+			}
+			var b strings.Builder
+			b.WriteString("Current task checklist (from `todo_write`):\n")
+			for _, t := range todos {
+				marker := "[ ]"
+				switch t.Status {
+				case ab.TodoStatusInProgress:
+					marker = "[~]"
+				case ab.TodoStatusCompleted:
+					marker = "[x]"
+				}
+				fmt.Fprintf(&b, "- %s %s — %s\n", marker, t.ID, t.Content)
+			}
+			b.WriteString("\nKeep this list current: mark items in_progress before working on them, completed once done.")
+			return b.String(), nil
+		},
 		Parameters: ab.ToolFuncParams{
 			Type: "object",
 			Properties: map[string]ab.ToolParam{
