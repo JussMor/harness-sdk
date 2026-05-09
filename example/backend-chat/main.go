@@ -586,15 +586,25 @@ func (a *BackendChatApp) handleStream(w http.ResponseWriter, r *http.Request, ch
 	}
 
 	// Interrupts: always wire an InterruptGate so tools like await_component_input
-	// can pause and ask for user input. When HIL is enabled, also prepend a
-	// HumanApprovalFilter that requires approval for dangerous tool calls.
+	// can pause and ask for user input. When HIL is enabled, attach a
+	// PermissionEngine that auto-allows known-safe tools and routes everything
+	// else through the same gate via InterruptGateApprover.
 	gate := ab.NewInterruptGate(8)
 	agentRT.runtime = agentRT.runtime.WithInterrupts(gate)
 	if req.HumanInLoop {
-		_, agentRT.runtime = agentRT.runtime.WithHumanApproval(ab.DefaultApprovalPolicy)
+		eng := ab.NewPermissionEngine(ab.PermissionModeDefault)
+		eng.SetApprover(&ab.InterruptGateApprover{Gate: gate})
+		// Auto-allow safe / read-only tools. Anything not listed falls
+		// through to the engine's default `ask` step, which routes to
+		// the InterruptGate approver and surfaces an approval prompt.
+		for _, safe := range []string{
+			"file_read", "list_dir", "search", "grep",
+			"memory", "Skill", "Agent",
+		} {
+			eng.AddAllowString(ab.RuleSourceSession, safe)
+		}
+		agentRT.runtime = agentRT.runtime.WithPermissions(eng)
 	}
-	// Register the runtime's actual gate — WithHumanApproval may have replaced
-	// the original gate with its own internal one.
 	ensureInterruptRegistry().Register(chatID, agentRT.runtime.InterruptGate())
 	defer ensureInterruptRegistry().Unregister(chatID)
 
