@@ -79,6 +79,7 @@ func main() {
 	mux.HandleFunc("/api/webhooks", app.handleWebhooks)
 	mux.HandleFunc("/api/webhooks/", app.handleWebhookByID)
 	mux.HandleFunc("/api/interrupts/", app.handleInterruptResolve)
+	mux.HandleFunc("/api/confirm", app.handleInterruptResolve)
 	mux.HandleFunc("/admin/eval", app.handleEval)
 	mux.HandleFunc("/api/threads", app.handleThreads)
 	mux.HandleFunc("/api/threads/", app.handleThreadRoutes)
@@ -387,6 +388,58 @@ func (a *BackendChatApp) handleMessages(w http.ResponseWriter, r *http.Request, 
 
 
 
+// handleInterruptResolve handles POST /api/interrupts/{chatID}[/resolve]
+// and POST /api/confirm — both resolve a pending interrupt for a streaming session.
+func (a *BackendChatApp) handleInterruptResolve(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+
+	var req struct {
+		ChatID       int64           `json:"chat_id"`
+		ID           string          `json:"id"`
+		Approved     bool            `json:"approved"`
+		Answer       json.RawMessage `json:"answer,omitempty"`
+		ModifiedArgs string          `json:"modified_args"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeErr(w, http.StatusBadRequest, err)
+		return
+	}
+
+	// Derive chatID from URL path if not supplied in body.
+	if req.ChatID == 0 {
+		path := strings.TrimPrefix(r.URL.Path, "/api/interrupts/")
+		path = strings.TrimSuffix(strings.Trim(path, "/"), "/resolve")
+		if id, err := strconv.ParseInt(path, 10, 64); err == nil {
+			req.ChatID = id
+		}
+	}
+
+	if req.ChatID == 0 {
+		writeErr(w, http.StatusBadRequest, fmt.Errorf("chat_id is required"))
+		return
+	}
+
+	gate, ok := ensureInterruptRegistry().Get(req.ChatID)
+	if !ok {
+		writeErr(w, http.StatusNotFound, fmt.Errorf("no active interrupt for chat %d", req.ChatID))
+		return
+	}
+
+	resp := ab.InterruptResponse{
+		ID:       req.ID,
+		Approved: req.Approved,
+		Answer:   req.Answer,
+	}
+	if !gate.Respond(resp) {
+		writeErr(w, http.StatusConflict, fmt.Errorf("interrupt already resolved or expired"))
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+}
+
 func newRunID() string {
 	return fmt.Sprintf("run_%d", time.Now().UnixNano())
 }
@@ -680,29 +733,6 @@ func (a *BackendChatApp) handleStream(w http.ResponseWriter, r *http.Request, ch
 					eventName = "artifact_updated"
 				}
 				sseWrite(eventName, string(d))
-			}
-
-		case ab.StreamEventPlanProposed:
-			if ev.Plan != nil {
-				executables := make([]map[string]any, 0, len(ev.Plan.Executables))
-				for _, exec := range ev.Plan.Executables {
-					executables = append(executables, map[string]any{
-						"id":           exec.ID,
-						"name":         exec.Name,
-						"description":  exec.Description,
-						"dependencies": exec.Dependencies,
-						"status":       string(exec.Status),
-					})
-				}
-				d, _ := json.Marshal(map[string]any{
-					"id":          ev.Plan.ID,
-					"title":       ev.Plan.Title,
-					"objective":   ev.Plan.Objective,
-					"executables": executables,
-				})
-				sseWrite("plan_proposed", string(d))
-				log.Printf("stream.plan_proposed chat_id=%d run_id=%s executables=%d",
-					chatID, runID, len(ev.Plan.Executables))
 			}
 
 		case ab.StreamEventSubagentResult:

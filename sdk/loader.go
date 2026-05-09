@@ -184,7 +184,6 @@ func ParseModeMarkdown(raw string) (*Mode, error) {
 		ID:              fields["id"],
 		Name:            fields["name"],
 		BaseMode:        fields["base_mode"],
-		PromptStrategy:  fields["prompt_strategy"],
 		ToolsMode:       fields["tools_mode"],
 		Tools:           lists["tools"],
 		Model:           fields["model"],
@@ -200,14 +199,6 @@ func ParseModeMarkdown(raw string) (*Mode, error) {
 		Name:          meta.Name,
 		BaseModeID:    BaseMode(meta.BaseMode),
 		PromptContent: body,
-	}
-
-	// Map string fields to typed enums
-	switch meta.PromptStrategy {
-	case "additions":
-		mode.PromptStrategy = PromptStrategyAdditions
-	case "replace":
-		mode.PromptStrategy = PromptStrategyReplace
 	}
 
 	switch meta.ToolsMode {

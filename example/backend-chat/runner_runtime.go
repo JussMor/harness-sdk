@@ -9,7 +9,6 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	ab "github.com/everfaz/autobuild-sdk"
@@ -22,11 +21,9 @@ type agentRuntime struct {
 	tools          *ab.ToolRegistry
 	engine         *ab.Engine
 	runtime        *ab.Runtime
-	execCtx        ab.ExecutionContext
 	subagentEngine *ab.Engine
 	skills         ab.SkillProvider
 	memory         ab.MemoryProvider
-	checkpoints    *checkpointStore
 	convStore      ab.ConversationStore
 }
 
@@ -34,7 +31,6 @@ type agentRuntime struct {
 
 func (r *agentRuntime) buildToolRegistry() *ab.ToolRegistry {
 	reg := ab.NewToolRegistry()
-	reg.Register(r.newCheckpointTool())
 	// Prefer sandbox file tools when available to avoid writing local host files.
 	if !isSandboxAvailable() || r.chatID <= 0 {
 		reg.Register(r.newDocumentTool())
@@ -62,7 +58,6 @@ func (r *agentRuntime) buildToolRegistry() *ab.ToolRegistry {
 
 func (r *agentRuntime) buildSubagentToolRegistry() *ab.ToolRegistry {
 	reg := ab.NewToolRegistry()
-	reg.Register(r.newCheckpointTool())
 	if !isSandboxAvailable() || r.chatID <= 0 {
 		reg.Register(r.newDocumentTool())
 	}
@@ -241,29 +236,6 @@ func (r *agentRuntime) newSkillsTool() *ab.Tool {
 	}
 }
 
-func (r *agentRuntime) newCheckpointTool() *ab.Tool {
-	return &ab.Tool{
-		Name:        "create-checkpoint",
-		Description: "Create a lightweight checkpoint label before or after a mutation.",
-		Category:    ab.ToolCategoryPlanning,
-		Parameters: ab.ToolFuncParams{
-			Type: "object",
-			Properties: map[string]ab.ToolParam{
-				"label": {Type: "string", Description: "Human-readable checkpoint label."},
-			},
-			Required: []string{"label"},
-		},
-		Execute: func(_ context.Context, _ string, args map[string]any) (string, error) {
-			label := strings.TrimSpace(asString(args["label"]))
-			if label == "" {
-				return "", fmt.Errorf("checkpoint label is required")
-			}
-			id := r.checkpoints.Create(label)
-			return fmt.Sprintf("checkpoint created: %s (%s)", id, label), nil
-		},
-	}
-}
-
 func (r *agentRuntime) newDocumentTool() *ab.Tool {
 	return &ab.Tool{
 		Name:        "document-operations",
@@ -297,17 +269,6 @@ func (r *agentRuntime) newDocumentTool() *ab.Tool {
 			return fmt.Sprintf("document %s: %s", action, relPath), nil
 		},
 	}
-}
-
-// ── Checkpoint ───────────────────────────────────────────────────────────────
-
-type checkpointStore struct {
-	nextID atomic.Uint64
-}
-
-func (s *checkpointStore) Create(label string) string {
-	id := s.nextID.Add(1)
-	return fmt.Sprintf("cp_%d_%s", id, slugify(label))
 }
 
 // ── helpers ──────────────────────────────────────────────────────────────────
@@ -385,8 +346,7 @@ func (r *agentRuntime) newSubagentDispatchTool() *ab.Tool {
 							"system_prompt":       {Type: "string", Description: "Custom persona for this subagent. Empty = generic focused-subagent prompt."},
 							"model":               {Type: "string", Description: "Model override (e.g. 'claude-haiku-4-5-20251001' for cheaper specialists). Empty = engine default."},
 							"max_turns":           {Type: "integer", Description: "Cap on subagent loop iterations (default 4)."},
-							"timeout_seconds":     {Type: "integer", Description: "Wall-clock timeout in seconds (default 120)."},
-							"allow_memory_writes": {Type: "boolean", Description: "Allow subagent to write to shared memory. Default false."},
+							"timeout_seconds": {Type: "integer", Description: "Wall-clock timeout in seconds (default 120)."},
 						},
 						Required: []string{"task"},
 					},
@@ -409,7 +369,6 @@ func (r *agentRuntime) newSubagentDispatchTool() *ab.Tool {
 			subEngine := r.subagentEngine
 			if isSandboxAvailable() && r.chatID > 0 {
 				subReg := ab.NewToolRegistry()
-				subReg.Register(r.newCheckpointTool())
 				if r.memory != nil {
 					subReg.Register(r.newMemoryTool())
 				}
@@ -445,10 +404,8 @@ func (r *agentRuntime) newSubagentDispatchTool() *ab.Tool {
 				if v, ok := m["timeout_seconds"].(float64); ok && v > 0 {
 					timeout = time.Duration(v) * time.Second
 				}
-				// New fields from updated Subagent struct
 				systemPrompt := strings.TrimSpace(asString(m["system_prompt"]))
 				model := strings.TrimSpace(asString(m["model"]))
-				allowWrites, _ := m["allow_memory_writes"].(bool)
 
 				// Strip routing prefix so the Anthropic provider always receives
 				// a bare model name (e.g. "claude-haiku-4-5-20251001", not "anthropic/...").
@@ -460,15 +417,14 @@ func (r *agentRuntime) newSubagentDispatchTool() *ab.Tool {
 					effectiveModel = modelOnly
 				}
 				subs = append(subs, ab.Subagent{
-					ID:                id,
-					Task:              task,
-					Engine:            subEngine,
-					Mode:              strings.TrimSpace(asString(m["mode"])),
-					MaxTurns:          maxTurns,
-					Timeout:           timeout,
-					SystemPrompt:      systemPrompt,
-					Model:             effectiveModel,
-					AllowMemoryWrites: allowWrites,
+					ID:           id,
+					Task:         task,
+					Engine:       subEngine,
+					Mode:         strings.TrimSpace(asString(m["mode"])),
+					MaxTurns:     maxTurns,
+					Timeout:      timeout,
+					SystemPrompt: systemPrompt,
+					Model:        effectiveModel,
 				})
 			}
 

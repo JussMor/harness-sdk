@@ -133,7 +133,6 @@ func (p *InMemorySkillProvider) Remove(name string) {
 
 // Verify interfaces at compile time
 var _ autobuild.SkillProvider = (*InMemorySkillProvider)(nil)
-var _ autobuild.ReloadableSkillProvider = (*InMemorySkillProvider)(nil)
 
 // ── FilesystemSkillProvider ───────────────────────────────────────────────────
 
@@ -259,4 +258,3 @@ func LoadFromDirs(candidates ...string) (*FilesystemSkillProvider, error) {
 }
 
 var _ autobuild.SkillProvider = (*FilesystemSkillProvider)(nil)
-var _ autobuild.ReloadableSkillProvider = (*FilesystemSkillProvider)(nil)
