@@ -65,11 +65,13 @@ func newModeEngineWithDB(provider ab.LLMProvider, model string, logContext Runti
 		engine.Modes = modes
 	}
 
-	// Subagent engine
+	// Subagent engine — same identity and tool awareness as parent so the LLM
+	// knows what it can and cannot do within a dispatched task.
 	subEngine := ab.New(
 		ab.WithLLM(provider),
 		ab.WithToolRegistry(rt.buildSubagentToolRegistry()),
 	)
+	subEngine.Prompt.Set(ab.LayerCore, buildCorePrompt(rt))
 	rt.subagentEngine = subEngine
 
 	// ── System prompt builder ──
