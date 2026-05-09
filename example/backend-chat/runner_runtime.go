@@ -39,6 +39,9 @@ func (r *agentRuntime) buildToolRegistry() *ab.ToolRegistry {
 	if tool := r.newSkillsTool(); tool != nil {
 		reg.Register(tool)
 	}
+	if tool := r.newAgentTool(); tool != nil {
+		reg.Register(tool)
+	}
 	if r.memory != nil {
 		reg.Register(r.newMemoryTool())
 	}
@@ -186,6 +189,35 @@ func resolveSkillsRoot() string {
 		"skills",
 		filepath.Join("example", "backend-chat", "skills"),
 		filepath.Join("..", "backend-chat", "skills"),
+	}
+	for _, c := range candidates {
+		if info, err := os.Stat(c); err == nil && info.IsDir() {
+			return c
+		}
+	}
+	return ""
+}
+
+func (r *agentRuntime) newAgentTool() *ab.Tool {
+	root := resolveAgentsRoot()
+	if root == "" || r.engine == nil {
+		return nil
+	}
+	return ab.NewAgentTool(ab.AgentToolConfig{
+		Sources: []ab.AgentSource{
+			&ab.FilesystemAgentSource{Root: root, Label: "backend-agents"},
+		},
+		ParentEngine:    r.engine,
+		DefaultModel:    r.modelName,
+		DefaultMaxTurns: 10,
+	})
+}
+
+func resolveAgentsRoot() string {
+	candidates := []string{
+		"agents",
+		filepath.Join("example", "backend-chat", "agents"),
+		filepath.Join("..", "backend-chat", "agents"),
 	}
 	for _, c := range candidates {
 		if info, err := os.Stat(c); err == nil && info.IsDir() {
@@ -546,7 +578,7 @@ func (r *agentRuntime) newSubagentDispatchTool() *ab.Tool {
 				)
 			}
 
-			subs := make([]ab.Subagent, 0, len(rawTasks))
+			subs := make([]ab.AgentInvocation, 0, len(rawTasks))
 			for i, raw := range rawTasks {
 				m, ok := raw.(map[string]any)
 				if !ok {
@@ -564,37 +596,34 @@ func (r *agentRuntime) newSubagentDispatchTool() *ab.Tool {
 				if v, ok := m["max_turns"].(float64); ok && v > 0 {
 					maxTurns = int(v)
 				}
-				timeout := 120 * time.Second
-				if v, ok := m["timeout_seconds"].(float64); ok && v > 0 {
-					timeout = time.Duration(v) * time.Second
-				}
 				systemPrompt := strings.TrimSpace(asString(m["system_prompt"]))
 				model := strings.TrimSpace(asString(m["model"]))
 
 				// Keep the routing prefix (e.g. "anthropic/...") so the
 				// RoutedLLMProvider can dispatch to the correct backend.
-				// RunAgentLoopWithEngine strips the prefix internally after
-				// resolving the provider. Stripping here would send a bare
-				// model name to the router, which has no match and falls
-				// back to the raw engine.LLM with an empty model — the
-				// Anthropic API then returns 404 with `model: <nil>`.
 				effectiveModel := model
 				if effectiveModel == "" {
 					effectiveModel = r.modelName
 				}
-				subs = append(subs, ab.Subagent{
-					ID:           id,
-					Task:         task,
-					Engine:       subEngine,
-					Mode:         strings.TrimSpace(asString(m["mode"])),
-					MaxTurns:     maxTurns,
-					Timeout:      timeout,
-					SystemPrompt: systemPrompt,
-					Model:        effectiveModel,
+				// Synthetic agent: ad-hoc task with the supplied prompt.
+				ag := &ab.Agent{
+					Type:        id,
+					Description: task,
+					Body:        systemPrompt,
+					Model:       effectiveModel,
+					MaxTurns:    maxTurns,
+					Source:      ab.AgentSourceFilesystem,
+				}
+				subs = append(subs, ab.AgentInvocation{
+					Agent:       ag,
+					Description: task,
+					Prompt:      task,
+					MaxTurns:    maxTurns,
+					Model:       effectiveModel,
 				})
 			}
 
-			results := ab.RunSubagentsInParallel(ctx, subs)
+			results := ab.RunAgentsInParallel(ctx, subEngine, subs, 4, r.modelName)
 
 			// Build LLM-friendly summary: keep it compact, surface errors clearly.
 			summaries := make([]map[string]any, 0, len(results))
@@ -603,7 +632,7 @@ func (r *agentRuntime) newSubagentDispatchTool() *ab.Tool {
 					continue
 				}
 				entry := map[string]any{
-					"id":          res.ID,
+					"id":          res.Type,
 					"task":        res.Task,
 					"output":      truncate(res.Output, 2000),
 					"turns":       res.Turns,

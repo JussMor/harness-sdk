@@ -768,32 +768,32 @@ func (a *BackendChatApp) handleStream(w http.ResponseWriter, r *http.Request, ch
 				sseWrite(eventName, string(d))
 			}
 
-		case ab.StreamEventSubagentResult:
-			if ev.SubagentResult != nil {
+		case ab.StreamEventAgentResult:
+			if ev.AgentResult != nil {
 				errMsg := ""
-				if ev.SubagentResult.Error != nil {
-					errMsg = ev.SubagentResult.Error.Error()
+				if ev.AgentResult.Error != nil {
+					errMsg = ev.AgentResult.Error.Error()
 				}
 				payload := map[string]any{
-					"id":            ev.SubagentResult.ID,
-					"task":          ev.SubagentResult.Task,
-					"output":        ev.SubagentResult.Output,
-					"turns":         ev.SubagentResult.Turns,
-					"stop_reason":   ev.SubagentResult.StopReason,
-					"duration_ms":   ev.SubagentResult.Duration.Milliseconds(),
+					"type":          ev.AgentResult.Type,
+					"description":   ev.AgentResult.Description,
+					"task":          ev.AgentResult.Task,
+					"output":        ev.AgentResult.Output,
+					"turns":         ev.AgentResult.Turns,
+					"stop_reason":   ev.AgentResult.StopReason,
+					"duration_ms":   ev.AgentResult.Duration.Milliseconds(),
 					"error":         errMsg,
 				}
-				// Include model and system_prompt when set — frontend uses them for display
-				if ev.SubagentResult.Model != "" {
-					payload["model"] = ev.SubagentResult.Model
+				if ev.AgentResult.Model != "" {
+					payload["model"] = ev.AgentResult.Model
 				}
-				if ev.SubagentResult.SystemPrompt != "" {
-					payload["system_prompt"] = ev.SubagentResult.SystemPrompt
+				if ev.AgentResult.SystemPrompt != "" {
+					payload["system_prompt"] = ev.AgentResult.SystemPrompt
 				}
 				d, _ := json.Marshal(payload)
-				sseWrite("subagent_result", string(d))
-				log.Printf("stream.subagent_result chat_id=%d run_id=%s agent_id=%s turns=%d",
-					chatID, runID, ev.SubagentResult.ID, ev.SubagentResult.Turns)
+				sseWrite("agent_result", string(d))
+				log.Printf("stream.agent_result chat_id=%d run_id=%s type=%s turns=%d",
+					chatID, runID, ev.AgentResult.Type, ev.AgentResult.Turns)
 			}
 
 		case ab.StreamEventDone:

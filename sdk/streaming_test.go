@@ -4,7 +4,6 @@ import (
 	"context"
 	"sync"
 	"testing"
-	"time"
 )
 
 // captureModelLLM records every model it receives in Chat calls.
@@ -42,26 +41,25 @@ func TestWithModel(t *testing.T) {
 	}
 }
 
-// TestSubagentModelReachesProvider creates a Subagent with a Model, runs it,
-// and verifies the model arrives at the LLM provider.
-func TestSubagentModelReachesProvider(t *testing.T) {
+// TestAgentModelReachesProvider creates an Agent invocation with a Model,
+// runs it, and verifies the model arrives at the LLM provider.
+func TestAgentModelReachesProvider(t *testing.T) {
 	llm := &captureModelLLM{}
 	engine := New(WithLLM(llm))
 
-	sub := Subagent{
-		ID:       "direct",
-		Task:     "Test task",
-		Engine:   engine,
+	ag := &Agent{
+		Type:     "direct",
+		Body:     "Test task",
 		Model:    "claude-haiku-4-5-20251001",
 		MaxTurns: 1,
-		Timeout:  5 * time.Second,
+		Source:   AgentSourceFilesystem,
 	}
 
 	ctx := context.Background()
-	result := sub.Run(ctx)
+	result := runAgentInner(ctx, engine, ag, "test", "Test task", 1, "")
 
 	if result.Error != nil {
-		t.Fatalf("subagent error: %v", result.Error)
+		t.Fatalf("agent error: %v", result.Error)
 	}
 	if result.Model != "claude-haiku-4-5-20251001" {
 		t.Errorf("result.Model = %q, want %q", result.Model, "claude-haiku-4-5-20251001")

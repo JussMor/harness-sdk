@@ -24,8 +24,8 @@ type StreamEvent struct {
 	// ToolResult is set when Type=StreamEventToolResult.
 	ToolResult *ToolResult `json:"tool_result,omitempty"`
 
-	// SubagentResult is set when Type=StreamEventSubagentResult.
-	SubagentResult *SubagentResult `json:"subagent_result,omitempty"`
+	// AgentResult is set when Type=StreamEventAgentResult.
+	AgentResult *AgentResult `json:"agent_result,omitempty"`
 
 	// Interrupt is set when Type=StreamEventInterruptRequired or
 	// Type=StreamEventInterruptResolved. Discriminate sub-variants on Kind.
@@ -81,9 +81,10 @@ const (
 	// (one request/response cycle within the agent loop).
 	StreamEventTurnComplete StreamEventType = "turn_complete"
 
-	// StreamEventSubagentResult fires once per subagent as they complete.
-	// Consumers can stream partial results to the user as each parallel task finishes.
-	StreamEventSubagentResult StreamEventType = "subagent_result"
+	// StreamEventAgentResult fires once per spawned Agent as it completes.
+	// Consumers can stream partial results to the user as each parallel
+	// Agent invocation finishes.
+	StreamEventAgentResult StreamEventType = "agent_result"
 
 	// StreamEventDone fires once when the entire agent loop has finished.
 	// Final field is populated.
