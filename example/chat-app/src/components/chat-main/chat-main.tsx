@@ -34,7 +34,6 @@ import {
   Square,
   ThumbsDown,
   ThumbsUp,
-  User,
 } from "lucide-react"
 import { useCallback, useEffect, useMemo, useRef, useState } from "react"
 import ReactMarkdown from "react-markdown"
@@ -777,19 +776,33 @@ export function ChatMain({
       className={`chat-main-root ${activeArtifact || canvasComponent ? "chat-main-root--with-canvas" : ""}`}
     >
       <div className="chat-main-panel">
-        {showGreeting && messages.length === 0 && (
-          <header className="chat-main-greeting">
-            <p className="chat-main-badge">
+        <header className="chat-main-header">
+          <span className="chat-main-header-title">
+            {activeChatID ? `Chat #${activeChatID}` : "New Chat"}
+          </span>
+          <span className="chat-main-header-sub">{selectedMode}</span>
+          <button
+            type="button"
+            title={
+              hilEnabled
+                ? "Human-in-the-loop ON — click to disable"
+                : "Human-in-the-loop OFF — click to enable"
+            }
+            onClick={() => setHilEnabled((v) => !v)}
+            disabled={isStreaming}
+            className={`chat-hil-toggle ${hilEnabled ? "chat-hil-toggle--on" : ""}`}
+          >
+            {hilEnabled ? <ShieldAlert size={14} /> : <Shield size={14} />}
+          </button>
+          <div className="chat-main-status">
+            {isStreaming ? (
+              <LoaderCircle className="spin" size={14} />
+            ) : (
               <Sparkles size={14} />
-              Stream Runtime Ready
-            </p>
-            <h1>Hola {userName}, el backend ya esta conectado con SSE real.</h1>
-            <p>
-              Crea un chat, elige provider y modo, y mira deltas + eventos de
-              tools en tiempo real.
-            </p>
-          </header>
-        )}
+            )}
+            <span>{statusText}</span>
+          </div>
+        </header>
 
         <div className="chat-main-toolbar">
           <select
@@ -822,35 +835,11 @@ export function ChatMain({
             )}
           </select>
 
-          <div className="chat-main-status">
-            {isStreaming ? (
-              <LoaderCircle className="spin" size={14} />
-            ) : (
-              <Sparkles size={14} />
-            )}
-            <span>{statusText}</span>
-            {allArtifacts.length > 0 && (
-              <span className="chat-main-artifact-count">
-                {allArtifacts.length} artifact
-                {allArtifacts.length > 1 ? "s" : ""}
-              </span>
-            )}
-          </div>
-
-          <button
-            type="button"
-            title={
-              hilEnabled
-                ? "Human-in-the-loop ON — click to disable"
-                : "Human-in-the-loop OFF — click to enable"
-            }
-            onClick={() => setHilEnabled((v) => !v)}
-            disabled={isStreaming}
-            className={`chat-hil-toggle ${hilEnabled ? "chat-hil-toggle--on" : ""}`}
-          >
-            {hilEnabled ? <ShieldAlert size={14} /> : <Shield size={14} />}
-            <span>{hilEnabled ? "HIL on" : "HIL off"}</span>
-          </button>
+          {allArtifacts.length > 0 && (
+            <span className="chat-main-artifact-count">
+              {allArtifacts.length} artifact{allArtifacts.length > 1 ? "s" : ""}
+            </span>
+          )}
         </div>
 
         {pendingInterrupt && (
@@ -872,14 +861,19 @@ export function ChatMain({
           />
         )}
 
-        {
-          componentArtifacts.filter(
-            (a) => (a.placement ?? "canvas") === "canvas"
-          ).length > 0 && null /* canvas components rendered in side panel */
-        }
-
         <div className="chat-main-grid">
           <div className="chat-main-feed">
+            {showGreeting && messages.length === 0 && (
+              <div className="chat-main-greeting">
+                <p className="chat-main-badge">
+                  <Sparkles size={14} />
+                  Stream Runtime Ready
+                </p>
+                <h1>Hello, {userName}</h1>
+                <p>Choose a mode and provider above, then start a conversation.</p>
+              </div>
+            )}
+
             {messages.map((message) => (
               <article
                 key={message.id}
@@ -889,69 +883,68 @@ export function ChatMain({
                     : "chat-bubble-user"
                 }`}
               >
-                <div className="chat-bubble-meta">
-                  {message.role === "assistant" ? (
-                    <Bot size={14} />
-                  ) : (
-                    <User size={14} />
-                  )}
-                  <span>
-                    {message.role === "assistant"
-                      ? message.model || "assistant"
-                      : "you"}
-                  </span>
-                  {message.pending && (
-                    <LoaderCircle className="spin" size={13} />
-                  )}
-                </div>
-                {message.traces && message.traces.length > 0 && (
-                  <div className="chat-bubble-traces">
-                    {message.traces.map((trace) => (
-                      <ToolTraceCard key={trace.id} trace={trace} />
-                    ))}
+                {message.role === "user" ? (
+                  <div className="chat-bubble-user-inner">
+                    <MessageContent message={message} />
                   </div>
+                ) : (
+                  <>
+                    <div className="chat-bubble-meta">
+                      <Bot size={14} />
+                      <span>{message.model || "assistant"}</span>
+                      {message.pending && (
+                        <LoaderCircle className="spin" size={13} />
+                      )}
+                    </div>
+                    {message.traces && message.traces.length > 0 && (
+                      <div className="chat-bubble-traces">
+                        {message.traces.map((trace) => (
+                          <ToolTraceCard key={trace.id} trace={trace} />
+                        ))}
+                      </div>
+                    )}
+                    {message.plan && (
+                      <PlanBlock
+                        plan={message.plan}
+                        defaultOpen={!!message.pending}
+                      />
+                    )}
+                    {message.subagentResults &&
+                      message.subagentResults.length > 0 && (
+                        <SubagentResultsBlock
+                          results={message.subagentResults}
+                          defaultOpen={!!message.pending}
+                        />
+                      )}
+                    {message.thinking && (
+                      <ThinkingBlock
+                        content={message.thinking}
+                        isStreaming={!!message.pending}
+                      />
+                    )}
+                    <MessageContent message={message} />
+                    {message.role === "assistant" &&
+                      !message.pending &&
+                      !isStreaming && (
+                        <MessageActions
+                          content={message.content}
+                          onRetry={() => {
+                            const idx = messages.findIndex(
+                              (m) => m.id === message.id
+                            )
+                            const prev = messages
+                              .slice(0, idx)
+                              .reverse()
+                              .find((m) => m.role === "user")
+                            if (prev) {
+                              setInput(prev.content)
+                              setTimeout(() => void sendPrompt(), 0)
+                            }
+                          }}
+                        />
+                      )}
+                  </>
                 )}
-                {message.plan && (
-                  <PlanBlock
-                    plan={message.plan}
-                    defaultOpen={!!message.pending}
-                  />
-                )}
-                {message.subagentResults &&
-                  message.subagentResults.length > 0 && (
-                    <SubagentResultsBlock
-                      results={message.subagentResults}
-                      defaultOpen={!!message.pending}
-                    />
-                  )}
-                {message.thinking && (
-                  <ThinkingBlock
-                    content={message.thinking}
-                    isStreaming={!!message.pending}
-                  />
-                )}
-                <MessageContent message={message} />
-                {/* Actions row — only for complete assistant messages */}
-                {message.role === "assistant" &&
-                  !message.pending &&
-                  !isStreaming && (
-                    <MessageActions
-                      content={message.content}
-                      onRetry={() => {
-                        const idx = messages.findIndex(
-                          (m) => m.id === message.id
-                        )
-                        const prev = messages
-                          .slice(0, idx)
-                          .reverse()
-                          .find((m) => m.role === "user")
-                        if (prev) {
-                          setInput(prev.content)
-                          setTimeout(() => void sendPrompt(), 0)
-                        }
-                      }}
-                    />
-                  )}
               </article>
             ))}
 
@@ -969,26 +962,6 @@ export function ChatMain({
                   />
                 </div>
               ))}
-
-            <div ref={listEndRef} />
-          </div>
-
-          <aside className="chat-main-events">
-            <h2>Live Events</h2>
-            {timeline.length === 0 && allArtifacts.length === 0 ? (
-              <p className="chat-empty-events">
-                Tool calls and stream milestones appear here.
-              </p>
-            ) : (
-              timeline.map((event) => (
-                <p
-                  key={event.id}
-                  className={`chat-event chat-event-${event.level}`}
-                >
-                  {event.text}
-                </p>
-              ))
-            )}
 
             {allArtifacts.length > 0 && (
               <div className="chat-artifacts-list">
@@ -1013,43 +986,46 @@ export function ChatMain({
                 ))}
               </div>
             )}
-          </aside>
+
+            <div ref={listEndRef} />
+          </div>
         </div>
 
         <footer className="chat-main-input-wrap">
-          <textarea
-            value={input}
-            onChange={(event) => setInput(event.target.value)}
-            onKeyDown={(event) => {
-              if (event.key === "Enter" && !event.shiftKey) {
-                event.preventDefault()
-                void sendPrompt()
-              }
-            }}
-            className="chat-main-textarea"
-            placeholder="Escribe tu prompt. Enter para enviar, Shift+Enter para nueva linea"
-            disabled={isStreaming}
-          />
-
-          <div className="chat-main-actions">
-            <button
-              type="button"
-              className="chat-btn chat-btn-primary"
-              onClick={() => void sendPrompt()}
-              disabled={!input.trim() || isStreaming}
-            >
-              <SendHorizontal size={15} />
-              Send
-            </button>
-            <button
-              type="button"
-              className="chat-btn chat-btn-muted"
-              onClick={stopStream}
-              disabled={!isStreaming}
-            >
-              <Square size={13} />
-              Stop
-            </button>
+          <div className="chat-main-textarea-wrap">
+            <textarea
+              value={input}
+              onChange={(event) => setInput(event.target.value)}
+              onKeyDown={(event) => {
+                if (event.key === "Enter" && !event.shiftKey) {
+                  event.preventDefault()
+                  void sendPrompt()
+                }
+              }}
+              className="chat-main-textarea"
+              placeholder="Message… (Enter to send, Shift+Enter for new line)"
+              disabled={isStreaming}
+            />
+            <div className="chat-main-actions">
+              <button
+                type="button"
+                className="chat-btn chat-btn-muted"
+                onClick={stopStream}
+                disabled={!isStreaming}
+              >
+                <Square size={13} />
+                Stop
+              </button>
+              <button
+                type="button"
+                className="chat-btn chat-btn-primary"
+                onClick={() => void sendPrompt()}
+                disabled={!input.trim() || isStreaming}
+              >
+                <SendHorizontal size={15} />
+                Send
+              </button>
+            </div>
           </div>
         </footer>
       </div>
