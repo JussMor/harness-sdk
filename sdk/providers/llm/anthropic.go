@@ -510,6 +510,9 @@ func (a *Anthropic) ChatStream(ctx context.Context, req autobuild.ChatRequest) (
 	if model == "" {
 		model = a.DefaultModel
 	}
+	if model == "" {
+		return nil, fmt.Errorf("anthropic: model not specified (set req.Model or DefaultModel)")
+	}
 
 	maxTokens := a.MaxTokens
 	if maxTokens <= 0 {

@@ -18,6 +18,7 @@ import (
 // agentRuntime wires the SDK Engine + Runtime for a single request.
 type agentRuntime struct {
 	chatID         int64
+	modelName      string // effective model for this run (e.g. "anthropic/claude-haiku-4-5-20251001")
 	tools          *ab.ToolRegistry
 	engine         *ab.Engine
 	runtime        *ab.Runtime
@@ -449,6 +450,15 @@ func (r *agentRuntime) newSubagentDispatchTool() *ab.Tool {
 				model := strings.TrimSpace(asString(m["model"]))
 				allowWrites, _ := m["allow_memory_writes"].(bool)
 
+				// Strip routing prefix so the Anthropic provider always receives
+				// a bare model name (e.g. "claude-haiku-4-5-20251001", not "anthropic/...").
+				effectiveModel := model
+				if effectiveModel == "" {
+					effectiveModel = r.modelName
+				}
+				if _, modelOnly := ab.ParseModelRef(effectiveModel); modelOnly != "" {
+					effectiveModel = modelOnly
+				}
 				subs = append(subs, ab.Subagent{
 					ID:                id,
 					Task:              task,
@@ -457,7 +467,7 @@ func (r *agentRuntime) newSubagentDispatchTool() *ab.Tool {
 					MaxTurns:          maxTurns,
 					Timeout:           timeout,
 					SystemPrompt:      systemPrompt,
-					Model:             model,
+					Model:             effectiveModel,
 					AllowMemoryWrites: allowWrites,
 				})
 			}

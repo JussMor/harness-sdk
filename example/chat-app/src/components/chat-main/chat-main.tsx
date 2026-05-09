@@ -177,7 +177,11 @@ export function ChatMain({
   )
 
   const syncMessages = useCallback(
-    async (targetChatID: number, signal?: AbortSignal) => {
+    async (
+      targetChatID: number,
+      signal?: AbortSignal,
+      finalizedAssistantId?: string
+    ) => {
       const payload = await api.listMessages(targetChatID, signal)
       const next = payload.map(toChatMessage)
 
@@ -190,23 +194,21 @@ export function ChatMain({
       setMessages((prev) => {
         const prevMap = new Map(prev.map((m) => [m.id, m]))
 
-        // Find the latest prev assistant message carrying streaming-only data.
-        let latestStreamFields:
-          | Pick<ChatMessage, "plan" | "subagentResults">
-          | undefined
-        for (let i = prev.length - 1; i >= 0; i--) {
-          const m = prev[i]
-          if (
-            m.role === "assistant" &&
-            (m.plan || (m.subagentResults && m.subagentResults.length > 0))
-          ) {
-            latestStreamFields = {
-              plan: m.plan,
-              subagentResults: m.subagentResults,
-            }
-            break
-          }
-        }
+        // Only carry streaming-only fields from the assistant message that
+        // belongs to the run we're finalizing right now.
+        const source = finalizedAssistantId
+          ? prev.find((m) => m.id === finalizedAssistantId)
+          : undefined
+        const streamFields =
+          source &&
+          source.role === "assistant" &&
+          (source.plan ||
+            (source.subagentResults && source.subagentResults.length > 0))
+            ? {
+                plan: source.plan,
+                subagentResults: source.subagentResults,
+              }
+            : undefined
 
         // Index of the last assistant message in next.
         let lastAssistantIdx = -1
@@ -228,8 +230,8 @@ export function ChatMain({
             }
           }
           // Graft streaming-only fields onto the freshly-persisted assistant message.
-          if (idx === lastAssistantIdx && latestStreamFields) {
-            return { ...m, ...latestStreamFields }
+          if (idx === lastAssistantIdx && streamFields) {
+            return { ...m, ...streamFields }
           }
           return m
         })
@@ -489,6 +491,11 @@ export function ChatMain({
         return
       }
 
+      if (event.type === "turn_complete") {
+        pushTimeline("LLM turn complete — dispatching tools", "info")
+        return
+      }
+
       if (event.type === "sandbox_output") {
         // Rich sandbox output (HTML, image, etc.) — show in canvas
         const data = event.data
@@ -574,59 +581,55 @@ export function ChatMain({
         return
       }
 
-      if (event.type === "confirmation_required") {
-        // Legacy event — wrap into the new InterruptRequest shape so the
-        // UI only needs to know about one HIL surface.
-        pushTimeline(`Awaiting approval: ${event.data.tool}`, "info")
-        setPendingInterrupt({
-          id: event.data.id,
-          kind: "approval",
-          reason: event.data.reason,
-          approval: {
-            tool_call: {
-              name: event.data.tool,
-              args: safeParseArgs(event.data.args),
-            },
-          },
-        })
-        return
-      }
-
-      if (event.type === "confirmation_resolved") {
-        pushTimeline(
-          `${event.data.approved ? "Approved" : "Rejected"}: ${event.data.tool}`,
-          event.data.approved ? "success" : "error"
-        )
-        setPendingInterrupt(null)
-        return
-      }
-
       if (
         event.type === "artifact_created" ||
         event.type === "artifact_updated"
       ) {
         const a = event.data
-        if (a.kind !== "component") return
-        const placement = a.placement ?? "canvas"
-        if (placement === "canvas") {
-          // Mount in the dedicated side panel; close any open file canvas
-          // so the two surfaces don't fight for the same slot.
-          setCanvasComponent(a)
-          setActiveArtifact(null)
-          setIsArtifactStreaming(false)
-        } else {
-          setComponentArtifacts((prev) => {
-            const idx = prev.findIndex((x) => x.id === a.id)
-            if (idx === -1) return [...prev, a]
+        if (a.kind === "component") {
+          const placement = a.placement ?? "canvas"
+          if (placement === "canvas") {
+            // Mount in the dedicated side panel; close any open file canvas
+            // so the two surfaces don't fight for the same slot.
+            setCanvasComponent(a)
+            setActiveArtifact(null)
+            setIsArtifactStreaming(false)
+          } else {
+            setComponentArtifacts((prev) => {
+              const idx = prev.findIndex((x) => x.id === a.id)
+              if (idx === -1) return [...prev, a]
+              const next = prev.slice()
+              next[idx] = a
+              return next
+            })
+          }
+          pushTimeline(
+            `Rendered ${a.component?.name ?? "component"} (${placement})`,
+            "info"
+          )
+        } else if (a.kind === "file" && a.file) {
+          // File artifact — show in the artifact canvas
+          const fileArt: Artifact = {
+            id: a.id,
+            language: a.file.language ?? "",
+            content: a.file.content ?? "",
+            complete: true,
+            title: a.file.title ?? a.file.path ?? "Untitled",
+          }
+          setActiveArtifact(fileArt)
+          setAllArtifacts((prev) => {
+            const idx = prev.findIndex((x) => x.id === fileArt.id)
+            if (idx === -1) return [...prev, fileArt]
             const next = prev.slice()
-            next[idx] = a
+            next[idx] = fileArt
             return next
           })
+          setIsArtifactStreaming(false)
+          pushTimeline(
+            `File artifact: ${a.file.title ?? a.file.path ?? "file"}`,
+            "info"
+          )
         }
-        pushTimeline(
-          `Rendered ${a.component?.name ?? "component"} (${placement})`,
-          "info"
-        )
         return
       }
 
@@ -704,7 +707,7 @@ export function ChatMain({
         controller.signal
       )
 
-      await syncMessages(targetChatID)
+      await syncMessages(targetChatID, undefined, assistantMessageID)
       onChatsChanged?.()
       setStatusText("Completed")
 
@@ -845,11 +848,10 @@ export function ChatMain({
             onResolve={async (response) => {
               if (!chatID) return
               try {
-                await api.confirm(
-                  chatID,
+                await api.resolveInterrupt(
                   pendingInterrupt.id,
-                  response.approved ?? false,
-                  response.modifiedArgs
+                  chatID,
+                  response
                 )
               } finally {
                 setPendingInterrupt(null)
@@ -1498,15 +1500,4 @@ function SubagentResultCard({ result }: { result: StreamSubagentResult }) {
 function formatDurationMs(ms: number): string {
   if (ms < 1000) return `${ms}ms`
   return `${(ms / 1000).toFixed(1)}s`
-}
-
-function safeParseArgs(raw: string): Record<string, unknown> | undefined {
-  try {
-    const v = JSON.parse(raw)
-    return typeof v === "object" && v !== null
-      ? (v as Record<string, unknown>)
-      : undefined
-  } catch {
-    return undefined
-  }
 }

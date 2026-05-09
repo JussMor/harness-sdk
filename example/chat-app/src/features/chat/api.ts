@@ -227,37 +227,9 @@ export class ChatAPI {
     })
   }
 
-  // ── Human-in-the-loop ────────────────────────────────────────────────────────
-
-  /**
-   * Deliver a human approval or rejection to a paused agent loop.
-   * @param chatId    The chat whose agent is waiting.
-   * @param id        The ApprovalRequest.id from the confirmation_required event.
-   * @param approved  true to allow the tool call, false to reject.
-   * @param modifiedArgs  Optional JSON string to override tool arguments.
-   */
-  async confirm(
-    chatId: number,
-    id: string,
-    approved: boolean,
-    modifiedArgs?: string
-  ): Promise<void> {
-    await fetch(`${this.baseURL}/api/confirm`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        chat_id: chatId,
-        id,
-        approved,
-        modified_args: modifiedArgs ?? "",
-      }),
-    })
-  }
-
   /**
    * Resolve a generic interrupt (approval/question/form_input) using a
-   * resolution token issued by the backend. Supersedes confirm() for the
-   * new interrupt-based HIL flow but both endpoints coexist.
+   * resolution token issued by the backend.
    */
   async resolveInterrupt(
     token: string,
@@ -301,6 +273,8 @@ function adaptSSEEvent(type: string, dataText: string): StreamEvent | null {
       return { type: "delta", data: parsed as { delta?: string } }
     case "thinking":
       return { type: "thinking", data: parsed as { thinking?: string } }
+    case "turn_complete":
+      return { type: "turn_complete", data: {} }
     case "tool_call":
       return {
         type: "tool_call",
@@ -317,16 +291,26 @@ function adaptSSEEvent(type: string, dataText: string): StreamEvent | null {
         data: parsed as Record<string, unknown>,
       }
     case "artifact":
+      // Legacy: backend now emits file artifacts as "artifact_created"
+      // with the unified SDK Artifact shape. Map for backward compat.
       return {
-        type: "artifact",
-        data: parsed as {
-          id: string
-          language: string
-          title: string
-          version: number
-          content: string
-          r2Url?: string
-        },
+        type: "artifact_created",
+        data: {
+          id: (parsed as Record<string, unknown>).id as string,
+          kind: "file" as const,
+          placement: "canvas" as const,
+          file: {
+            title: (parsed as Record<string, unknown>).title as string,
+            language: (parsed as Record<string, unknown>).language as string,
+            content: (parsed as Record<string, unknown>).content as string,
+            url: (parsed as Record<string, unknown>).r2Url as
+              | string
+              | undefined,
+            version: (parsed as Record<string, unknown>).version as
+              | number
+              | undefined,
+          },
+        } satisfies import("./types").StreamComponentArtifact,
       }
     case "plan_proposed":
       return {
@@ -357,21 +341,6 @@ function adaptSSEEvent(type: string, dataText: string): StreamEvent | null {
           error?: string
         },
       }
-    case "confirmation_required":
-      return {
-        type: "confirmation_required",
-        data: parsed as {
-          id: string
-          tool: string
-          args: string
-          reason: string
-        },
-      }
-    case "confirmation_resolved":
-      return {
-        type: "confirmation_resolved",
-        data: parsed as { id: string; tool: string; approved: boolean },
-      }
     case "interrupt_required":
       return {
         type: "interrupt_required",
@@ -380,7 +349,7 @@ function adaptSSEEvent(type: string, dataText: string): StreamEvent | null {
     case "interrupt_resolved":
       return {
         type: "interrupt_resolved",
-        data: parsed as import("./types").StreamInterruptRequest,
+        data: parsed as { id: string; kind: string; approved?: boolean },
       }
     case "artifact_created":
       return {

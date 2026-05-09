@@ -49,8 +49,19 @@ func newModeEngineWithDB(provider ab.LLMProvider, model string, logContext Runti
 		memRoots = ab.DefaultMemoryRoots
 	}
 
+	// Strip routing prefix from model for providers that need a bare model name
+	// (e.g. "anthropic/claude-haiku-4-5-20251001" → "claude-haiku-4-5-20251001").
+	// The RoutedLLMProvider handles routing via the prefix; internal SDK components
+	// like EpisodicCompactor, InferredMemoryWriter, LLMPlanner call Chat() directly
+	// and must receive only the bare name.
+	bareModel := model
+	if _, modelOnly := ab.ParseModelRef(model); modelOnly != "" {
+		bareModel = modelOnly
+	}
+
 	rt := &agentRuntime{
 		chatID:      logContext.ChatID,
+		modelName:   model,
 		skills:      skills,
 		memory:      memory,
 		checkpoints: &checkpointStore{},
@@ -108,6 +119,7 @@ func newModeEngineWithDB(provider ab.LLMProvider, model string, logContext Runti
 	// ── Runtime with every capability wired ──
 	runtime := ab.NewRuntime(engine).
 		WithMode(logContext.Mode).
+		WithModel(bareModel).
 		// Memory roots: labeled dirs matching Claude's profile/facts/project structure
 		WithMemoryRoots(memRoots...).
 		// Memory token cap: prevent enormous memory from overflowing context
@@ -130,7 +142,7 @@ func newModeEngineWithDB(provider ab.LLMProvider, model string, logContext Runti
 		// Compaction: episodic with differential scoring (pre-filters low-importance msgs)
 		WithCompactor(&ab.EpisodicCompactor{
 			Provider:            provider,
-			Model:               model,
+			Model:               bareModel,
 			MaxWords:            400,
 			ImportanceThreshold: 0.25,
 			EpisodeThreshold:    0.65,
@@ -140,20 +152,20 @@ func newModeEngineWithDB(provider ab.LLMProvider, model string, logContext Runti
 		// Memory inference: extract persistent facts, deduplicated
 		WithMemoryWriter(&ab.InferredMemoryWriter{
 			Provider:        provider,
-			Model:           model,
+			Model:           bareModel,
 			MaxFacts:        3,
 			MinConfidence:   0.75,
 			DedupeThreshold: 0.6,
 		}).
 		// Planning: LLM-driven decision + executable DAG proposal
-		WithPlanner(&ab.LLMPlanner{Provider: provider, Model: model, MaxExecutables: 6}).
+		WithPlanner(&ab.LLMPlanner{Provider: provider, Model: bareModel, MaxExecutables: 6}).
 		WithAutoApprovePlan(true).
 		// Extended thinking for deep-work mode
 		WithThinkingBudget(resolveThinkingBudget(logContext.Mode)).
 		// Session context: inject time every turn
 		WithSessionContext(ab.LocalTimeSessionContext()).
 		// Tokenizer: auto-selects per model (gpt-4o→O200K, gpt-4→CL100K, claude→heuristic)
-		WithTokenizer(sdktokenizers.NewAutoForModel(model)).
+		WithTokenizer(sdktokenizers.NewAutoForModel(bareModel)).
 		// Persistence: SQLite conversation store
 		WithConversationStore(convStore).
 		// Wellbeing detection
@@ -256,7 +268,11 @@ When the user asks to **display, show, render, or visualize** a domain UI (e.g. 
 
 When you need **structured input from the user that's better collected through a UI than a free-form question** (dates, picks, multi-field forms), call ` + "`await_component_input`" + ` instead. That tool renders the component AND pauses you until the user submits — its result is the user's data as JSON, which you reason against on the next turn.
 
+When you determine that collecting structured user input is useful, you may use ` + "`QuestionnaireForm`" + ` and design/order the questions in the way that best fits the user's objective. Use ` + "`type: single|multi|text`" + ` and provide ` + "`options`" + ` whenever choices are helpful.
+
 Use ` + "`file_write`" + ` only when the user explicitly asks for source code, scripts, or document files they want to download or edit.
+
+**When a tool call is rejected by the user (HIL):** stop, acknowledge briefly, and ASK what they want to do instead. Do NOT dump the rejected content into the chat as a fenced code block, do NOT retry the same write under a different filename, and do NOT bypass the rejection by emitting the same content inline. The user's rejection is final until they ask for a different action.
 
 The **dispatch-subagents** tool lets you spawn parallel sub-agents for independent tasks. Each subagent runs its own focused agent loop and returns a structured result. Use it for fan-out work: multiple independent research tasks, creating multiple files in parallel, or validating from multiple angles simultaneously.
 

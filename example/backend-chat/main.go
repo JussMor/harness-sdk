@@ -76,7 +76,6 @@ func main() {
 	mux.HandleFunc("/api/providers", app.handleProviders)
 	mux.HandleFunc("/api/chats", app.handleChats)
 	mux.HandleFunc("/api/chats/", app.handleChatRoutes)
-	mux.HandleFunc("/api/confirm", app.handleConfirm)
 	mux.HandleFunc("/api/webhooks", app.handleWebhooks)
 	mux.HandleFunc("/api/webhooks/", app.handleWebhookByID)
 	mux.HandleFunc("/api/interrupts/", app.handleInterruptResolve)
@@ -170,10 +169,19 @@ func (a *BackendChatApp) handleEval(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// isSandboxOutput returns true for tools that produce rich sandbox outputs.
-func isSandboxOutput(toolName string) bool {
-	switch toolName {
-	case "bash", "code_interpreter", "file_write", "file_read":
+// isSandboxOutput returns true for tools whose category is compute or workspace
+// (sandbox-backed tools that may produce rich outputs). Uses the ToolRegistry
+// to avoid hardcoding tool names.
+func isSandboxOutput(toolName string, registry *ab.ToolRegistry) bool {
+	if registry == nil {
+		return false
+	}
+	tool := registry.Get(toolName)
+	if tool == nil {
+		return false
+	}
+	switch tool.Category {
+	case ab.ToolCategoryCompute, ab.ToolCategoryWorkspace:
 		return true
 	}
 	return false
@@ -489,19 +497,18 @@ func (a *BackendChatApp) handleStream(w http.ResponseWriter, r *http.Request, ch
 		return
 	}
 
-	// Human-in-the-loop: wire approval gate when requested. Whether HIL is on
-	// or off we always register an ApprovalGate so its inner InterruptGate
-	// can be used by tools that need user input (e.g. `await_component_input`)
-	// regardless of the safety policy. When HIL is off we install a no-op
-	// policy so no tool call ever pauses for approval.
-	policy := func(ab.ToolCallEntry) (bool, string) { return false, "" }
+	// Interrupts: always wire an InterruptGate so tools like await_component_input
+	// can pause and ask for user input. When HIL is enabled, also prepend a
+	// HumanApprovalFilter that requires approval for dangerous tool calls.
+	gate := ab.NewInterruptGate(8)
+	agentRT.runtime = agentRT.runtime.WithInterrupts(gate)
 	if req.HumanInLoop {
-		policy = ab.DefaultApprovalPolicy
+		_, agentRT.runtime = agentRT.runtime.WithHumanApproval(ab.DefaultApprovalPolicy)
 	}
-	gate, updatedRuntime := agentRT.runtime.WithHumanApproval(policy)
-	agentRT.runtime = updatedRuntime
-	hilRegistry.Register(chatID, gate)
-	defer hilRegistry.Unregister(chatID)
+	// Register the runtime's actual gate — WithHumanApproval may have replaced
+	// the original gate with its own internal one.
+	ensureInterruptRegistry().Register(chatID, agentRT.runtime.InterruptGate())
+	defer ensureInterruptRegistry().Unregister(chatID)
 
 	conv, err := LoadOrCreateConversation(ctx, agentRT.convStore, chatID, history)
 	if err != nil {
@@ -545,25 +552,23 @@ func (a *BackendChatApp) handleStream(w http.ResponseWriter, r *http.Request, ch
 				sseWrite("thinking", string(d))
 			}
 
-		case ab.StreamEventConfirmationRequired:
-			if ev.ConfirmationRequest != nil {
-				d, _ := json.Marshal(map[string]any{
-					"id":     ev.ConfirmationRequest.ID,
-					"tool":   ev.ConfirmationRequest.ToolCall.Name,
-					"args":   ev.ConfirmationRequest.ToolCall.Arguments,
-					"reason": ev.ConfirmationRequest.Reason,
-				})
-				sseWrite("confirmation_required", string(d))
+		case ab.StreamEventTurnComplete:
+			sseWrite("turn_complete", "{}")
+
+		case ab.StreamEventInterruptRequired:
+			if ev.Interrupt != nil {
+				d, _ := json.Marshal(ev.Interrupt)
+				sseWrite("interrupt_required", string(d))
 			}
 
-		case ab.StreamEventConfirmationResolved:
-			if ev.ConfirmationRequest != nil {
+		case ab.StreamEventInterruptResolved:
+			if ev.Interrupt != nil {
 				d, _ := json.Marshal(map[string]any{
-					"id":      ev.ConfirmationRequest.ID,
-					"tool":    ev.ConfirmationRequest.ToolCall.Name,
+					"id":       ev.Interrupt.ID,
+					"kind":     string(ev.Interrupt.Kind),
 					"approved": true,
 				})
-				sseWrite("confirmation_resolved", string(d))
+				sseWrite("interrupt_resolved", string(d))
 			}
 
 		case ab.StreamEventToolCall:
@@ -638,7 +643,7 @@ func (a *BackendChatApp) handleStream(w http.ResponseWriter, r *http.Request, ch
 				_ = lastToolCall // used above
 
 				// For sandbox tools, emit structured sandbox_output event
-				if isSandboxOutput(ev.ToolResult.Name) {
+				if isSandboxOutput(ev.ToolResult.Name, agentRT.tools) {
 					if sbData := parseSandboxOutput(ev.ToolResult.Content); sbData != nil {
 						sbJSON, _ := json.Marshal(sbData)
 						sseWrite("sandbox_output", string(sbJSON))
@@ -706,18 +711,26 @@ func (a *BackendChatApp) handleStream(w http.ResponseWriter, r *http.Request, ch
 				if ev.SubagentResult.Error != nil {
 					errMsg = ev.SubagentResult.Error.Error()
 				}
-				d, _ := json.Marshal(map[string]any{
-					"id":          ev.SubagentResult.ID,
-					"task":        ev.SubagentResult.Task,
-					"output":      ev.SubagentResult.Output,
-					"turns":       ev.SubagentResult.Turns,
-					"stop_reason": ev.SubagentResult.StopReason,
-					"duration_ms": ev.SubagentResult.Duration.Milliseconds(),
-					"error":       errMsg,
-				})
+				payload := map[string]any{
+					"id":            ev.SubagentResult.ID,
+					"task":          ev.SubagentResult.Task,
+					"output":        ev.SubagentResult.Output,
+					"turns":         ev.SubagentResult.Turns,
+					"stop_reason":   ev.SubagentResult.StopReason,
+					"duration_ms":   ev.SubagentResult.Duration.Milliseconds(),
+					"error":         errMsg,
+				}
+				// Include model and system_prompt when set — frontend uses them for display
+				if ev.SubagentResult.Model != "" {
+					payload["model"] = ev.SubagentResult.Model
+				}
+				if ev.SubagentResult.SystemPrompt != "" {
+					payload["system_prompt"] = ev.SubagentResult.SystemPrompt
+				}
+				d, _ := json.Marshal(payload)
 				sseWrite("subagent_result", string(d))
-				log.Printf("stream.subagent_result chat_id=%d run_id=%s agent_id=%s",
-					chatID, runID, ev.SubagentResult.ID)
+				log.Printf("stream.subagent_result chat_id=%d run_id=%s agent_id=%s turns=%d",
+					chatID, runID, ev.SubagentResult.ID, ev.SubagentResult.Turns)
 			}
 
 		case ab.StreamEventDone:
@@ -730,22 +743,29 @@ func (a *BackendChatApp) handleStream(w http.ResponseWriter, r *http.Request, ch
 			_ = a.pub.PublishChatMessage(ctx, chatID, assistantMsg)
 
 			// Auto-persist artifacts detected from stream (file_write tool calls)
-			// and emit artifact SSE events so the frontend canvas can show them.
+			// and emit as unified SDK Artifact shape via "artifact_created".
 			for _, metaArt := range streamMeta.Artifacts {
 				art, ver, err := CreateArtifact(ctx, a.db, a.r2,
 					chatID, &assistantMsg.ID,
 					metaArt.Language, metaArt.Path, metaArt.Content,
 				)
 				if err == nil {
-					d, _ := json.Marshal(map[string]any{
-						"id":       art.ID,
-						"language": art.Language,
-						"title":    art.Title,
-						"version":  ver.Version,
-						"content":  ver.Content,
-						"r2Url":    ver.R2URL,
-					})
-					sseWrite("artifact", string(d))
+					unified := ab.Artifact{
+						ID:        art.ID,
+						Kind:      ab.ArtifactKindFile,
+						Placement: ab.ArtifactPlacementCanvas,
+						CreatedAt: art.CreatedAt,
+						File: &ab.FileArtifact{
+							Title:    art.Title,
+							Language: art.Language,
+							Path:     metaArt.Path,
+							Content:  ver.Content,
+							URL:      ver.R2URL,
+							Version:  ver.Version,
+						},
+					}
+					d, _ := json.Marshal(unified)
+					sseWrite("artifact_created", string(d))
 				}
 			}
 

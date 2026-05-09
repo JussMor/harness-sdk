@@ -279,14 +279,12 @@ func (r *Runtime) runStreamInternal(
 
 	_ = r.advancePhase(ctx, PhaseAlignment)
 	// Alignment: planner (non-streaming, cheap)
-	var proposedPlan *Plan
 	if r.planner != nil && r.engine.HasExecution() && r.planner.ShouldPlan(ctx, userMessage, conv) {
 		plan, _ := r.planner.Propose(ctx, userMessage, conv)
 		if plan != nil {
 			if _, err := r.engine.Execution.Propose(ctx, *plan); err == nil && r.autoApprovePlan {
 				_ = r.engine.Execution.Approve(ctx, true)
 			}
-			proposedPlan = plan
 			out <- StreamEvent{Type: StreamEventPlanProposed, Plan: plan}
 		}
 	}
@@ -303,6 +301,7 @@ func (r *Runtime) runStreamInternal(
 	// Mirrors agent_loop.go but uses ChatStream instead of Chat.
 	var finalResponse string
 	var totalUsage TokenUsage
+	var dispatchedSubagents bool // tracks if dispatch-subagents tool was called
 	messages := conv.Messages
 
 	// Build system prompt once
@@ -418,6 +417,14 @@ func (r *Runtime) runStreamInternal(
 			break
 		}
 
+		// Track if the LLM already dispatched subagents via tool call
+		for _, tc := range turnToolCalls {
+			if tc.Name == "dispatch-subagents" {
+				dispatchedSubagents = true
+				break
+			}
+		}
+
 		// Dispatch tool calls — apply safety filter before each call
 		var sandboxID string
 		// Filter tool calls through safety
@@ -486,10 +493,15 @@ func (r *Runtime) runStreamInternal(
 	}
 
 	// ── Subagent fan-out from proposed plan ──
-	if proposedPlan != nil && len(proposedPlan.Executables) >= 2 {
-		ready := proposedPlan.NextReady()
-		if len(ready) >= 2 {
-			r.runStreamSubagents(ctx, ready, out)
+	// Only fan out if: (a) the plan exists in ExecutionContext, (b) it has been
+	// approved, (c) the LLM didn't already handle subagents via dispatch-subagents
+	// tool, and (d) there are still ≥2 executables that haven't been dispatched.
+	if !dispatchedSubagents && r.engine.HasExecution() {
+		if activePlan := r.engine.Execution.ActivePlan(); activePlan != nil && activePlan.Approved {
+			ready := activePlan.NextReady()
+			if len(ready) >= 2 {
+				r.runStreamSubagents(ctx, ready, out)
+			}
 		}
 	}
 
@@ -532,6 +544,7 @@ func (r *Runtime) runStreamSubagents(ctx context.Context, executables []Executab
 			ID:       exec.ID,
 			Task:     task,
 			Engine:   r.engine,
+			Model:    r.model,
 			MaxTurns: 4,
 			Timeout:  30 * 1000000000, // 30s
 		})

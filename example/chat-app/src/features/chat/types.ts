@@ -87,19 +87,17 @@ export interface StreamSandboxOutput {
 export type StreamEvent =
   | { type: "delta"; data: { delta?: string } }
   | { type: "thinking"; data: { thinking?: string } }
+  | { type: "turn_complete"; data: Record<string, never> }
   | { type: "tool_call"; data: StreamToolCall }
   | { type: "tool_result"; data: StreamToolResult }
   | { type: "sandbox_output"; data: StreamSandboxOutput }
-  | { type: "artifact"; data: StreamArtifact }
   | { type: "plan_proposed"; data: StreamPlanProposed }
   | { type: "subagent_result"; data: StreamSubagentResult }
-  | { type: "confirmation_required"; data: ConfirmationRequest }
-  | {
-      type: "confirmation_resolved"
-      data: { id: string; tool: string; approved: boolean }
-    }
   | { type: "interrupt_required"; data: StreamInterruptRequest }
-  | { type: "interrupt_resolved"; data: StreamInterruptRequest }
+  | {
+      type: "interrupt_resolved"
+      data: { id: string; kind: string; approved?: boolean }
+    }
   | { type: "artifact_created"; data: StreamComponentArtifact }
   | { type: "artifact_updated"; data: StreamComponentArtifact }
   | { type: "done"; data: StreamDone }
@@ -149,15 +147,6 @@ export interface StreamComponentArtifact {
   }
 }
 
-// ── Human-in-the-Loop types ───────────────────────────────────────────────────
-
-export interface ConfirmationRequest {
-  id: string
-  tool: string
-  args: string // raw JSON string of tool arguments
-  reason: string
-}
-
 export interface StreamPlanProposed {
   id: string
   title: string
@@ -185,15 +174,6 @@ export interface StreamSubagentResult {
   model?: string
   /** Custom system prompt assigned to this subagent. */
   system_prompt?: string
-}
-
-export interface StreamArtifact {
-  id: string
-  language: string
-  title: string
-  version: number
-  content: string
-  r2Url?: string
 }
 
 // ── Artifact API types ──────────────────────────────────────────────────────

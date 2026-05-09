@@ -167,23 +167,32 @@ func (a *BackendChatApp) handleInterruptResolve(w http.ResponseWriter, r *http.R
 		return
 	}
 
-	gate, ok := hilRegistry.Get(body.ChatID)
+	gate, ok := ensureInterruptRegistry().Get(body.ChatID)
 	if !ok {
 		writeErr(w, http.StatusNotFound, fmt.Errorf("no pending interrupts for chat %d", body.ChatID))
 		return
 	}
 
-	// Resolve via the inner InterruptGate so all kinds (approval, question,
-	// form input) work uniformly, not just approvals.
 	resp := ab.InterruptResponse{
 		Approved:     body.Approved,
 		Answer:       body.Answer,
 		ModifiedArgs: body.ModifiedArgs,
 	}
-	if err := gate.Inner().ResolveByToken(token, resp); err != nil {
-		// 410 Gone = token valid but interrupt no longer pending; 401 = bad signature.
+
+	// The path segment may be a plain interrupt ID (from the live SSE flow
+	// where the frontend passes InterruptRequest.ID) or a signed resolution
+	// token (from out-of-band webhooks/email links). Try the plain ID first
+	// — it's the common case for interactive frontends.
+	resp.ID = token
+	if gate.Respond(resp) {
+		writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+		return
+	}
+
+	// Not a pending plain ID — try as a signed resolution token.
+	if err := gate.ResolveByToken(token, resp); err != nil {
 		status := http.StatusGone
-		if strings.Contains(err.Error(), "signature") || strings.Contains(err.Error(), "expired") {
+		if strings.Contains(err.Error(), "signature") || strings.Contains(err.Error(), "expired") || strings.Contains(err.Error(), "malformed") {
 			status = http.StatusUnauthorized
 		}
 		writeErr(w, status, err)
