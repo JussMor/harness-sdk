@@ -210,6 +210,9 @@ func (r *Runtime) runStreamInternal(
 	}
 
 	dispatcher := NewToolDispatcher(r.engine.Tools, r.engine.Sandbox)
+	if r.permissions != nil {
+		dispatcher.WithPermissions(r.permissions)
+	}
 
 	// Forward interrupt requests to the stream
 	if r.interruptGate != nil {

@@ -48,6 +48,11 @@ type AgentLoopConfig struct {
 	// SandboxID is the specific sandbox environment for tool execution.
 	SandboxID string
 
+	// Permissions optionally installs the v3 PermissionEngine on the
+	// dispatcher created for this loop. nil = use legacy per-tool
+	// CheckPermissions only.
+	Permissions *PermissionEngine
+
 	// ── Limits ────────────────────────────────────────────────────
 
 	// MaxTurns caps the LLM ↔ tool loop. 0 defaults to 50.
@@ -148,6 +153,9 @@ func RunAgentLoop(ctx context.Context, cfg AgentLoopConfig, messages []ChatMessa
 	var dispatcher *ToolDispatcher
 	if cfg.Tools != nil {
 		dispatcher = NewToolDispatcher(cfg.Tools, cfg.Sandbox)
+		if cfg.Permissions != nil {
+			dispatcher.WithPermissions(cfg.Permissions)
+		}
 	}
 
 	// ─── The loop ─────────────────────────────────────────────────

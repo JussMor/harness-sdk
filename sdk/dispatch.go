@@ -12,14 +12,23 @@ import (
 // It parses the JSON arguments, finds the tool in the registry, executes it,
 // and returns the result as a string ready to be fed back to the LLM.
 type ToolDispatcher struct {
-	tools   *ToolRegistry
-	sandbox SandboxDriver
+	tools       *ToolRegistry
+	sandbox     SandboxDriver
+	permissions *PermissionEngine // optional v3 permission engine
 }
 
 // NewToolDispatcher creates a dispatcher bound to a tool registry and
 // an optional sandbox (for tools that need a sandboxID).
 func NewToolDispatcher(tools *ToolRegistry, sandbox SandboxDriver) *ToolDispatcher {
 	return &ToolDispatcher{tools: tools, sandbox: sandbox}
+}
+
+// WithPermissions attaches a v3 PermissionEngine. When set, the engine runs
+// BEFORE the legacy per-tool CheckPermissions path (the engine itself folds
+// CheckPermissions in as step 6 of its algorithm).
+func (d *ToolDispatcher) WithPermissions(eng *PermissionEngine) *ToolDispatcher {
+	d.permissions = eng
+	return d
 }
 
 // ToolResult holds the outcome of dispatching a single tool call.
@@ -82,10 +91,32 @@ func (d *ToolDispatcher) Dispatch(ctx context.Context, call ToolCallEntry, sandb
 		}
 	}
 
-	// Permission gate. Denials surface to the LLM as a tool error so it can
-	// adapt; ask_user is treated as a deny at this layer (front-ends that
-	// want interactive confirmation should intercept before Dispatch).
-	if tool.CheckPermissions != nil {
+	// Permission gate. When the v3 PermissionEngine is wired, it runs the
+	// full algorithm (mode + alwaysAllow/Deny rules + tool fallback +
+	// approver). Otherwise we fall back to the per-tool CheckPermissions
+	// callback for backwards compatibility. ask_user without an engine is
+	// treated as a deny — front-ends wanting interactive confirmation must
+	// register a PermissionEngine with an Approver.
+	if d.permissions != nil {
+		dec := d.permissions.Decide(ctx, tool, args)
+		switch dec.Behavior {
+		case PermissionBehaviorDeny, PermissionBehaviorAsk:
+			reason := strings.TrimSpace(dec.Reason)
+			if reason == "" {
+				reason = "permission denied"
+			}
+			return ToolResult{
+				ToolCallID: call.ID,
+				Name:       call.Name,
+				Content:    fmt.Sprintf("error: %s", reason),
+				Error:      fmt.Errorf("%s", reason),
+			}
+		case PermissionBehaviorAllow:
+			if dec.UpdatedInput != nil {
+				args = dec.UpdatedInput
+			}
+		}
+	} else if tool.CheckPermissions != nil {
 		decision, err := tool.CheckPermissions(ctx, args)
 		if err != nil {
 			return ToolResult{

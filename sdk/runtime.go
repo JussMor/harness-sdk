@@ -33,6 +33,7 @@ type Runtime struct {
 	memoryRootsV2   []MemoryRoot
 	thinkingBudget  int
 	interruptGate   *InterruptGate
+	permissions     *PermissionEngine
 }
 
 // Tokenizer estimates token count for a string. Replace the default heuristic
@@ -96,6 +97,17 @@ func (r *Runtime) WithMode(modeID string) *Runtime              { r.mode = modeI
 func (r *Runtime) WithModel(m string) *Runtime                  { r.model = m; return r }
 func (r *Runtime) WithMemoryTrigger(d MemoryTriggerDetector) *Runtime { r.memoryTrigger = d; return r }
 func (r *Runtime) WithSafety(s SafetyFilter) *Runtime           { r.safety = s; return r }
+
+// WithPermissions installs a v3 PermissionEngine that runs before tool
+// execution. It supersedes the per-tool CheckPermissions callback path:
+// when an engine is set, the dispatcher hands every call through it. The
+// engine itself folds the legacy CheckPermissions in as a fallback step,
+// so existing tools keep working while gaining declarative rules + an
+// optional human approver.
+func (r *Runtime) WithPermissions(eng *PermissionEngine) *Runtime {
+	r.permissions = eng
+	return r
+}
 func (r *Runtime) WithTokenizer(t Tokenizer) *Runtime           { r.tokenizer = t; return r }
 func (r *Runtime) WithConversationStore(s ConversationStore) *Runtime { r.store = s; return r }
 
@@ -346,7 +358,8 @@ func (r *Runtime) preparation(ctx context.Context, conv *Conversation, rr *Runti
 
 func (r *Runtime) execution(ctx context.Context, conv *Conversation, rr *RuntimeResult) (*AgentLoopResult, error) {
 	cfg := AgentLoopConfig{
-		MaxTurns: 50,
+		MaxTurns:    50,
+		Permissions: r.permissions,
 		OnToolCall: func(call ToolCallEntry) bool {
 			if r.safety != nil {
 				v := r.safety.Inspect(ctx, call)
