@@ -73,7 +73,7 @@ type Skill struct {
 	Paths                  []string
 
 	// Execution context
-	ContextFork bool   // run in a forked subagent (TODO v3.1)
+	ContextFork bool   // run in a forked subagent (reserved for a future release)
 	Agent       string // optional agent override
 
 	// Storage

@@ -27,7 +27,6 @@ export {
 } from "@harness/client";
 export type {
   ApprovalPayload,
-  ApprovalRequest,
   Artifact,
   ComponentArtifact,
   FileArtifact,

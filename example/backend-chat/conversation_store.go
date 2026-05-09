@@ -62,7 +62,7 @@ ON CONFLICT(id) DO UPDATE SET
 		conv.ID,
 		conv.ThreadID,
 		string(messagesJSON),
-		"[]", // SDK_V3_REMOVE: loaded_skills_json column kept for schema compat
+		"[]", // loaded_skills_json column retained for schema compat with v2
 		boolToInt(conv.MemoryRead),
 		conv.TurnCount,
 		conv.CreatedAt.Format(time.RFC3339),
@@ -104,7 +104,7 @@ FROM sdk_conversations WHERE id = ?`, id)
 	if err := json.Unmarshal([]byte(messagesJSON), &conv.Messages); err != nil {
 		return nil, fmt.Errorf("unmarshal messages: %w", err)
 	}
-	_ = skillsJSON // SDK_V3_REMOVE: legacy loaded_skills_json column ignored
+	_ = skillsJSON // legacy loaded_skills_json column ignored in v3
 	if conv.Messages == nil {
 		conv.Messages = make([]ab.ChatMessage, 0)
 	}

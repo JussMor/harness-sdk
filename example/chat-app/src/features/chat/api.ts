@@ -328,9 +328,9 @@ function adaptSSEEvent(type: string, dataText: string): StreamEvent | null {
           }>
         },
       }
-    case "subagent_result":
+    case "agent_result":
       return {
-        type: "subagent_result",
+        type: "agent_result",
         data: parsed as {
           id: string
           task: string

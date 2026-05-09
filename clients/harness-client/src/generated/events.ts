@@ -4,6 +4,7 @@
 
 // StreamEventName — string union of every StreamEventType constant in the SDK.
 export type StreamEventName =
+  | "agent_result"
   | "artifact_created"
   | "artifact_updated"
   | "delta"
@@ -11,13 +12,13 @@ export type StreamEventName =
   | "error"
   | "interrupt_required"
   | "interrupt_resolved"
-  | "subagent_result"
   | "thinking"
   | "tool_call"
   | "tool_result"
   | "turn_complete";
 
 export const StreamEventNames = [
+  "agent_result",
   "artifact_created",
   "artifact_updated",
   "delta",
@@ -25,7 +26,6 @@ export const StreamEventNames = [
   "error",
   "interrupt_required",
   "interrupt_resolved",
-  "subagent_result",
   "thinking",
   "tool_call",
   "tool_result",
@@ -33,10 +33,7 @@ export const StreamEventNames = [
 ] as const satisfies readonly StreamEventName[];
 
 // InterruptKindName — string union of every InterruptKind constant in the SDK.
-export type InterruptKindName =
-  | "approval"
-  | "form_input"
-  | "question";
+export type InterruptKindName = "approval" | "form_input" | "question";
 
 export const InterruptKindNames = [
   "approval",
@@ -45,12 +42,9 @@ export const InterruptKindNames = [
 ] as const satisfies readonly InterruptKindName[];
 
 // ArtifactKindName — string union of every ArtifactKind constant in the SDK.
-export type ArtifactKindName =
-  | "component"
-  | "file";
+export type ArtifactKindName = "component" | "file";
 
 export const ArtifactKindNames = [
   "component",
   "file",
 ] as const satisfies readonly ArtifactKindName[];
-

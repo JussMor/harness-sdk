@@ -36,7 +36,7 @@ func loadBackendMemory() (ab.MemoryProvider, []ab.MemoryRoot, error) {
 	}
 
 	var mem ab.MemoryProvider = provider
-	// SDK_V3_REMOVE: Voyage hybrid search removed (embedder subsystem deleted).
+	// Voyage hybrid search removed; v3 memory uses tool-driven reads.
 	log.Printf("backend memory: root=%s (BM25 search)", root)
 
 	return mem, ab.DefaultMemoryRoots, nil

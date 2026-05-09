@@ -556,7 +556,7 @@ export function ChatMain({
         return
       }
 
-      if (event.type === "subagent_result") {
+      if (event.type === "agent_result") {
         const result = event.data
         const level: TimelineEvent["level"] = result.error ? "error" : "success"
         pushTimeline(`Subagent ${result.id}: ${result.error || "done"}`, level)

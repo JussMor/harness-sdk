@@ -92,7 +92,7 @@ export type StreamEvent =
   | { type: "tool_result"; data: StreamToolResult }
   | { type: "sandbox_output"; data: StreamSandboxOutput }
   | { type: "plan_proposed"; data: StreamPlanProposed }
-  | { type: "subagent_result"; data: StreamSubagentResult }
+  | { type: "agent_result"; data: StreamSubagentResult }
   | { type: "interrupt_required"; data: StreamInterruptRequest }
   | {
       type: "interrupt_resolved"

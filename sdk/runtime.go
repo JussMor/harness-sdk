@@ -23,7 +23,6 @@ type Runtime struct {
 	model  string
 
 	// Configurable behavior
-	memoryTrigger   MemoryTriggerDetector
 	safety          SafetyFilter
 	tokenizer       Tokenizer
 	store           ConversationStore
@@ -81,9 +80,6 @@ func TruncateToTokens(text string, maxTokens int, tok Tokenizer) string {
 	return text[:limit]
 }
 
-// MemoryTriggerDetector inspects a user message for memory write intent.
-type MemoryTriggerDetector func(message string) (content string, detected bool)
-
 // NewRuntime creates a Runtime over an Engine with sensible defaults.
 func NewRuntime(engine *Engine) *Runtime {
 	return &Runtime{
@@ -93,10 +89,9 @@ func NewRuntime(engine *Engine) *Runtime {
 	}
 }
 
-func (r *Runtime) WithMode(modeID string) *Runtime              { r.mode = modeID; return r }
-func (r *Runtime) WithModel(m string) *Runtime                  { r.model = m; return r }
-func (r *Runtime) WithMemoryTrigger(d MemoryTriggerDetector) *Runtime { r.memoryTrigger = d; return r }
-func (r *Runtime) WithSafety(s SafetyFilter) *Runtime           { r.safety = s; return r }
+func (r *Runtime) WithMode(modeID string) *Runtime    { r.mode = modeID; return r }
+func (r *Runtime) WithModel(m string) *Runtime        { r.model = m; return r }
+func (r *Runtime) WithSafety(s SafetyFilter) *Runtime { r.safety = s; return r }
 
 // WithPermissions installs a v3 PermissionEngine that runs before tool
 // execution. It supersedes the per-tool CheckPermissions callback path:
@@ -283,19 +278,15 @@ func (r *Runtime) orientation(ctx context.Context, userMessage string, conv *Con
 		}
 	}
 
-	// Match and load skills → LayerSkills
-	// SDK_V3_REMOVE: skill matching at orientation is gone. Skills are
-	// invoked on demand through the Skill tool (Claude Code model).
-
-	// Build LayerSession: session context (time/location/user)
+	// Skills are loaded lazily by the Skill tool — no orientation-time matching.
 	r.buildSessionLayer(ctx, conv, userMessage)
 	return nil
 }
 
 // ── Warm turn refresh ─────────────────────────────────────────────────────────
 
-// warmRefresh runs on non-cold turns. SDK_V3_REMOVE: previous version
-// re-matched skills and grew LayerSkills. Skills are now lazy tools.
+// warmRefresh runs on non-cold turns. Only the session layer needs to be
+// rebuilt; skills are loaded lazily through the Skill tool.
 func (r *Runtime) warmRefresh(ctx context.Context, userMessage string, conv *Conversation) error {
 	r.buildSessionLayer(ctx, conv, userMessage)
 	return nil
@@ -410,30 +401,15 @@ func (r *Runtime) execution(ctx context.Context, conv *Conversation, rr *Runtime
 // ── Closure ──────────────────────────────────────────────────────────────────
 
 func (r *Runtime) closure(ctx context.Context, userMessage string, loopResult *AgentLoopResult, conv *Conversation, rr *RuntimeResult) error {
-	if r.engine.HasMemory() && r.memoryTrigger != nil {
-		content, detected := r.memoryTrigger(userMessage)
-		if detected && content != "" {
-			r.handleMemoryTrigger(ctx, content, rr)
-		}
-	}
-	// SDK_V3_REMOVE: InferredMemoryWriter (closure.go) was deleted.
-	// Memory writes are tool-driven now (Claude Code model). The runtime
-	// only honours explicit user phrases via memoryTrigger, which is
-	// nil by default — callers opt in via WithMemoryTrigger.
+	// In v3 all memory writes go through the Memory tool driven by the LLM,
+	// with read-before-write validation in the tool layer. The runtime no
+	// longer inspects user messages for trigger phrases.
+	_ = ctx
+	_ = userMessage
 	_ = loopResult
 	_ = conv
+	_ = rr
 	return nil
-}
-
-// handleMemoryTrigger is a NO-OP placeholder.
-//
-// SDK_V3_REMOVE: previous implementation invoked memory provider directly
-// from regex-detected user phrases (e.g. "remember that ..."). That bypassed
-// the tool layer and caused duplicate / orphan entries. In v3, all memory
-// writes go through the Memory tool driven by the LLM, with read-before-write
-// validation in the tool layer. Callers that still want the old behaviour
-// should set their own MemoryTriggerDetector and write through the tool.
-func (r *Runtime) handleMemoryTrigger(_ context.Context, _ string, _ *RuntimeResult) {
 }
 
 // ── RuntimeResult ─────────────────────────────────────────────────────────────
@@ -451,61 +427,6 @@ type RuntimeResult struct {
 	Enforcement   *EnforcementResult `json:"enforcement,omitempty"`
 	StartedAt     time.Time          `json:"started_at"`
 	CompletedAt   time.Time          `json:"completed_at"`
-}
-
-// ── Defaults ──────────────────────────────────────────────────────────────────
-
-// DefaultMemoryTriggerDetector detects English + Spanish memory triggers.
-func DefaultMemoryTriggerDetector(message string) (string, bool) {
-	lower := strings.ToLower(strings.TrimSpace(message))
-
-	explicit := []string{
-		"remember that ", "please remember ", "don't forget that ", "don't forget ",
-		"update your memory ", "save that ",
-		"recuerda que ", "por favor recuerda ", "no olvides que ", "no olvides ",
-		"actualiza tu memoria ", "guarda que ",
-	}
-	for _, trigger := range explicit {
-		if idx := strings.Index(lower, trigger); idx >= 0 {
-			content := strings.TrimSpace(message[idx+len(trigger):])
-			if content != "" {
-				return content, true
-			}
-		}
-	}
-
-	stateChange := []string{
-		"i no longer ", "i moved to ", "i now work at ", "i changed ", "i started ", "my name is ", "i am ",
-		"ya no ", "me mudé a ", "ahora trabajo en ", "cambié ", "empecé ", "mi nombre es ", "me llamo ",
-	}
-	for _, trigger := range stateChange {
-		if idx := strings.Index(lower, trigger); idx >= 0 {
-			rest := message[idx:]
-			end := strings.IndexAny(rest, ".\n")
-			if end < 0 {
-				end = len(rest)
-			}
-			content := strings.TrimSpace(rest[:end])
-			if content != "" {
-				return content, true
-			}
-		}
-	}
-
-	forget := []string{
-		"forget about ", "please forget ",
-		"olvida ", "olvídate de ",
-	}
-	for _, trigger := range forget {
-		if idx := strings.Index(lower, trigger); idx >= 0 {
-			content := strings.TrimSpace(message[idx+len(trigger):])
-			if content != "" {
-				return "FORGET: " + content, true
-			}
-		}
-	}
-
-	return "", false
 }
 
 // evictMemoryToTokenBudget truncates memory content to fit within maxTokens.

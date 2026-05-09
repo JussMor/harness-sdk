@@ -11,8 +11,7 @@ import (
 	sdktokenizers "github.com/everfaz/autobuild-sdk/providers/tokenizers"
 )
 
-// SDK_V3_REMOVE: backendSkillsProvider/loadBackendSkills removed with the
-// legacy skill subsystem. Skills will return as a Tool in v3.
+// Skills are loaded on demand via the Skill tool (sdk/skill_tool.go).
 
 // newModeEngine builds a fully-wired agentRuntime using the SDK Runtime.
 func newModeEngine(provider ab.LLMProvider, model string, logContext RuntimeLogContext) (*ab.Engine, *agentRuntime, error) {
