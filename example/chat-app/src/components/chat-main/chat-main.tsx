@@ -575,6 +575,18 @@ export function ChatMain({
 
       if (event.type === "interrupt_required") {
         const req = event.data
+        // Form-input interrupts paired with a UIHint (component name) are
+        // already rendered as an interactive component artifact — the
+        // QuestionnaireForm/PatientIntakeForm modal posts its own resolution
+        // via interaction.token. Suppress the generic InterruptDialog so
+        // the user only sees one surface and only one resolve fires.
+        if (req.kind === "form_input" && req.form?.ui_hint) {
+          pushTimeline(
+            `Awaiting input: ${req.form.title ?? req.form.ui_hint}`,
+            "info"
+          )
+          return
+        }
         const label =
           req.kind === "approval"
             ? `Awaiting approval: ${req.approval?.tool_call?.name ?? "tool"}`
@@ -870,7 +882,9 @@ export function ChatMain({
                   Stream Runtime Ready
                 </p>
                 <h1>Hello, {userName}</h1>
-                <p>Choose a mode and provider above, then start a conversation.</p>
+                <p>
+                  Choose a mode and provider above, then start a conversation.
+                </p>
               </div>
             )}
 
@@ -1042,8 +1056,7 @@ export function ChatMain({
           onSaveVersion={async (artifactId, newContent) => {
             // Persist the new version to the backend (best-effort).
             // Only works for artifacts with real DB UUIDs (not temp local IDs).
-            const isDbId =
-              artifactId.length === 36 && artifactId.includes("-")
+            const isDbId = artifactId.length === 36 && artifactId.includes("-")
             if (isDbId) {
               try {
                 await api.addArtifactVersion(artifactId, newContent)

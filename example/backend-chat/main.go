@@ -412,12 +412,19 @@ func (a *BackendChatApp) handleInterruptResolve(w http.ResponseWriter, r *http.R
 	}
 
 	// Derive chatID from URL path if not supplied in body.
+	// Path shape: /api/interrupts/{token}[/resolve]
+	pathTail := strings.TrimPrefix(r.URL.Path, "/api/interrupts/")
+	pathTail = strings.TrimSuffix(strings.Trim(pathTail, "/"), "/resolve")
 	if req.ChatID == 0 {
-		path := strings.TrimPrefix(r.URL.Path, "/api/interrupts/")
-		path = strings.TrimSuffix(strings.Trim(path, "/"), "/resolve")
-		if id, err := strconv.ParseInt(path, 10, 64); err == nil {
+		if id, err := strconv.ParseInt(pathTail, 10, 64); err == nil {
 			req.ChatID = id
 		}
+	}
+	// Backfill the interrupt ID from the URL when the frontend only sent
+	// it in the path (current chat-app behaviour). Without this the gate
+	// receives an empty ID, never matches, and always returns 409.
+	if req.ID == "" && pathTail != "" && !isAllDigits(pathTail) {
+		req.ID = pathTail
 	}
 
 	if req.ChatID == 0 {
@@ -436,6 +443,18 @@ func (a *BackendChatApp) handleInterruptResolve(w http.ResponseWriter, r *http.R
 		Approved: req.Approved,
 		Answer:   req.Answer,
 	}
+
+	// Path tokens minted via IssueResolutionToken contain a `.` separating
+	// body and HMAC signature. Use ResolveByToken to verify+decode in one go.
+	if strings.Contains(pathTail, ".") {
+		if err := gate.ResolveByToken(pathTail, resp); err != nil {
+			writeErr(w, http.StatusConflict, err)
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+		return
+	}
+
 	if !gate.Respond(resp) {
 		writeErr(w, http.StatusConflict, fmt.Errorf("interrupt already resolved or expired"))
 		return
@@ -445,6 +464,19 @@ func (a *BackendChatApp) handleInterruptResolve(w http.ResponseWriter, r *http.R
 
 func newRunID() string {
 	return fmt.Sprintf("run_%d", time.Now().UnixNano())
+}
+
+// isAllDigits reports whether s consists solely of ASCII digits (and is non-empty).
+func isAllDigits(s string) bool {
+	if s == "" {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		if s[i] < '0' || s[i] > '9' {
+			return false
+		}
+	}
+	return true
 }
 
 // handleStream is the real-time streaming endpoint for LLM generation.

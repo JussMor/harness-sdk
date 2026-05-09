@@ -507,6 +507,9 @@ func ensureWritableScope(scope ab.Scope) ab.Scope {
 }
 
 func asString(value any) string {
+	if value == nil {
+		return ""
+	}
 	switch v := value.(type) {
 	case string:
 		return v
@@ -622,14 +625,16 @@ func (r *agentRuntime) newSubagentDispatchTool() *ab.Tool {
 				systemPrompt := strings.TrimSpace(asString(m["system_prompt"]))
 				model := strings.TrimSpace(asString(m["model"]))
 
-				// Strip routing prefix so the Anthropic provider always receives
-				// a bare model name (e.g. "claude-haiku-4-5-20251001", not "anthropic/...").
+				// Keep the routing prefix (e.g. "anthropic/...") so the
+				// RoutedLLMProvider can dispatch to the correct backend.
+				// RunAgentLoopWithEngine strips the prefix internally after
+				// resolving the provider. Stripping here would send a bare
+				// model name to the router, which has no match and falls
+				// back to the raw engine.LLM with an empty model — the
+				// Anthropic API then returns 404 with `model: <nil>`.
 				effectiveModel := model
 				if effectiveModel == "" {
 					effectiveModel = r.modelName
-				}
-				if _, modelOnly := ab.ParseModelRef(effectiveModel); modelOnly != "" {
-					effectiveModel = modelOnly
 				}
 				subs = append(subs, ab.Subagent{
 					ID:           id,
