@@ -6,6 +6,15 @@ import (
 	"strings"
 )
 
+// truncate clips s to at most max chars, appending "..." when cut.
+// Local helper (was previously shared with closure.go, deleted in v3).
+func truncate(s string, max int) string {
+	if len(s) <= max {
+		return s
+	}
+	return s[:max] + "..."
+}
+
 // Compactor summarizes dropped conversation history into a compact memory
 // entry instead of silently discarding it. When the context budget enforces
 // truncation, old messages are gone from the active window — but their
@@ -90,7 +99,7 @@ Summary:`, maxWords, transcript.String())
 //
 // Usage in Runtime.preparation:
 //
-//	enforce := EnforceWithCompaction(ctx, budget, compactor, conv, skills, ...)
+//	enforce := EnforceWithCompaction(ctx, budget, compactor, conv, ...)
 //	if enforce.Summary != "" {
 //	    engine.Prompt.Append(LayerMemory, "Context summary:\n"+enforce.Summary)
 //	}
@@ -107,8 +116,7 @@ func EnforceWithCompaction(
 	budget *ContextBudget,
 	compactor Compactor,
 	conv *Conversation,
-	skills SkillProvider,
-	skillTokens, memoryTokens int,
+	memoryTokens int,
 ) *EnforceCompactionResult {
 	if budget == nil {
 		return &EnforceCompactionResult{EnforcementResult: &EnforcementResult{}}
@@ -118,7 +126,7 @@ func EnforceWithCompaction(
 	histBefore := make([]ChatMessage, len(conv.Messages))
 	copy(histBefore, conv.Messages)
 
-	enforce := budget.Enforce(ctx, conv, skills, skillTokens, memoryTokens, &conv.Messages)
+	enforce := budget.Enforce(ctx, conv, memoryTokens, &conv.Messages)
 	result := &EnforceCompactionResult{EnforcementResult: enforce}
 
 	if !enforce.TruncatedHistory || compactor == nil {

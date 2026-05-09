@@ -15,7 +15,6 @@
 //   - [SystemPromptBuilder]— layered system prompt assembly
 //   - [MemoryProvider]     — persistent two-scope memory (User / Project)
 //   - [ObservationStore]   — session-scoped working memory (not persistent)
-//   - [SkillProvider]      — on-demand knowledge loading with scored matching
 //   - [ToolRegistry]       — typed tool definitions with JSON Schema
 //   - [ModeProvider]       — execution modes with model + tool config
 //   - [LLMProvider]        — chat completion backend (use [RoutedLLMProvider]

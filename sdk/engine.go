@@ -8,7 +8,6 @@ type Engine struct {
 	Memory  MemoryProvider
 	Sandbox SandboxDriver
 	Tools   *ToolRegistry
-	Skills  SkillProvider
 	Threads ThreadProvider
 	Modes   ModeProvider
 	LLM     LLMProvider          // primary LLM — use RoutedLLMProvider for multi-model
@@ -39,7 +38,6 @@ func NewWithDefaults(windowSize int) *Engine {
 func (e *Engine) HasMemory() bool  { return e.Memory != nil }
 func (e *Engine) HasSandbox() bool { return e.Sandbox != nil }
 func (e *Engine) HasTools() bool   { return e.Tools != nil }
-func (e *Engine) HasSkills() bool  { return e.Skills != nil }
 func (e *Engine) HasThreads() bool { return e.Threads != nil }
 func (e *Engine) HasModes() bool   { return e.Modes != nil }
 func (e *Engine) HasLLM() bool     { return e.LLM != nil }

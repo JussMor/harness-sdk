@@ -22,7 +22,6 @@ type agentRuntime struct {
 	engine         *ab.Engine
 	runtime        *ab.Runtime
 	subagentEngine *ab.Engine
-	skills         ab.SkillProvider
 	memory         ab.MemoryProvider
 	convStore      ab.ConversationStore
 	execCtx        *ab.InMemoryExecutionContext // task checklist (TodoWrite/TodoRead)
@@ -37,9 +36,7 @@ func (r *agentRuntime) buildToolRegistry() *ab.ToolRegistry {
 	if !isSandboxAvailable() || r.chatID <= 0 {
 		reg.Register(r.newDocumentTool())
 	}
-	if r.skills != nil {
-		reg.Register(r.newSkillsTool())
-	}
+	// SDK_V3_REMOVE: skills tool removed; will return as agnostic SkillTool v3.
 	if r.memory != nil {
 		reg.Register(r.newMemoryTool())
 	}
@@ -167,86 +164,8 @@ func (r *agentRuntime) newMemoryTool() *ab.Tool {
 }
 
 func (r *agentRuntime) newSkillsTool() *ab.Tool {
-	return &ab.Tool{
-		Name:        "skills-operations",
-		Description: "List, match, inspect, load, and unload backend skills.",
-		Category:    ab.ToolCategoryPlanning,
-		Parameters: ab.ToolFuncParams{
-			Type: "object",
-			Properties: map[string]ab.ToolParam{
-				"operation": {Type: "string", Enum: []string{"list", "match", "get", "load", "unload"}},
-				"skillName": {Type: "string", Description: "Skill name for get/load/unload."},
-				"query":     {Type: "string", Description: "Text to match triggers against."},
-			},
-			Required: []string{"operation"},
-		},
-		Execute: func(ctx context.Context, _ string, args map[string]any) (string, error) {
-			if r.skills == nil {
-				return "skills provider not configured", nil
-			}
-			op := strings.ToLower(strings.TrimSpace(asString(args["operation"])))
-			skillName := strings.TrimSpace(asString(args["skillName"]))
-			query := strings.TrimSpace(asString(args["query"]))
-
-			switch op {
-			case "list":
-				names, err := r.skills.List(ctx)
-				if err != nil {
-					return "", err
-				}
-				if len(names) == 0 {
-					return "No skills available.", nil
-				}
-				for i := range names {
-					names[i] = "- " + names[i]
-				}
-				return "Available skills:\n" + strings.Join(names, "\n"), nil
-			case "match":
-				if query == "" {
-					return "query is required for match", nil
-				}
-				matched, err := r.skills.Match(ctx, query)
-				if err != nil {
-					return "", err
-				}
-				if len(matched) == 0 {
-					return "No skills matched.", nil
-				}
-				lines := make([]string, 0, len(matched))
-				for _, m := range matched {
-					lines = append(lines, fmt.Sprintf("- %s (score %.2f): %s", m.Skill.Name, m.Score, m.Skill.Meta.Description))
-				}
-				return "Matched skills:\n" + strings.Join(lines, "\n"), nil
-			case "get":
-				if skillName == "" {
-					return "skillName is required", nil
-				}
-				skill, err := r.skills.Get(ctx, skillName)
-				if err != nil {
-					return "", err
-				}
-				return fmt.Sprintf("Skill %s\n\n%s", skill.Name, strings.TrimSpace(skill.Content)), nil
-			case "load":
-				if skillName == "" {
-					return "skillName is required", nil
-				}
-				skill, err := r.skills.Load(ctx, skillName)
-				if err != nil {
-					return "", err
-				}
-				return fmt.Sprintf("Loaded skill %s\n\n%s", skill.Name, strings.TrimSpace(skill.Content)), nil
-			case "unload":
-				if skillName == "" {
-					return "skillName is required", nil
-				}
-				if err := r.skills.Unload(ctx, skillName); err != nil {
-					return "", err
-				}
-				return fmt.Sprintf("Unloaded skill %s", skillName), nil
-			}
-			return "unsupported operation", nil
-		},
-	}
+	// SDK_V3_REMOVE: stubbed during demolition. Replace with agnostic SkillTool v3.
+	return nil
 }
 
 func (r *agentRuntime) newTodoTool() *ab.Tool {

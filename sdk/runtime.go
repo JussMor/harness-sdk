@@ -23,10 +23,7 @@ type Runtime struct {
 	model  string
 
 	// Configurable behavior
-	maxSkills       int
-	skillThreshold  float64
 	memoryTrigger   MemoryTriggerDetector
-	memoryWriter    *InferredMemoryWriter
 	safety          SafetyFilter
 	tokenizer       Tokenizer
 	store           ConversationStore
@@ -89,22 +86,16 @@ type MemoryTriggerDetector func(message string) (content string, detected bool)
 // NewRuntime creates a Runtime over an Engine with sensible defaults.
 func NewRuntime(engine *Engine) *Runtime {
 	return &Runtime{
-		engine:         engine,
-		maxSkills:      3,
-		skillThreshold: 0.3,
-		memoryTrigger:  DefaultMemoryTriggerDetector,
-		safety:         nil,
-		tokenizer:      HeuristicTokenizer{},
+		engine:    engine,
+		safety:    nil,
+		tokenizer: HeuristicTokenizer{},
 	}
 }
 
 func (r *Runtime) WithMode(modeID string) *Runtime              { r.mode = modeID; return r }
 func (r *Runtime) WithModel(m string) *Runtime                  { r.model = m; return r }
-func (r *Runtime) WithSkillThreshold(t float64) *Runtime        { r.skillThreshold = t; return r }
-func (r *Runtime) WithMaxSkills(n int) *Runtime                 { r.maxSkills = n; return r }
 func (r *Runtime) WithMemoryTrigger(d MemoryTriggerDetector) *Runtime { r.memoryTrigger = d; return r }
 func (r *Runtime) WithSafety(s SafetyFilter) *Runtime           { r.safety = s; return r }
-func (r *Runtime) WithMemoryWriter(w *InferredMemoryWriter) *Runtime { r.memoryWriter = w; return r }
 func (r *Runtime) WithTokenizer(t Tokenizer) *Runtime           { r.tokenizer = t; return r }
 func (r *Runtime) WithConversationStore(s ConversationStore) *Runtime { r.store = s; return r }
 
@@ -147,18 +138,6 @@ func (r *Runtime) WithMemoryRoots(roots ...MemoryRoot) *Runtime {
 // Default 0 = disabled.
 func (r *Runtime) WithThinkingBudget(budgetTokens int) *Runtime {
 	r.thinkingBudget = budgetTokens
-	return r
-}
-
-// WithMaxSkillTokens caps how many tokens of skill content can be injected
-// into LayerSkills. When combined skill content exceeds this, it is truncated
-// at token boundaries using the configured tokenizer.
-//
-// Default 0 = no cap.
-func (r *Runtime) WithMaxSkillTokens(maxTokens int) *Runtime {
-	if r.engine.HasPrompt() {
-		r.engine.Prompt.SetMaxLayerTokens(LayerSkills, maxTokens)
-	}
 	return r
 }
 
@@ -293,9 +272,8 @@ func (r *Runtime) orientation(ctx context.Context, userMessage string, conv *Con
 	}
 
 	// Match and load skills → LayerSkills
-	if err := r.matchAndLoadSkills(ctx, userMessage, conv, rr); err != nil {
-		return err
-	}
+	// SDK_V3_REMOVE: skill matching at orientation is gone. Skills are
+	// invoked on demand through the Skill tool (Claude Code model).
 
 	// Build LayerSession: session context (time/location/user)
 	r.buildSessionLayer(ctx, conv, userMessage)
@@ -304,100 +282,10 @@ func (r *Runtime) orientation(ctx context.Context, userMessage string, conv *Con
 
 // ── Warm turn refresh ─────────────────────────────────────────────────────────
 
+// warmRefresh runs on non-cold turns. SDK_V3_REMOVE: previous version
+// re-matched skills and grew LayerSkills. Skills are now lazy tools.
 func (r *Runtime) warmRefresh(ctx context.Context, userMessage string, conv *Conversation) error {
 	r.buildSessionLayer(ctx, conv, userMessage)
-
-	if r.engine.HasSkills() {
-		matches, err := r.engine.Skills.Match(ctx, userMessage)
-		if err == nil {
-			for _, m := range matches {
-				if conv.IsSkillLoaded(m.Skill.Name) {
-					continue
-				}
-				if m.Score < r.skillThreshold {
-					break
-				}
-				skill, err := r.engine.Skills.Load(ctx, m.Skill.Name)
-				if err != nil {
-					continue
-				}
-				if r.engine.HasPrompt() {
-					existing := r.engine.Prompt.Get(LayerSkills)
-					newContent := existing
-					if newContent != "" {
-						newContent += "\n\n"
-					}
-					newContent += "# Skill: " + skill.Name + "\n\n" + skill.Content + "\n\n"
-					cap := r.engine.Prompt.maxLayerTokens[LayerSkills]
-					if cap > 0 && r.tokenizer.Count(newContent) > cap {
-						newContent = TruncateToTokens(newContent, cap, r.tokenizer)
-					}
-					r.engine.Prompt.Set(LayerSkills, newContent)
-				}
-				conv.MarkSkillLoaded(skill.Name, m.Score, r.tokenizer.Count(skill.Content))
-			}
-		}
-	}
-	return nil
-}
-
-func (r *Runtime) matchAndLoadSkills(ctx context.Context, userMessage string, conv *Conversation, rr *RuntimeResult) error {
-	if !r.engine.HasSkills() || !r.engine.HasPrompt() {
-		return nil
-	}
-	matches, err := r.engine.Skills.Match(ctx, userMessage)
-	if err != nil {
-		return fmt.Errorf("skill match: %w", err)
-	}
-	var skillContent strings.Builder
-	loaded := 0
-	seen := make(map[string]bool)
-
-	var loadSkill func(name string, depth int) *Skill
-	loadSkill = func(name string, depth int) *Skill {
-		if depth > 4 || seen[name] || conv.IsSkillLoaded(name) || loaded >= r.maxSkills {
-			return nil
-		}
-		seen[name] = true
-		skill, err := r.engine.Skills.Load(ctx, name)
-		if err != nil {
-			return nil
-		}
-		for _, dep := range skill.Meta.Requires {
-			if dep != "" && dep != name {
-				loadSkill(dep, depth+1)
-			}
-		}
-		skillContent.WriteString("# Skill: ")
-		skillContent.WriteString(skill.Name)
-		skillContent.WriteString("\n\n")
-		skillContent.WriteString(skill.Content)
-		skillContent.WriteString("\n\n")
-		conv.MarkSkillLoaded(skill.Name, 1.0, r.tokenizer.Count(skill.Content))
-		rr.SkillsLoaded = append(rr.SkillsLoaded, skill.Name)
-		loaded++
-		return skill
-	}
-
-	for _, m := range matches {
-		if loaded >= r.maxSkills {
-			break
-		}
-		if m.Score < r.skillThreshold {
-			break
-		}
-		loadSkill(m.Skill.Name, 0)
-	}
-	if skillContent.Len() > 0 {
-		content := skillContent.String()
-		if r.engine.HasPrompt() {
-			cap := r.engine.Prompt.maxLayerTokens[LayerSkills]
-			if cap > 0 && r.tokenizer.Count(content) > cap {
-				content = TruncateToTokens(content, cap, r.tokenizer)
-			}
-		}
-		r.engine.Prompt.Set(LayerSkills, content)
-	}
 	return nil
 }
 
@@ -427,10 +315,6 @@ func (r *Runtime) buildSessionLayer(ctx context.Context, conv *Conversation, use
 
 func (r *Runtime) preparation(ctx context.Context, conv *Conversation, rr *RuntimeResult) error {
 	if r.engine.HasBudget() && r.engine.HasPrompt() {
-		skillTokens := 0
-		for _, s := range conv.LoadedSkills {
-			skillTokens += s.TokenEstimate
-		}
 		memoryTokens := r.tokenizer.Count(r.engine.Prompt.Get(LayerMemory))
 
 		compResult := EnforceWithCompaction(
@@ -438,17 +322,11 @@ func (r *Runtime) preparation(ctx context.Context, conv *Conversation, rr *Runti
 			r.engine.Budget,
 			r.compactor,
 			conv,
-			r.engine.Skills,
-			skillTokens,
 			memoryTokens,
 		)
 		enforce := compResult.EnforcementResult
 		if enforce.OverflowTokens > 0 {
 			rr.Enforcement = enforce
-			if len(enforce.EvictedSkills) > 0 {
-				rr.Warnings = append(rr.Warnings,
-					fmt.Sprintf("budget: evicted %d skills", len(enforce.EvictedSkills)))
-			}
 			if enforce.TruncatedHistory {
 				rr.Warnings = append(rr.Warnings,
 					fmt.Sprintf("budget: dropped %d messages", enforce.HistoryDropped))
@@ -525,58 +403,24 @@ func (r *Runtime) closure(ctx context.Context, userMessage string, loopResult *A
 			r.handleMemoryTrigger(ctx, content, rr)
 		}
 	}
-
-	if r.memoryWriter != nil && loopResult != nil && r.engine.HasMemory() {
-		facts, err := r.memoryWriter.Extract(ctx, conv, loopResult.FinalContent)
-		if err == nil && len(facts) > 0 {
-			written, _ := r.memoryWriter.WriteWithDedup(ctx, r.engine.Memory, facts)
-			for _, fact := range written {
-				if fact.Path != "" {
-					rr.MemoryWritten = append(rr.MemoryWritten, fact.Path)
-				}
-				rr.InferredFacts = append(rr.InferredFacts, fact)
-			}
-		}
-	}
-
+	// SDK_V3_REMOVE: InferredMemoryWriter (closure.go) was deleted.
+	// Memory writes are tool-driven now (Claude Code model). The runtime
+	// only honours explicit user phrases via memoryTrigger, which is
+	// nil by default — callers opt in via WithMemoryTrigger.
+	_ = loopResult
+	_ = conv
 	return nil
 }
 
-// handleMemoryTrigger writes, replaces, or deletes a memory entry.
-func (r *Runtime) handleMemoryTrigger(ctx context.Context, content string, rr *RuntimeResult) {
-	if strings.HasPrefix(content, "FORGET: ") {
-		query := strings.TrimPrefix(content, "FORGET: ")
-		existing, _ := r.engine.Memory.Search(ctx, ScopeUser, query)
-		for _, entry := range existing {
-			if entry.Path == "" {
-				continue
-			}
-			if stringSimilarity(entry.Content, query) >= 0.4 {
-				if err := r.engine.Memory.Delete(ctx, ScopeUser, entry.Path); err == nil {
-					rr.MemoryWritten = append(rr.MemoryWritten, "deleted:"+entry.Path)
-				}
-			}
-		}
-		return
-	}
-
-	existing, _ := r.engine.Memory.Search(ctx, ScopeUser, content)
-	for _, entry := range existing {
-		if entry.Content == "" || entry.Path == "" {
-			continue
-		}
-		if stringSimilarity(entry.Content, content) >= 0.5 {
-			if err := r.engine.Memory.StrReplace(ctx, ScopeUser, entry.Path, entry.Content, content); err == nil {
-				rr.MemoryWritten = append(rr.MemoryWritten, entry.Path)
-				return
-			}
-		}
-	}
-
-	path := fmt.Sprintf("/facts/%d.md", time.Now().UnixNano())
-	if err := r.engine.Memory.Create(ctx, ScopeUser, path, content); err == nil {
-		rr.MemoryWritten = append(rr.MemoryWritten, path)
-	}
+// handleMemoryTrigger is a NO-OP placeholder.
+//
+// SDK_V3_REMOVE: previous implementation invoked memory provider directly
+// from regex-detected user phrases (e.g. "remember that ..."). That bypassed
+// the tool layer and caused duplicate / orphan entries. In v3, all memory
+// writes go through the Memory tool driven by the LLM, with read-before-write
+// validation in the tool layer. Callers that still want the old behaviour
+// should set their own MemoryTriggerDetector and write through the tool.
+func (r *Runtime) handleMemoryTrigger(_ context.Context, _ string, _ *RuntimeResult) {
 }
 
 // ── RuntimeResult ─────────────────────────────────────────────────────────────
@@ -588,10 +432,8 @@ type RuntimeResult struct {
 	StopReason    string             `json:"stop_reason"`
 	Trace         []Span             `json:"trace,omitempty"`
 	TraceID       string             `json:"trace_id,omitempty"`
-	SkillsLoaded  []string           `json:"skills_loaded,omitempty"`
 	MemoryRead    bool               `json:"memory_read"`
 	MemoryWritten []string           `json:"memory_written,omitempty"`
-	InferredFacts []InferredFact     `json:"inferred_facts,omitempty"`
 	Warnings      []string           `json:"warnings,omitempty"`
 	Enforcement   *EnforcementResult `json:"enforcement,omitempty"`
 	StartedAt     time.Time          `json:"started_at"`

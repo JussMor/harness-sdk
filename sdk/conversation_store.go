@@ -102,27 +102,25 @@ func (s *InMemoryConversationStore) Delete(_ context.Context, id string) error {
 // serializableConversation is the JSON-friendly view of a Conversation
 // (mu omitted, maps as plain).
 type serializableConversation struct {
-	ID           string                  `json:"id"`
-	ThreadID     string                  `json:"thread_id,omitempty"`
-	Messages     []ChatMessage           `json:"messages"`
-	LoadedSkills map[string]LoadedSkill  `json:"loaded_skills,omitempty"`
-	MemoryRead   bool                    `json:"memory_read"`
-	TurnCount    int                     `json:"turn_count"`
-	CreatedAt    string                  `json:"created_at"`
-	LastTurnAt   string                  `json:"last_turn_at,omitempty"`
+	ID         string        `json:"id"`
+	ThreadID   string        `json:"thread_id,omitempty"`
+	Messages   []ChatMessage `json:"messages"`
+	MemoryRead bool          `json:"memory_read"`
+	TurnCount  int           `json:"turn_count"`
+	CreatedAt  string        `json:"created_at"`
+	LastTurnAt string        `json:"last_turn_at,omitempty"`
 }
 
 func serializeConversation(c *Conversation) ([]byte, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	sc := serializableConversation{
-		ID:           c.ID,
-		ThreadID:     c.ThreadID,
-		Messages:     c.Messages,
-		LoadedSkills: c.LoadedSkills,
-		MemoryRead:   c.MemoryRead,
-		TurnCount:    c.TurnCount,
-		CreatedAt:    c.CreatedAt.Format("2006-01-02T15:04:05Z07:00"),
+		ID:         c.ID,
+		ThreadID:   c.ThreadID,
+		Messages:   c.Messages,
+		MemoryRead: c.MemoryRead,
+		TurnCount:  c.TurnCount,
+		CreatedAt:  c.CreatedAt.Format("2006-01-02T15:04:05Z07:00"),
 	}
 	if !c.LastTurnAt.IsZero() {
 		sc.LastTurnAt = c.LastTurnAt.Format("2006-01-02T15:04:05Z07:00")
@@ -136,15 +134,11 @@ func deserializeConversation(data []byte) (*Conversation, error) {
 		return nil, fmt.Errorf("deserialize conversation: %w", err)
 	}
 	c := &Conversation{
-		ID:           sc.ID,
-		ThreadID:     sc.ThreadID,
-		Messages:     sc.Messages,
-		LoadedSkills: sc.LoadedSkills,
-		MemoryRead:   sc.MemoryRead,
-		TurnCount:    sc.TurnCount,
-	}
-	if c.LoadedSkills == nil {
-		c.LoadedSkills = make(map[string]LoadedSkill)
+		ID:         sc.ID,
+		ThreadID:   sc.ThreadID,
+		Messages:   sc.Messages,
+		MemoryRead: sc.MemoryRead,
+		TurnCount:  sc.TurnCount,
 	}
 	if c.Messages == nil {
 		c.Messages = make([]ChatMessage, 0)

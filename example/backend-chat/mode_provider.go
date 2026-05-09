@@ -6,17 +6,13 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
-	"sync"
 
 	ab "github.com/everfaz/autobuild-sdk"
 	sdktokenizers "github.com/everfaz/autobuild-sdk/providers/tokenizers"
 )
 
-var (
-	backendSkillsOnce     sync.Once
-	backendSkillsProvider ab.SkillProvider
-	backendSkillsErr      error
-)
+// SDK_V3_REMOVE: backendSkillsProvider/loadBackendSkills removed with the
+// legacy skill subsystem. Skills will return as a Tool in v3.
 
 // newModeEngine builds a fully-wired agentRuntime using the SDK Runtime.
 func newModeEngine(provider ab.LLMProvider, model string, logContext RuntimeLogContext) (*ab.Engine, *agentRuntime, error) {
@@ -24,10 +20,6 @@ func newModeEngine(provider ab.LLMProvider, model string, logContext RuntimeLogC
 }
 
 func newModeEngineWithDB(provider ab.LLMProvider, model string, logContext RuntimeLogContext, db *sql.DB, threads ab.ThreadProvider) (*ab.Engine, *agentRuntime, error) {
-	backendSkillsOnce.Do(func() {
-		backendSkillsProvider, backendSkillsErr = loadBackendSkills()
-	})
-	skills := backendSkillsProvider
 	memory, memRoots, err := loadBackendMemory()
 	if err != nil {
 		memory = nil
@@ -43,7 +35,6 @@ func newModeEngineWithDB(provider ab.LLMProvider, model string, logContext Runti
 	rt := &agentRuntime{
 		chatID:    logContext.ChatID,
 		modelName: model,
-		skills:    skills,
 		memory:    memory,
 		execCtx:   ab.NewExecutionContext(),
 	}
@@ -54,7 +45,6 @@ func newModeEngineWithDB(provider ab.LLMProvider, model string, logContext Runti
 	// Main engine with all providers
 	engine := ab.NewWithDefaults(128_000)
 	engine.LLM = provider
-	engine.Skills = skills
 	engine.Memory = memory
 	engine.Tools = rt.tools
 	engine.Threads = threads
@@ -102,14 +92,6 @@ func newModeEngineWithDB(provider ab.LLMProvider, model string, logContext Runti
 			Provider: provider,
 			Model:    bareModel,
 			MaxWords: 200,
-		}).
-		WithMaxSkillTokens(6_000).
-		WithMemoryWriter(&ab.InferredMemoryWriter{
-			Provider:        provider,
-			Model:           bareModel,
-			MaxFacts:        3,
-			MinConfidence:   0.75,
-			DedupeThreshold: 0.6,
 		}).
 		WithThinkingBudget(resolveThinkingBudget(logContext.Mode)).
 		WithSessionContext(ab.LocalTimeSessionContext()).

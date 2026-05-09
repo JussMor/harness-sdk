@@ -48,10 +48,6 @@ func (s *SQLiteConversationStore) Save(ctx context.Context, conv *ab.Conversatio
 	if err != nil {
 		return fmt.Errorf("marshal messages: %w", err)
 	}
-	skillsJSON, err := json.Marshal(conv.LoadedSkills)
-	if err != nil {
-		return fmt.Errorf("marshal skills: %w", err)
-	}
 
 	_, err = s.db.ExecContext(ctx, `
 INSERT INTO sdk_conversations(id, thread_id, messages_json, loaded_skills_json, memory_read, turn_count, created_at, updated_at)
@@ -66,7 +62,7 @@ ON CONFLICT(id) DO UPDATE SET
 		conv.ID,
 		conv.ThreadID,
 		string(messagesJSON),
-		string(skillsJSON),
+		"[]", // SDK_V3_REMOVE: loaded_skills_json column kept for schema compat
 		boolToInt(conv.MemoryRead),
 		conv.TurnCount,
 		conv.CreatedAt.Format(time.RFC3339),
@@ -108,9 +104,7 @@ FROM sdk_conversations WHERE id = ?`, id)
 	if err := json.Unmarshal([]byte(messagesJSON), &conv.Messages); err != nil {
 		return nil, fmt.Errorf("unmarshal messages: %w", err)
 	}
-	if err := json.Unmarshal([]byte(skillsJSON), &conv.LoadedSkills); err != nil {
-		conv.LoadedSkills = make(map[string]ab.LoadedSkill)
-	}
+	_ = skillsJSON // SDK_V3_REMOVE: legacy loaded_skills_json column ignored
 	if conv.Messages == nil {
 		conv.Messages = make([]ab.ChatMessage, 0)
 	}

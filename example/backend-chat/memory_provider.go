@@ -7,7 +7,6 @@ import (
 	"path/filepath"
 
 	ab "github.com/everfaz/autobuild-sdk"
-	sdkembedders "github.com/everfaz/autobuild-sdk/providers/embedders"
 	sdkmemory "github.com/everfaz/autobuild-sdk/providers/memory"
 )
 
@@ -37,13 +36,8 @@ func loadBackendMemory() (ab.MemoryProvider, []ab.MemoryRoot, error) {
 	}
 
 	var mem ab.MemoryProvider = provider
-	if apiKey := os.Getenv("VOYAGE_API_KEY"); apiKey != "" {
-		embedder := sdkembedders.NewVoyage(apiKey, "voyage-3")
-		mem = ab.NewHybridMemorySearch(provider, embedder)
-		log.Printf("backend memory: root=%s (hybrid BM25+Voyage search)", root)
-	} else {
-		log.Printf("backend memory: root=%s (BM25 search)", root)
-	}
+	// SDK_V3_REMOVE: Voyage hybrid search removed (embedder subsystem deleted).
+	log.Printf("backend memory: root=%s (BM25 search)", root)
 
 	return mem, ab.DefaultMemoryRoots, nil
 }
