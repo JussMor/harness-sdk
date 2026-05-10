@@ -2,6 +2,7 @@
 name: execution-planning
 version: 1.1.0
 description: Break down a multi-step task into an execution plan with dependencies, sequencing, and parallelization. Use when the task has 3+ executables or unclear ordering.
+when_to_use: When the user asks for sequencing, dependency mapping, execution waves, or parallelization of a multi-step implementation.
 category: planning
 triggers:
   - execution planning
@@ -23,6 +24,7 @@ updated: 2026-05-04
 ## When to use
 
 Load this skill when:
+
 - A task has 3 or more distinct steps that need ordering
 - The user asks how to sequence or parallelize work
 - Dependencies between steps need to be made explicit

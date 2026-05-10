@@ -69,6 +69,9 @@ func BuildLLMFromEnv() ab.LLMProvider {
 	// Ollama via SDK provider — Chat + ChatStream (NDJSON), native tools, vision
 	ollamaProvider := sdkllm.NewOllama(getenv("OLLAMA_MODEL", "llama3.1"))
 	ollamaProvider.BaseURL = getenv("OLLAMA_BASE_URL", "http://localhost:11434")
+	// Most modern Ollama models support native tool-calling. Keep this
+	// configurable to allow quick fallback for models that don't.
+	ollamaProvider.NativeToolCalls = strings.ToLower(getenv("OLLAMA_NATIVE_TOOL_CALLS", "true")) != "false"
 	routedProviders["ollama"] = ollamaProvider
 
 	// Ensure defaultProvider is available

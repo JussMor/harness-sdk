@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strings"
 	"time"
 
 	autobuild "github.com/everfaz/autobuild-sdk"
@@ -151,8 +152,10 @@ func parseOllamaResponse(body []byte) (*autobuild.ChatResponse, error) {
 			TotalTokens:      raw.PromptEvalCount + raw.EvalCount,
 		},
 	}
-	for _, tc := range raw.Message.ToolCalls {
+	for i, tc := range raw.Message.ToolCalls {
+		id := fmt.Sprintf("ollama_tool_%d", i+1)
 		out.ToolCalls = append(out.ToolCalls, autobuild.ToolCallEntry{
+			ID:        id,
 			Name:      tc.Function.Name,
 			Arguments: string(tc.Function.Arguments),
 		})
@@ -189,7 +192,7 @@ func (o *Ollama) ChatStream(ctx context.Context, req autobuild.ChatRequest) (<-c
 		return nil, fmt.Errorf("ollama: Model is required")
 	}
 
-	body, err := buildOllamaRequest(model, req, true)
+	body, err := buildOllamaRequest(model, req, true, o.NativeToolCalls)
 	if err != nil {
 		return nil, err
 	}
@@ -221,7 +224,7 @@ func (o *Ollama) ChatStream(ctx context.Context, req autobuild.ChatRequest) (<-c
 }
 
 // buildOllamaRequest mirrors what Chat sends, optionally streaming.
-func buildOllamaRequest(model string, req autobuild.ChatRequest, stream bool) ([]byte, error) {
+func buildOllamaRequest(model string, req autobuild.ChatRequest, stream bool, nativeToolCalls bool) ([]byte, error) {
 	msgs := make([]map[string]any, 0, len(req.Messages))
 	for _, m := range req.Messages {
 		msg := map[string]any{
@@ -246,6 +249,16 @@ func buildOllamaRequest(model string, req autobuild.ChatRequest, stream bool) ([
 		"messages": msgs,
 		"stream":   stream,
 	}
+	if nativeToolCalls && len(req.Tools) > 0 {
+		tools := make([]map[string]any, 0, len(req.Tools))
+		for _, t := range req.Tools {
+			tools = append(tools, map[string]any{
+				"type":     t.Type,
+				"function": t.Function,
+			})
+		}
+		body["tools"] = tools
+	}
 	if req.Temperature > 0 {
 		body["options"] = map[string]any{"temperature": req.Temperature}
 	}
@@ -264,7 +277,13 @@ func readOllamaStream(ctx context.Context, body io.Reader, out chan<- autobuild.
 		}
 		var chunk struct {
 			Message struct {
-				Content string `json:"content"`
+				Content   string `json:"content"`
+				ToolCalls []struct {
+					Function struct {
+						Name      string          `json:"name"`
+						Arguments json.RawMessage `json:"arguments"`
+					} `json:"function"`
+				} `json:"tool_calls,omitempty"`
 			} `json:"message"`
 			Done            bool   `json:"done"`
 			DoneReason      string `json:"done_reason"`
@@ -285,6 +304,21 @@ func readOllamaStream(ctx context.Context, body io.Reader, out chan<- autobuild.
 			out <- autobuild.StreamEvent{
 				Type:  autobuild.StreamEventDelta,
 				Delta: chunk.Message.Content,
+			}
+		}
+		for i, tc := range chunk.Message.ToolCalls {
+			id := fmt.Sprintf("ollama_stream_tool_%d", i+1)
+			name := strings.TrimSpace(tc.Function.Name)
+			if name == "" {
+				continue
+			}
+			out <- autobuild.StreamEvent{
+				Type: autobuild.StreamEventToolCall,
+				ToolCall: &autobuild.ToolCallEntry{
+					ID:        id,
+					Name:      name,
+					Arguments: string(tc.Function.Arguments),
+				},
 			}
 		}
 		if chunk.Done {

@@ -262,6 +262,27 @@ func (r *Runtime) runStreamInternal(
 		systemPrompt = r.engine.Prompt.Build()
 	}
 
+	// Per-turn dynamic reminders (skills, agents, memory listing).
+	// Mirrors the injection in Runtime.execution for the sync path.
+	if r.engine.Tools != nil {
+		if blocks, err := r.engine.Tools.CollectDynamicReminders(ctx); err == nil && len(blocks) > 0 {
+			wrapped := make([]string, 0, len(blocks))
+			for _, b := range blocks {
+				if w := SystemReminder(b); w != "" {
+					wrapped = append(wrapped, w)
+				}
+			}
+			joined := JoinSystemReminders(wrapped...)
+			if joined != "" {
+				if systemPrompt != "" {
+					systemPrompt += "\n\n" + joined
+				} else {
+					systemPrompt = joined
+				}
+			}
+		}
+	}
+
 	dispatcher := NewToolDispatcher(r.engine.Tools, r.engine.Sandbox)
 	if r.permissions != nil {
 		dispatcher.WithPermissions(r.permissions)

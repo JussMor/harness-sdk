@@ -2,6 +2,7 @@
 name: writing
 version: 1.1.0
 description: Professional writing and document creation. BLUF-first structure, prose over bullets for arguments, clear hierarchy. Use for memos, reports, articles, and long-form content.
+when_to_use: When the user asks to draft, rewrite, or improve long-form prose documents (memo, report, article, proposal).
 category: documents
 triggers:
   - writing
@@ -26,6 +27,7 @@ updated: 2026-05-04
 ## When to use
 
 Load this skill when:
+
 - User asks to write, draft, rewrite, or edit a document
 - The output is long-form prose (memo, report, article, proposal)
 - The writing needs to be professional and structured
