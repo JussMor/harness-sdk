@@ -4,28 +4,32 @@
 
 // StreamEventName — string union of every StreamEventType constant in the SDK.
 export type StreamEventName =
+  | "agent_result"
   | "artifact_created"
   | "artifact_updated"
+  | "compaction"
   | "delta"
   | "done"
   | "error"
   | "interrupt_required"
   | "interrupt_resolved"
-  | "subagent_result"
+  | "plan_mode_changed"
   | "thinking"
   | "tool_call"
   | "tool_result"
   | "turn_complete";
 
 export const StreamEventNames = [
+  "agent_result",
   "artifact_created",
   "artifact_updated",
+  "compaction",
   "delta",
   "done",
   "error",
   "interrupt_required",
   "interrupt_resolved",
-  "subagent_result",
+  "plan_mode_changed",
   "thinking",
   "tool_call",
   "tool_result",

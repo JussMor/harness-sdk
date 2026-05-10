@@ -23,10 +23,6 @@ type Runtime struct {
 	model  string
 
 	// Configurable behavior
-	maxSkills       int
-	skillThreshold  float64
-	memoryTrigger   MemoryTriggerDetector
-	memoryWriter    *InferredMemoryWriter
 	safety          SafetyFilter
 	tokenizer       Tokenizer
 	store           ConversationStore
@@ -36,6 +32,12 @@ type Runtime struct {
 	memoryRootsV2   []MemoryRoot
 	thinkingBudget  int
 	interruptGate   *InterruptGate
+	permissions     *PermissionEngine
+	planController  *PlanController
+
+	// emit is set during streaming runs so phases (preparation, plan-mode
+	// transitions) can publish out-of-band events. Nil during sync Run.
+	emit func(StreamEvent)
 }
 
 // Tokenizer estimates token count for a string. Replace the default heuristic
@@ -83,28 +85,29 @@ func TruncateToTokens(text string, maxTokens int, tok Tokenizer) string {
 	return text[:limit]
 }
 
-// MemoryTriggerDetector inspects a user message for memory write intent.
-type MemoryTriggerDetector func(message string) (content string, detected bool)
-
 // NewRuntime creates a Runtime over an Engine with sensible defaults.
 func NewRuntime(engine *Engine) *Runtime {
 	return &Runtime{
-		engine:         engine,
-		maxSkills:      3,
-		skillThreshold: 0.3,
-		memoryTrigger:  DefaultMemoryTriggerDetector,
-		safety:         nil,
-		tokenizer:      HeuristicTokenizer{},
+		engine:    engine,
+		safety:    nil,
+		tokenizer: HeuristicTokenizer{},
 	}
 }
 
-func (r *Runtime) WithMode(modeID string) *Runtime              { r.mode = modeID; return r }
-func (r *Runtime) WithModel(m string) *Runtime                  { r.model = m; return r }
-func (r *Runtime) WithSkillThreshold(t float64) *Runtime        { r.skillThreshold = t; return r }
-func (r *Runtime) WithMaxSkills(n int) *Runtime                 { r.maxSkills = n; return r }
-func (r *Runtime) WithMemoryTrigger(d MemoryTriggerDetector) *Runtime { r.memoryTrigger = d; return r }
-func (r *Runtime) WithSafety(s SafetyFilter) *Runtime           { r.safety = s; return r }
-func (r *Runtime) WithMemoryWriter(w *InferredMemoryWriter) *Runtime { r.memoryWriter = w; return r }
+func (r *Runtime) WithMode(modeID string) *Runtime    { r.mode = modeID; return r }
+func (r *Runtime) WithModel(m string) *Runtime        { r.model = m; return r }
+func (r *Runtime) WithSafety(s SafetyFilter) *Runtime { r.safety = s; return r }
+
+// WithPermissions installs a v3 PermissionEngine that runs before tool
+// execution. It supersedes the per-tool CheckPermissions callback path:
+// when an engine is set, the dispatcher hands every call through it. The
+// engine itself folds the legacy CheckPermissions in as a fallback step,
+// so existing tools keep working while gaining declarative rules + an
+// optional human approver.
+func (r *Runtime) WithPermissions(eng *PermissionEngine) *Runtime {
+	r.permissions = eng
+	return r
+}
 func (r *Runtime) WithTokenizer(t Tokenizer) *Runtime           { r.tokenizer = t; return r }
 func (r *Runtime) WithConversationStore(s ConversationStore) *Runtime { r.store = s; return r }
 
@@ -121,6 +124,27 @@ func (r *Runtime) WithSessionContext(p SessionContextProvider) *Runtime {
 // messages are silently lost. With it, a summary is injected into LayerMemory.
 func (r *Runtime) WithCompactor(c Compactor) *Runtime {
 	r.compactor = c
+	return r
+}
+
+// WithPlanController binds a PlanController so plan-mode transitions
+// (Enter/Exit) publish StreamEventPlanModeChanged on streaming runs.
+// The runtime takes over OnStateChanged and forwards previously-set
+// callbacks if any.
+func (r *Runtime) WithPlanController(pc *PlanController) *Runtime {
+	if pc == nil {
+		return r
+	}
+	prev := pc.OnStateChanged
+	pc.OnStateChanged = func(ev PlanModeEvent) {
+		if prev != nil {
+			prev(ev)
+		}
+		if r.emit != nil {
+			r.emit(StreamEvent{Type: StreamEventPlanModeChanged, PlanMode: &ev})
+		}
+	}
+	r.planController = pc
 	return r
 }
 
@@ -147,18 +171,6 @@ func (r *Runtime) WithMemoryRoots(roots ...MemoryRoot) *Runtime {
 // Default 0 = disabled.
 func (r *Runtime) WithThinkingBudget(budgetTokens int) *Runtime {
 	r.thinkingBudget = budgetTokens
-	return r
-}
-
-// WithMaxSkillTokens caps how many tokens of skill content can be injected
-// into LayerSkills. When combined skill content exceeds this, it is truncated
-// at token boundaries using the configured tokenizer.
-//
-// Default 0 = no cap.
-func (r *Runtime) WithMaxSkillTokens(maxTokens int) *Runtime {
-	if r.engine.HasPrompt() {
-		r.engine.Prompt.SetMaxLayerTokens(LayerSkills, maxTokens)
-	}
 	return r
 }
 
@@ -261,143 +273,63 @@ func (r *Runtime) Run(ctx context.Context, conv *Conversation, userMessage strin
 // ── Orientation (cold start only) ────────────────────────────────────────────
 
 func (r *Runtime) orientation(ctx context.Context, userMessage string, conv *Conversation, rr *RuntimeResult) error {
-	// Read memory → LayerMemory using labeled roots
+	// Memory → LayerMemory using the Claude Code memdir contract:
+	//
+	//   1. Inject the static behavioural prompt (taxonomy, two-step save,
+	//      freshness, read-before-write).
+	//   2. Inline the MEMORY.md index for each requested scope. The index
+	//      is short by contract — full memory bodies are read on demand
+	//      via the memory tool, NOT stuffed into the system prompt.
+	//
+	// Per-turn dynamic manifest + freshness reminders are added separately
+	// by the memory tool's DynamicReminder hook in execution().
 	if r.engine.HasMemory() && r.engine.HasPrompt() {
-		roots := r.memoryRootsV2
-		if len(roots) == 0 {
-			roots = DefaultMemoryRoots
+		scopes := uniqueScopesFromRoots(r.memoryRootsV2)
+		if len(scopes) == 0 {
+			scopes = []Scope{ScopeUser, ScopeProject}
 		}
-		var memContent strings.Builder
-		for _, root := range roots {
-			content, err := r.engine.Memory.View(ctx, root.Scope, root.Path)
-			if err != nil || strings.TrimSpace(content) == "" {
-				continue
+		section := BuildMemdirPromptSection(ctx, r.engine.Memory, scopes...)
+		if section != "" {
+			if r.maxMemoryTokens > 0 && r.tokenizer != nil &&
+				r.tokenizer.Count(section) > r.maxMemoryTokens {
+				section = evictMemoryToTokenBudget(section, r.maxMemoryTokens, r.tokenizer)
 			}
-			if root.Label != "" {
-				memContent.WriteString("## ")
-				memContent.WriteString(root.Label)
-				memContent.WriteString("\n\n")
-			}
-			memContent.WriteString(strings.TrimSpace(content))
-			memContent.WriteString("\n\n")
-		}
-		if memContent.Len() > 0 {
-			memStr := memContent.String()
-			if r.maxMemoryTokens > 0 && r.tokenizer.Count(memStr) > r.maxMemoryTokens {
-				memStr = evictMemoryToTokenBudget(memStr, r.maxMemoryTokens, r.tokenizer)
-			}
-			r.engine.Prompt.Set(LayerMemory, memStr)
+			r.engine.Prompt.Set(LayerMemory, section)
 			rr.MemoryRead = true
 			conv.MemoryRead = true
 		}
 	}
 
-	// Match and load skills → LayerSkills
-	if err := r.matchAndLoadSkills(ctx, userMessage, conv, rr); err != nil {
-		return err
-	}
-
-	// Build LayerSession: session context (time/location/user)
+	// Skills are loaded lazily by the Skill tool — no orientation-time matching.
 	r.buildSessionLayer(ctx, conv, userMessage)
 	return nil
+}
+
+// uniqueScopesFromRoots collapses the legacy MemoryRoot list into the set
+// of distinct scopes the caller wants bootstrapped. Order is preserved on
+// first occurrence.
+func uniqueScopesFromRoots(roots []MemoryRoot) []Scope {
+	if len(roots) == 0 {
+		return nil
+	}
+	seen := make(map[Scope]bool, len(roots))
+	out := make([]Scope, 0, len(roots))
+	for _, r := range roots {
+		if r.Scope == "" || seen[r.Scope] {
+			continue
+		}
+		seen[r.Scope] = true
+		out = append(out, r.Scope)
+	}
+	return out
 }
 
 // ── Warm turn refresh ─────────────────────────────────────────────────────────
 
+// warmRefresh runs on non-cold turns. Only the session layer needs to be
+// rebuilt; skills are loaded lazily through the Skill tool.
 func (r *Runtime) warmRefresh(ctx context.Context, userMessage string, conv *Conversation) error {
 	r.buildSessionLayer(ctx, conv, userMessage)
-
-	if r.engine.HasSkills() {
-		matches, err := r.engine.Skills.Match(ctx, userMessage)
-		if err == nil {
-			for _, m := range matches {
-				if conv.IsSkillLoaded(m.Skill.Name) {
-					continue
-				}
-				if m.Score < r.skillThreshold {
-					break
-				}
-				skill, err := r.engine.Skills.Load(ctx, m.Skill.Name)
-				if err != nil {
-					continue
-				}
-				if r.engine.HasPrompt() {
-					existing := r.engine.Prompt.Get(LayerSkills)
-					newContent := existing
-					if newContent != "" {
-						newContent += "\n\n"
-					}
-					newContent += "# Skill: " + skill.Name + "\n\n" + skill.Content + "\n\n"
-					cap := r.engine.Prompt.maxLayerTokens[LayerSkills]
-					if cap > 0 && r.tokenizer.Count(newContent) > cap {
-						newContent = TruncateToTokens(newContent, cap, r.tokenizer)
-					}
-					r.engine.Prompt.Set(LayerSkills, newContent)
-				}
-				conv.MarkSkillLoaded(skill.Name, m.Score, r.tokenizer.Count(skill.Content))
-			}
-		}
-	}
-	return nil
-}
-
-func (r *Runtime) matchAndLoadSkills(ctx context.Context, userMessage string, conv *Conversation, rr *RuntimeResult) error {
-	if !r.engine.HasSkills() || !r.engine.HasPrompt() {
-		return nil
-	}
-	matches, err := r.engine.Skills.Match(ctx, userMessage)
-	if err != nil {
-		return fmt.Errorf("skill match: %w", err)
-	}
-	var skillContent strings.Builder
-	loaded := 0
-	seen := make(map[string]bool)
-
-	var loadSkill func(name string, depth int) *Skill
-	loadSkill = func(name string, depth int) *Skill {
-		if depth > 4 || seen[name] || conv.IsSkillLoaded(name) || loaded >= r.maxSkills {
-			return nil
-		}
-		seen[name] = true
-		skill, err := r.engine.Skills.Load(ctx, name)
-		if err != nil {
-			return nil
-		}
-		for _, dep := range skill.Meta.Requires {
-			if dep != "" && dep != name {
-				loadSkill(dep, depth+1)
-			}
-		}
-		skillContent.WriteString("# Skill: ")
-		skillContent.WriteString(skill.Name)
-		skillContent.WriteString("\n\n")
-		skillContent.WriteString(skill.Content)
-		skillContent.WriteString("\n\n")
-		conv.MarkSkillLoaded(skill.Name, 1.0, r.tokenizer.Count(skill.Content))
-		rr.SkillsLoaded = append(rr.SkillsLoaded, skill.Name)
-		loaded++
-		return skill
-	}
-
-	for _, m := range matches {
-		if loaded >= r.maxSkills {
-			break
-		}
-		if m.Score < r.skillThreshold {
-			break
-		}
-		loadSkill(m.Skill.Name, 0)
-	}
-	if skillContent.Len() > 0 {
-		content := skillContent.String()
-		if r.engine.HasPrompt() {
-			cap := r.engine.Prompt.maxLayerTokens[LayerSkills]
-			if cap > 0 && r.tokenizer.Count(content) > cap {
-				content = TruncateToTokens(content, cap, r.tokenizer)
-			}
-		}
-		r.engine.Prompt.Set(LayerSkills, content)
-	}
 	return nil
 }
 
@@ -427,10 +359,6 @@ func (r *Runtime) buildSessionLayer(ctx context.Context, conv *Conversation, use
 
 func (r *Runtime) preparation(ctx context.Context, conv *Conversation, rr *RuntimeResult) error {
 	if r.engine.HasBudget() && r.engine.HasPrompt() {
-		skillTokens := 0
-		for _, s := range conv.LoadedSkills {
-			skillTokens += s.TokenEstimate
-		}
 		memoryTokens := r.tokenizer.Count(r.engine.Prompt.Get(LayerMemory))
 
 		compResult := EnforceWithCompaction(
@@ -438,17 +366,11 @@ func (r *Runtime) preparation(ctx context.Context, conv *Conversation, rr *Runti
 			r.engine.Budget,
 			r.compactor,
 			conv,
-			r.engine.Skills,
-			skillTokens,
 			memoryTokens,
 		)
 		enforce := compResult.EnforcementResult
 		if enforce.OverflowTokens > 0 {
 			rr.Enforcement = enforce
-			if len(enforce.EvictedSkills) > 0 {
-				rr.Warnings = append(rr.Warnings,
-					fmt.Sprintf("budget: evicted %d skills", len(enforce.EvictedSkills)))
-			}
 			if enforce.TruncatedHistory {
 				rr.Warnings = append(rr.Warnings,
 					fmt.Sprintf("budget: dropped %d messages", enforce.HistoryDropped))
@@ -460,6 +382,19 @@ func (r *Runtime) preparation(ctx context.Context, conv *Conversation, rr *Runti
 		if compResult.Summary != "" && r.engine.HasPrompt() {
 			r.engine.Prompt.Append(LayerMemory, "\n\nContext summary (from earlier turns):\n"+compResult.Summary)
 		}
+		// Surface the compaction signal to streaming consumers so the UI
+		// can show a "memory compacted" indicator. Only emitted when
+		// history was truncated.
+		if r.emit != nil && enforce.TruncatedHistory {
+			r.emit(StreamEvent{
+				Type: StreamEventCompaction,
+				Compaction: &CompactionEvent{
+					MessagesDropped: enforce.HistoryDropped,
+					OverflowTokens:  enforce.OverflowTokens,
+					Summary:         compResult.Summary,
+				},
+			})
+		}
 	}
 	return nil
 }
@@ -468,7 +403,8 @@ func (r *Runtime) preparation(ctx context.Context, conv *Conversation, rr *Runti
 
 func (r *Runtime) execution(ctx context.Context, conv *Conversation, rr *RuntimeResult) (*AgentLoopResult, error) {
 	cfg := AgentLoopConfig{
-		MaxTurns: 50,
+		MaxTurns:    50,
+		Permissions: r.permissions,
 		OnToolCall: func(call ToolCallEntry) bool {
 			if r.safety != nil {
 				v := r.safety.Inspect(ctx, call)
@@ -503,6 +439,30 @@ func (r *Runtime) execution(ctx context.Context, conv *Conversation, rr *Runtime
 		cfg.SystemPrompt = r.engine.Prompt.Build()
 	}
 
+	// Per-turn dynamic reminders — skill listing, agent listing, etc.
+	// Tools opt in via the Tool.DynamicReminder hook. Without this, the
+	// LLM never sees which skills/agents are available and replies as if
+	// none exist. Reminders are appended to the system prompt as a
+	// <system-reminder> block so they ride alongside the static layers.
+	if r.engine.Tools != nil {
+		if blocks, err := r.engine.Tools.CollectDynamicReminders(ctx); err == nil && len(blocks) > 0 {
+			wrapped := make([]string, 0, len(blocks))
+			for _, b := range blocks {
+				if w := SystemReminder(b); w != "" {
+					wrapped = append(wrapped, w)
+				}
+			}
+			joined := JoinSystemReminders(wrapped...)
+			if joined != "" {
+				if cfg.SystemPrompt != "" {
+					cfg.SystemPrompt += "\n\n" + joined
+				} else {
+					cfg.SystemPrompt = joined
+				}
+			}
+		}
+	}
+
 	loopResult, err := RunAgentLoopWithEngine(ctx, r.engine, r.mode, cfg, conv.Messages)
 	if err != nil {
 		return nil, err
@@ -519,64 +479,15 @@ func (r *Runtime) execution(ctx context.Context, conv *Conversation, rr *Runtime
 // ── Closure ──────────────────────────────────────────────────────────────────
 
 func (r *Runtime) closure(ctx context.Context, userMessage string, loopResult *AgentLoopResult, conv *Conversation, rr *RuntimeResult) error {
-	if r.engine.HasMemory() && r.memoryTrigger != nil {
-		content, detected := r.memoryTrigger(userMessage)
-		if detected && content != "" {
-			r.handleMemoryTrigger(ctx, content, rr)
-		}
-	}
-
-	if r.memoryWriter != nil && loopResult != nil && r.engine.HasMemory() {
-		facts, err := r.memoryWriter.Extract(ctx, conv, loopResult.FinalContent)
-		if err == nil && len(facts) > 0 {
-			written, _ := r.memoryWriter.WriteWithDedup(ctx, r.engine.Memory, facts)
-			for _, fact := range written {
-				if fact.Path != "" {
-					rr.MemoryWritten = append(rr.MemoryWritten, fact.Path)
-				}
-				rr.InferredFacts = append(rr.InferredFacts, fact)
-			}
-		}
-	}
-
+	// In v3 all memory writes go through the Memory tool driven by the LLM,
+	// with read-before-write validation in the tool layer. The runtime no
+	// longer inspects user messages for trigger phrases.
+	_ = ctx
+	_ = userMessage
+	_ = loopResult
+	_ = conv
+	_ = rr
 	return nil
-}
-
-// handleMemoryTrigger writes, replaces, or deletes a memory entry.
-func (r *Runtime) handleMemoryTrigger(ctx context.Context, content string, rr *RuntimeResult) {
-	if strings.HasPrefix(content, "FORGET: ") {
-		query := strings.TrimPrefix(content, "FORGET: ")
-		existing, _ := r.engine.Memory.Search(ctx, ScopeUser, query)
-		for _, entry := range existing {
-			if entry.Path == "" {
-				continue
-			}
-			if stringSimilarity(entry.Content, query) >= 0.4 {
-				if err := r.engine.Memory.Delete(ctx, ScopeUser, entry.Path); err == nil {
-					rr.MemoryWritten = append(rr.MemoryWritten, "deleted:"+entry.Path)
-				}
-			}
-		}
-		return
-	}
-
-	existing, _ := r.engine.Memory.Search(ctx, ScopeUser, content)
-	for _, entry := range existing {
-		if entry.Content == "" || entry.Path == "" {
-			continue
-		}
-		if stringSimilarity(entry.Content, content) >= 0.5 {
-			if err := r.engine.Memory.StrReplace(ctx, ScopeUser, entry.Path, entry.Content, content); err == nil {
-				rr.MemoryWritten = append(rr.MemoryWritten, entry.Path)
-				return
-			}
-		}
-	}
-
-	path := fmt.Sprintf("/facts/%d.md", time.Now().UnixNano())
-	if err := r.engine.Memory.Create(ctx, ScopeUser, path, content); err == nil {
-		rr.MemoryWritten = append(rr.MemoryWritten, path)
-	}
 }
 
 // ── RuntimeResult ─────────────────────────────────────────────────────────────
@@ -588,69 +499,12 @@ type RuntimeResult struct {
 	StopReason    string             `json:"stop_reason"`
 	Trace         []Span             `json:"trace,omitempty"`
 	TraceID       string             `json:"trace_id,omitempty"`
-	SkillsLoaded  []string           `json:"skills_loaded,omitempty"`
 	MemoryRead    bool               `json:"memory_read"`
 	MemoryWritten []string           `json:"memory_written,omitempty"`
-	InferredFacts []InferredFact     `json:"inferred_facts,omitempty"`
 	Warnings      []string           `json:"warnings,omitempty"`
 	Enforcement   *EnforcementResult `json:"enforcement,omitempty"`
 	StartedAt     time.Time          `json:"started_at"`
 	CompletedAt   time.Time          `json:"completed_at"`
-}
-
-// ── Defaults ──────────────────────────────────────────────────────────────────
-
-// DefaultMemoryTriggerDetector detects English + Spanish memory triggers.
-func DefaultMemoryTriggerDetector(message string) (string, bool) {
-	lower := strings.ToLower(strings.TrimSpace(message))
-
-	explicit := []string{
-		"remember that ", "please remember ", "don't forget that ", "don't forget ",
-		"update your memory ", "save that ",
-		"recuerda que ", "por favor recuerda ", "no olvides que ", "no olvides ",
-		"actualiza tu memoria ", "guarda que ",
-	}
-	for _, trigger := range explicit {
-		if idx := strings.Index(lower, trigger); idx >= 0 {
-			content := strings.TrimSpace(message[idx+len(trigger):])
-			if content != "" {
-				return content, true
-			}
-		}
-	}
-
-	stateChange := []string{
-		"i no longer ", "i moved to ", "i now work at ", "i changed ", "i started ", "my name is ", "i am ",
-		"ya no ", "me mudé a ", "ahora trabajo en ", "cambié ", "empecé ", "mi nombre es ", "me llamo ",
-	}
-	for _, trigger := range stateChange {
-		if idx := strings.Index(lower, trigger); idx >= 0 {
-			rest := message[idx:]
-			end := strings.IndexAny(rest, ".\n")
-			if end < 0 {
-				end = len(rest)
-			}
-			content := strings.TrimSpace(rest[:end])
-			if content != "" {
-				return content, true
-			}
-		}
-	}
-
-	forget := []string{
-		"forget about ", "please forget ",
-		"olvida ", "olvídate de ",
-	}
-	for _, trigger := range forget {
-		if idx := strings.Index(lower, trigger); idx >= 0 {
-			content := strings.TrimSpace(message[idx+len(trigger):])
-			if content != "" {
-				return "FORGET: " + content, true
-			}
-		}
-	}
-
-	return "", false
 }
 
 // evictMemoryToTokenBudget truncates memory content to fit within maxTokens.

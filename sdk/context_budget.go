@@ -3,23 +3,15 @@ package autobuild
 import "context"
 
 // ContextBudget defines token limits for the different layers of context
-// injected into each LLM request. Without this, loading many skills +
-// long memory + deep conversation history silently overflows the context
-// window and the provider returns an error or truncates.
+// injected into each LLM request. Without this, long memory + deep
+// conversation history silently overflow the context window.
 //
-// Usage:
-//
-//	budget := DefaultContextBudget(128_000)
-//	if budget.WouldOverflow(skillTokens, memoryTokens, historyTokens) {
-//	    // evict oldest skills or summarize memory before calling LLM
-//	}
+// Skills no longer participate in budget — they are loaded lazily on demand
+// (Claude Code model). This keeps the budget agnostic of the SDK's
+// extensibility surface.
 type ContextBudget struct {
 	// TotalTokens is the model's context window size.
 	TotalTokens int
-
-	// SkillBudget is the max tokens that loaded skills may consume.
-	// Skills are evicted (oldest first) when this is exceeded.
-	SkillBudget int
 
 	// MemoryBudget is the max tokens that injected memory may consume.
 	MemoryBudget int
@@ -33,12 +25,11 @@ type ContextBudget struct {
 }
 
 // DefaultContextBudget returns sensible defaults for the given window size.
-// Distribution: 10% skills, 15% memory, 60% history, 15% reserve.
+// Distribution: 25% memory, 60% history, 15% reserve.
 func DefaultContextBudget(windowSize int) ContextBudget {
 	return ContextBudget{
 		TotalTokens:   windowSize,
-		SkillBudget:   windowSize / 10,
-		MemoryBudget:  windowSize * 15 / 100,
+		MemoryBudget:  windowSize * 25 / 100,
 		HistoryBudget: windowSize * 60 / 100,
 		ReserveTokens: windowSize * 15 / 100,
 	}
@@ -50,55 +41,35 @@ func (b ContextBudget) Available() int {
 }
 
 // WouldOverflow returns true if the given token counts would exceed the budget.
-func (b ContextBudget) WouldOverflow(skillTokens, memoryTokens, historyTokens int) bool {
-	if skillTokens > b.SkillBudget {
-		return true
-	}
+func (b ContextBudget) WouldOverflow(memoryTokens, historyTokens int) bool {
 	if memoryTokens > b.MemoryBudget {
 		return true
 	}
 	if historyTokens > b.HistoryBudget {
 		return true
 	}
-	total := skillTokens + memoryTokens + historyTokens + b.ReserveTokens
+	total := memoryTokens + historyTokens + b.ReserveTokens
 	return total > b.TotalTokens
-}
-
-// SkillEvictionCount returns how many skills to evict (from oldest) to fit
-// within the skill budget, given a uniform token cost per skill.
-func (b ContextBudget) SkillEvictionCount(loadedSkills int, tokensPerSkill int) int {
-	if loadedSkills == 0 || tokensPerSkill == 0 {
-		return 0
-	}
-	maxSkills := b.SkillBudget / tokensPerSkill
-	if loadedSkills <= maxSkills {
-		return 0
-	}
-	return loadedSkills - maxSkills
 }
 
 // EnforcementResult describes what was done to bring usage under budget.
 type EnforcementResult struct {
-	OverflowTokens int      `json:"overflow_tokens"`
-	EvictedSkills  []string `json:"evicted_skills,omitempty"`
-	TruncatedHistory bool   `json:"truncated_history"`
-	HistoryDropped int      `json:"history_dropped"`
-	StillOverflow  bool     `json:"still_overflow"`
+	OverflowTokens   int  `json:"overflow_tokens"`
+	TruncatedHistory bool `json:"truncated_history"`
+	HistoryDropped   int  `json:"history_dropped"`
+	StillOverflow    bool `json:"still_overflow"`
 }
 
-// Enforce takes action on overflow instead of just warning. Order:
+// Enforce takes action on overflow:
 //
-//   1. Evict skills (oldest first) until skill budget fits
-//   2. Truncate oldest non-system history messages until history budget fits
-//   3. Report any remaining overflow as StillOverflow=true
+//   1. Truncate oldest non-system history messages until history budget fits
+//   2. Report any remaining overflow as StillOverflow=true
 //
-// Skills are evicted via SkillProvider.Unload. History is mutated in place.
-// Returns the actions taken. Always non-nil.
+// History is mutated in place. Returns the actions taken. Always non-nil.
 func (b ContextBudget) Enforce(
-	ctx context.Context,
-	conv *Conversation,
-	skills SkillProvider,
-	skillTokens, memoryTokens int,
+	_ context.Context,
+	_ *Conversation,
+	memoryTokens int,
 	historyMessages *[]ChatMessage,
 ) *EnforcementResult {
 	res := &EnforcementResult{}
@@ -109,26 +80,12 @@ func (b ContextBudget) Enforce(
 		historyTokens += len(m.Content) / 4
 	}
 
-	if !b.WouldOverflow(skillTokens, memoryTokens, historyTokens) {
+	if !b.WouldOverflow(memoryTokens, historyTokens) {
 		return res
 	}
 
-	res.OverflowTokens = (skillTokens + memoryTokens + historyTokens + b.ReserveTokens) - b.TotalTokens
+	res.OverflowTokens = (memoryTokens + historyTokens + b.ReserveTokens) - b.TotalTokens
 
-	// 1. Skill eviction (LRU)
-	if skills != nil && conv != nil && skillTokens > b.SkillBudget {
-		toFree := skillTokens - b.SkillBudget
-		policy := LRUEvictionPolicy{}
-		victims := policy.Evict(conv.SkillsByLastUsed(), toFree)
-		for _, name := range victims {
-			if err := skills.Unload(ctx, name); err == nil {
-				conv.MarkSkillUnloaded(name)
-				res.EvictedSkills = append(res.EvictedSkills, name)
-			}
-		}
-	}
-
-	// 2. History truncation — drop oldest non-system messages
 	if historyTokens > b.HistoryBudget {
 		newHistory := make([]ChatMessage, 0, len(*historyMessages))
 		// Always keep system messages
@@ -137,7 +94,6 @@ func (b ContextBudget) Enforce(
 				newHistory = append(newHistory, m)
 			}
 		}
-		// Add messages from newest, stopping when budget reached
 		nonSystem := make([]ChatMessage, 0, len(*historyMessages))
 		for _, m := range *historyMessages {
 			if m.Role != RoleSystem {
@@ -160,11 +116,10 @@ func (b ContextBudget) Enforce(
 		*historyMessages = newHistory
 	}
 
-	// 3. Re-check
 	historyTokens = 0
 	for _, m := range *historyMessages {
 		historyTokens += len(m.Content) / 4
 	}
-	res.StillOverflow = b.WouldOverflow(skillTokens, memoryTokens, historyTokens)
+	res.StillOverflow = b.WouldOverflow(memoryTokens, historyTokens)
 	return res
 }

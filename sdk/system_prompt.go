@@ -36,10 +36,6 @@ const (
 	// Refreshed each session — not hardcoded.
 	LayerMemory SystemPromptLayer = "memory"
 
-	// LayerSkills contains the content of currently loaded skills.
-	// Added/removed dynamically as skills are loaded/unloaded.
-	LayerSkills SystemPromptLayer = "skills"
-
 	// LayerSession holds ephemeral situational context for this conversation.
 	// Includes: current time, active thread ID, what the user is viewing,
 	// recent observations worth surfacing.
@@ -55,7 +51,6 @@ var layerOrder = []SystemPromptLayer{
 	LayerCore,
 	LayerBehavior,
 	LayerMemory,
-	LayerSkills,
 	LayerSession,
 	LayerMode,
 }
@@ -69,7 +64,6 @@ var layerOrder = []SystemPromptLayer{
 //	builder := NewSystemPromptBuilder()
 //	builder.Set(LayerCore, corePrompt)
 //	builder.Set(LayerMemory, memoryContent)
-//	builder.Set(LayerSkills, skill1.Content+"\n\n"+skill2.Content)
 //	prompt := builder.Build()
 type SystemPromptBuilder struct {
 	layers         map[SystemPromptLayer]string
@@ -86,12 +80,10 @@ func NewSystemPromptBuilder() *SystemPromptBuilder {
 
 // SetMaxLayerTokens caps the token count for a specific layer.
 // When Build() is called with a tokenizer, layers exceeding their cap are
-// truncated before concatenation. This prevents LayerSkills from exploding
-// the system prompt when many skills are loaded simultaneously.
+// truncated before concatenation.
 //
-// Example — cap skills to 4k tokens:
+// Example — cap memory to 8k tokens:
 //
-//	builder.SetMaxLayerTokens(LayerSkills, 4000)
 //	builder.SetMaxLayerTokens(LayerMemory, 8000)
 func (b *SystemPromptBuilder) SetMaxLayerTokens(layer SystemPromptLayer, maxTokens int) {
 	b.maxLayerTokens[layer] = maxTokens

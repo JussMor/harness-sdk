@@ -328,9 +328,9 @@ function adaptSSEEvent(type: string, dataText: string): StreamEvent | null {
           }>
         },
       }
-    case "subagent_result":
+    case "agent_result":
       return {
-        type: "subagent_result",
+        type: "agent_result",
         data: parsed as {
           id: string
           task: string
@@ -361,13 +361,26 @@ function adaptSSEEvent(type: string, dataText: string): StreamEvent | null {
         type: "artifact_updated",
         data: parsed as import("./types").StreamComponentArtifact,
       }
+    case "compaction":
+      return {
+        type: "compaction",
+        data: parsed as import("./types").StreamCompaction,
+      }
+    case "plan_mode_changed":
+      return {
+        type: "plan_mode_changed",
+        data: parsed as import("./types").StreamPlanMode,
+      }
     case "done":
       return {
         type: "done",
         data: parsed as { runId?: string; messageId?: number },
       }
     case "error":
-      return { type: "error", data: parsed as { error?: string } }
+      return {
+        type: "error",
+        data: parsed as { error?: string; category?: string; detail?: string },
+      }
     default:
       return null
   }

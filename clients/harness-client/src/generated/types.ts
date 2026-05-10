@@ -38,6 +38,12 @@ export interface AgentLoopConfig {
    */
   SandboxID: string;
   /**
+   * Permissions optionally installs the v3 PermissionEngine on the
+   * dispatcher created for this loop. nil = use legacy per-tool
+   * CheckPermissions only.
+   */
+  Permissions?: PermissionEngine;
+  /**
    * MaxTurns caps the LLM ↔ tool loop. 0 defaults to 50.
    */
   MaxTurns: number /* int */;
@@ -115,6 +121,156 @@ export interface AgentLoopResult {
    * "aborted", "stopped", "error".
    */
   StopReason: string;
+}
+
+//////////
+// source: agent_tool.go
+/*
+Package autobuild — AgentTool v3.
+
+Mirrors Claude Code's AgentTool faithfully but stays agnostic:
+  - no provider lock-in
+  - no language defaults
+  - no Claude-specific frontmatter quirks
+  - layout supports BOTH `<root>/<name>.md` AND `<root>/<name>/AGENT.md`
+
+An Agent is a focused, isolated loop the model spawns to handle a
+self-contained task. The model invokes the Agent tool with a description
+and a prompt; the SDK runs an inner AgentLoop with the agent's own tool
+allowlist, model, and max-turn cap, then returns the final assistant text.
+
+Parallel execution: when the LLM emits multiple Agent tool_use blocks in
+the same assistant message, the dispatcher (sdk/dispatch.go) runs them
+concurrently as long as the AgentTool's IsConcurrencySafe predicate
+returns true (it does — agents are independent by construction).
+
+Cross-reference: see /memories/session/agent-tool-v3-spec.md for the
+full mapping from Claude Code source.
+*/
+
+/**
+ * AgentSourceKind identifies where an Agent definition was loaded from.
+ */
+export type AgentSourceKind = string;
+export const AgentSourceBundled: AgentSourceKind = "bundled";
+export const AgentSourceFilesystem: AgentSourceKind = "filesystem";
+export const AgentSourceRemote: AgentSourceKind = "remote";
+/**
+ * Agent is a single subagent definition resolved at startup.
+ * The Body is the system prompt for the spawned loop. Argument substitution
+ * and ${SESSION_ID} / ${AGENT_DIR} expansion happen at invoke time.
+ */
+export interface Agent {
+  /**
+   * Identity
+   */
+  Type: string; // canonical name; matches `subagent_type` in tool input
+  DisplayName: string;
+  Description: string; // short — drives the agent listing's whenToUse text
+  Color: string;
+  /**
+   * Tool gating
+   */
+  Tools: string[]; // allowlist; empty = inherit all parent tools
+  DisallowedTools: string[]; // denylist; combined with allowlist if both set
+  /**
+   * Behaviour
+   */
+  Model: string; // "" or "inherit" → use parent model
+  Effort: string; // "low" | "medium" | "high" | numeric
+  MaxTurns: number /* int */; // 0 → use AgentToolConfig default
+  Background: boolean; // run async; caller is notified later
+  InitialPrompt: string; // prepended to first user turn
+  /**
+   * Skills the agent should preload (list, comma- or space-separated)
+   */
+  PreloadSkills: string[];
+  /**
+   * Storage
+   */
+  Body: string; // SYSTEM PROMPT body (after frontmatter stripping)
+  BaseDir: string; // absolute path of the agent's dir (or file's dir for .md)
+  /**
+   * Provenance
+   */
+  Source: AgentSourceKind;
+}
+/**
+ * AgentResult is what an Agent returns to its parent (and to the LLM as
+ * the tool_result content). Mirrors the old SubagentResult shape so
+ * streaming consumers stay source-compatible.
+ */
+export interface AgentResult {
+  type: string; // agent type that ran ("" for fork / ad-hoc)
+  description: string; // 3-5 word task summary the model gave
+  task: string; // full prompt the model gave
+  output: string; // final assistant text
+  turns: number /* int */;
+  usage: TokenUsage;
+  stop_reason: string;
+  duration_ms: number;
+  trace?: ReasoningStep[];
+  model?: string;
+  system_prompt?: string;
+  background?: boolean;
+}
+/**
+ * AgentSource is a pluggable source of agent definitions.
+ */
+export type AgentSource = unknown;
+/**
+ * FilesystemAgentSource scans agent definitions from a directory. Supports
+ * BOTH layouts (matching Claude Code's loadAgentsDir):
+ *   - <Root>/<name>.md         (file form)
+ *   - <Root>/<name>/AGENT.md   (directory form)
+ */
+export interface FilesystemAgentSource {
+  Root: string;
+  Label: string;
+  Kind: AgentSourceKind;
+}
+/**
+ * RunAgentsInParallel runs N Agent invocations concurrently and returns
+ * results in input order. Used by the parent dispatcher when the model
+ * emits multiple Agent tool_use blocks in a single assistant turn.
+ * Drop-in replacement for the old RunSubagentsInParallel.
+ */
+export interface AgentInvocation {
+  Agent?: Agent;
+  Description: string;
+  Prompt: string;
+  MaxTurns: number /* int */; // 0 → use AgentToolConfig default
+  Model: string; // "" → use Agent.Model or parent default
+}
+/**
+ * AgentToolConfig wires an AgentTool. All fields are agnostic.
+ */
+export interface AgentToolConfig {
+  /**
+   * Sources discover Agents. Order matters: earlier sources win on type
+   * collisions.
+   */
+  Sources: AgentSource[];
+  /**
+   * ParentEngine is the Engine whose tools/LLM the spawned agents reuse
+   * (via RunAgentLoopWithEngine). Required.
+   */
+  ParentEngine?: Engine;
+  /**
+   * DefaultModel is used when an agent definition doesn't specify one and
+   * the tool input doesn't override.
+   */
+  DefaultModel: string;
+  /**
+   * DefaultMaxTurns caps any agent that doesn't specify maxTurns.
+   * Default 10.
+   */
+  DefaultMaxTurns: number /* int */;
+  /**
+   * AllowedTypes optionally restricts which agent types the model can
+   * spawn (mirrors Claude Code's `Agent(x,y)` allowedAgentTypes filter).
+   */
+  AllowedTypes: string[];
 }
 
 //////////
@@ -214,77 +370,181 @@ export type ArtifactEmitter = unknown;
 export type InterruptRequester = unknown;
 
 //////////
-// source: closure.go
-
-/**
- * InferredMemoryWriter asks the LLM to identify facts worth remembering
- * after each turn. Deduplication prevents near-identical entries accumulating.
- */
-export interface InferredMemoryWriter {
-  Provider: LLMProvider;
-  Model: string;
-  MaxFacts: number /* int */;
-  MinConfidence: number /* float64 */;
-  DedupeThreshold: number /* float64 */; // 0-1, default 0.6
-}
-/**
- * InferredFact is one memorable fact extracted from a turn.
- */
-export interface InferredFact {
-  content: string;
-  scope: Scope;
-  confidence: number /* float64 */;
-  reason: string;
-  path?: string;
-  merged?: boolean;
-}
-export type SkillEvictionPolicy = unknown;
-export interface LRUEvictionPolicy {
-}
-export interface TTLEvictionPolicy {
-  MaxIdle: number;
-}
-
-//////////
 // source: compaction.go
 
 /**
- * Compactor summarizes dropped conversation history into a compact memory
- * entry instead of silently discarding it. When the context budget enforces
- * truncation, old messages are gone from the active window — but their
- * content shouldn't be lost entirely.
- * This mirrors how Claude handles long context: older turns get summarized
- * and the summary is kept as a layered memory entry. Without this, the agent
- * loses facts from early in the conversation the moment they scroll out.
- * The Compactor runs after Budget.Enforce and before the next LLM call.
- * It receives the dropped messages and returns a compact summary string
- * that gets injected into LayerMemory (overwriting or appending).
+ * CompactDirection mirrors Claude Code's PartialCompactDirection.
+ */
+export type CompactDirection = string;
+/**
+ * CompactDirectionFrom summarises everything from a marker forward
+ * (the default for full compaction).
+ */
+export const CompactDirectionFrom: CompactDirection = "from";
+/**
+ * CompactDirectionUpTo summarises everything up to a marker, leaving
+ * the recent tail intact.
+ */
+export const CompactDirectionUpTo: CompactDirection = "up_to";
+/**
+ * CompactionResult is the outcome of a single Compact() call.
+ */
+export interface CompactionResult {
+  /**
+   * Summary is the raw text the LLM produced (still contains <analysis>
+   * and <summary> XML blocks).
+   */
+  summary: string;
+  /**
+   * FormattedSummary is the post-processed version: <analysis> stripped,
+   * <summary> tags rewritten to plain section headers.
+   */
+  formatted_summary: string;
+  /**
+   * Direction reports whether this was a full ("from") or partial
+   * ("up_to") compaction.
+   */
+  direction: CompactDirection;
+  /**
+   * TurnsSummarized is the number of dropped chat messages that were
+   * folded into this summary.
+   */
+  turns_summarized: number /* int */;
+  /**
+   * TokensIn is a rough estimate of the prompt tokens fed to the LLM.
+   */
+  tokens_in?: number /* int */;
+}
+/**
+ * Compactor summarises dropped conversation history into a compact memory
+ * entry. Returning a *CompactionResult instead of a bare string lets callers
+ * observe the analysis / summary split without re-parsing.
  */
 export type Compactor = unknown;
 /**
- * LLMCompactor asks the LLM to summarize the dropped messages.
- * Produces a compact summary with facts and decisions made in those turns.
+ * LLMCompactor calls an LLM with the structured 9-section prompt. Drop-in
+ * replacement for the v2 implementation; existing callers using
+ * `&LLMCompactor{Provider, Model}` continue to compile (MaxWords is now
+ * ignored in favour of the structured prompt).
  */
 export interface LLMCompactor {
+  /**
+   * Provider is the LLM backend used for summarisation. Required.
+   */
   Provider: LLMProvider;
-  Model: string; // small model recommended — compression is cheap
-  MaxWords: number /* int */; // target summary length. Default 200 words
+  /**
+   * Model is the model name to send. A small, cheap model is recommended.
+   */
+  Model: string;
+  /**
+   * CustomInstructions is appended to the prompt verbatim before the
+   * no-tools trailer. Use to inject project-specific guidance (e.g.
+   * "preserve all SQL schema definitions in section 3").
+   */
+  CustomInstructions: string;
+  /**
+   * MaxWords is retained for backwards compatibility but no longer
+   * affects the prompt — the structured prompt sets its own length
+   * expectations through the section schema.
+   */
+  MaxWords: number /* int */;
+  /**
+   * Direction overrides the default compaction direction. When unset
+   * the direction passed to Compact() wins.
+   */
+  Direction: CompactDirection;
 }
 /**
- * EnforceWithCompaction extends Budget.Enforce to run a Compactor on the
- * dropped messages before discarding them. The summary is injected as an
- * additional paragraph in the memory layer.
- * Usage in Runtime.preparation:
- * 	enforce := EnforceWithCompaction(ctx, budget, compactor, conv, skills, ...)
- * 	if enforce.Summary != "" {
- * 	    engine.Prompt.Append(LayerMemory, "Context summary:\n"+enforce.Summary)
- * 	}
+ * CompactionThresholds is the per-model token-window configuration (port of
+ * getEffectiveContextWindowSize + getAutoCompactThreshold).
+ * Defaults match Claude Code's constants:
+ *   - AutoBufferTokens     = 13_000
+ *   - WarningBufferTokens  = 20_000
+ *   - ErrorBufferTokens    = 20_000
+ *   - ManualBufferTokens   = 3_000
+ *   - SummaryReserveTokens = 20_000
+ */
+export interface CompactionThresholds {
+  /**
+   * ContextWindow is the model's full context-window size (tokens).
+   * Required: callers must set this since the SDK does not ship a
+   * per-model registry (it stays agnostic).
+   */
+  ContextWindow: number /* int */;
+  /**
+   * SummaryReserveTokens reserves headroom for the compaction call's
+   * own output. Default 20_000 (matches Claude Code's
+   * MAX_OUTPUT_TOKENS_FOR_SUMMARY).
+   */
+  SummaryReserveTokens: number /* int */;
+  /**
+   * AutoBufferTokens is the trigger threshold below the effective
+   * window. Default 13_000.
+   */
+  AutoBufferTokens: number /* int */;
+  /**
+   * WarningBufferTokens flags "approaching limit". Default 20_000.
+   */
+  WarningBufferTokens: number /* int */;
+  /**
+   * ErrorBufferTokens flags "very near limit". Default 20_000.
+   */
+  ErrorBufferTokens: number /* int */;
+  /**
+   * ManualBufferTokens is the buffer reserved for the user's manual
+   * /compact invocation. Default 3_000.
+   */
+  ManualBufferTokens: number /* int */;
+}
+/**
+ * TokenWarningState is the result of CalculateTokenWarningState. Mirrors
+ * the shape of calculateTokenWarningState in autoCompact.ts.
+ */
+export interface TokenWarningState {
+  percent_left: number /* int */;
+  is_above_warning_threshold: boolean;
+  is_above_error_threshold: boolean;
+  is_above_auto_compact_threshold: boolean;
+  is_at_blocking_limit: boolean;
+}
+/**
+ * AutoCompactPolicy is the optional auto-trigger glue. ShouldAutoCompact
+ * is the equivalent of shouldAutoCompact() in autoCompact.ts; it includes
+ * a circuit breaker matching MAX_CONSECUTIVE_AUTOCOMPACT_FAILURES.
+ */
+export interface AutoCompactPolicy {
+  /**
+   * Thresholds defines per-model token windows. Required.
+   */
+  Thresholds: CompactionThresholds;
+  /**
+   * Enabled is the master switch (mirrors isAutoCompactEnabled). When
+   * false, ShouldAutoCompact always returns false.
+   */
+  Enabled: boolean;
+  /**
+   * MaxConsecutiveFailures stops auto-compaction after N straight
+   * failures (default 3, matching Claude Code).
+   */
+  MaxConsecutiveFailures: number /* int */;
+}
+/**
+ * EnforceCompactionResult bundles the budget enforcement outcome with the
+ * compaction summary. Back-compat shim so callers that previously consumed
+ * EnforceWithCompaction continue to work; the runtime now reads
+ * CompactionResult.FormattedSummary instead of the bare Summary string.
  */
 export interface EnforceCompactionResult {
   EnforcementResult?: EnforcementResult;
   /**
-   * Summary is the compacted text of the dropped messages.
-   * Empty if no messages were dropped or compactor returned nothing.
+   * Compaction is non-nil when at least one message was dropped AND a
+   * compactor was configured. May still carry an Error field — see
+   * CompactionResult.Error.
+   */
+  Compaction?: CompactionResult;
+  /**
+   * Summary is FormattedSummary when Compaction != nil, "" otherwise.
+   * Retained for back-compat with existing runtime call sites.
    */
   Summary: string;
 }
@@ -294,25 +554,17 @@ export interface EnforceCompactionResult {
 
 /**
  * ContextBudget defines token limits for the different layers of context
- * injected into each LLM request. Without this, loading many skills +
- * long memory + deep conversation history silently overflows the context
- * window and the provider returns an error or truncates.
- * Usage:
- * 	budget := DefaultContextBudget(128_000)
- * 	if budget.WouldOverflow(skillTokens, memoryTokens, historyTokens) {
- * 	    // evict oldest skills or summarize memory before calling LLM
- * 	}
+ * injected into each LLM request. Without this, long memory + deep
+ * conversation history silently overflow the context window.
+ * Skills no longer participate in budget — they are loaded lazily on demand
+ * (Claude Code model). This keeps the budget agnostic of the SDK's
+ * extensibility surface.
  */
 export interface ContextBudget {
   /**
    * TotalTokens is the model's context window size.
    */
   TotalTokens: number /* int */;
-  /**
-   * SkillBudget is the max tokens that loaded skills may consume.
-   * Skills are evicted (oldest first) when this is exceeded.
-   */
-  SkillBudget: number /* int */;
   /**
    * MemoryBudget is the max tokens that injected memory may consume.
    */
@@ -332,7 +584,6 @@ export interface ContextBudget {
  */
 export interface EnforcementResult {
   overflow_tokens: number /* int */;
-  evicted_skills?: string[];
   truncated_history: boolean;
   history_dropped: number /* int */;
   still_overflow: boolean;
@@ -343,8 +594,7 @@ export interface EnforcementResult {
 
 /**
  * Conversation holds the state of an ongoing conversation across multiple
- * Runtime.Run calls. It tracks the message history, which skills are loaded,
- * whether memory has been read, and which fields are warm vs. cold.
+ * Runtime.Run calls.
  * A Conversation is the unit of multi-turn interaction. Create one when the
  * user starts talking; reuse it for every subsequent message in the same
  * thread. Discard it when the conversation ends.
@@ -367,11 +617,6 @@ export interface Conversation {
    */
   Messages: ChatMessage[];
   /**
-   * LoadedSkills tracks which skills are currently in context.
-   * Used to avoid double-loading and to drive eviction.
-   */
-  LoadedSkills: { [key: string]: LoadedSkill};
-  /**
    * MemoryRead is true after orientation has read memory at least once.
    * Subsequent turns skip memory re-read unless ForceRefresh is set.
    */
@@ -388,16 +633,6 @@ export interface Conversation {
    * LastTurnAt is when the most recent Run completed.
    */
   LastTurnAt: string;
-}
-/**
- * LoadedSkill tracks metadata about a skill currently in context.
- */
-export interface LoadedSkill {
-  name: string;
-  loaded_at: string;
-  last_used: string;
-  score: number /* float64 */; // match score when loaded
-  token_estimate: number /* int */;
 }
 
 //////////
@@ -438,57 +673,6 @@ export interface ToolResult {
 }
 
 //////////
-// source: embeddings.go
-
-/**
- * Embedder produces a vector representation of text suitable for similarity
- * search. Implementations wrap providers like Voyage, OpenAI, or local models.
- * The SDK does not bundle an embedder — you bring your own. The interface
- * exists so ObservationStore and SkillProvider can swap from keyword matching
- * to semantic search without API changes for consumers.
- */
-export type Embedder = unknown;
-/**
- * SemanticSkillMatcher provides scored skill matching using embeddings.
- * Wrap your existing SkillProvider with this when keyword triggers
- * undermatch — e.g. when users phrase requests differently than the
- * skill's literal triggers.
- * The wrapper computes embeddings lazily (on first Match call per skill)
- * and caches them. If the underlying SkillProvider returns matches that
- * score well by keywords, those wins; otherwise semantic similarity fills in.
- */
-export interface SemanticSkillMatcher {
-}
-/**
- * SemanticMemorySearch wraps a MemoryProvider to add embedding-based retrieval.
- * Falls through to the underlying Search when no Embedder is configured.
- * Use when "user prefers terse responses" should match "user dislikes verbose
- * explanations" without requiring exact word overlap.
- */
-export interface SemanticMemorySearch {
-  Inner: MemoryProvider;
-  Embedder: Embedder;
-}
-/**
- * HybridMemorySearch combines BM25 (keyword) with vector (semantic) search using
- * reciprocal rank fusion (RRF) — the standard technique used by production
- * retrieval systems (Vespa, Elasticsearch, Pinecone).
- * Each candidate gets RRF score = Σ 1 / (k + rank_in_each_method)
- * where k=60 is a constant that dampens the contribution of low-ranked results.
- * Hybrid search consistently outperforms either method alone: BM25 captures
- * exact terms (acronyms, proper nouns, code identifiers) while embeddings
- * capture meaning (paraphrases, synonyms).
- */
-export interface HybridMemorySearch {
-  Inner: MemoryProvider;
-  Embedder: Embedder;
-  /**
-   * K is the RRF constant. Default 60.
-   */
-  K: number /* float64 */;
-}
-
-//////////
 // source: engine.go
 
 /**
@@ -501,7 +685,6 @@ export interface Engine {
   Memory: MemoryProvider;
   Sandbox: SandboxDriver;
   Tools?: ToolRegistry;
-  Skills: SkillProvider;
   Threads: ThreadProvider;
   Modes: ModeProvider;
   LLM: LLMProvider; // primary LLM — use RoutedLLMProvider for multi-model
@@ -678,48 +861,6 @@ export type ExecutionContext = unknown;
  * InMemoryExecutionContext is a thread-safe, non-persistent ExecutionContext.
  */
 export interface InMemoryExecutionContext {
-}
-
-//////////
-// source: human_in_loop.go
-
-/**
- * SafetyPause is a SafetyDecision that pauses the agent loop until a human
- * responds. Unlike SafetyBlock (instant rejection), SafetyPause suspends
- * execution and waits — the agent loop is live but frozen on that tool call.
- */
-export const SafetyPause: SafetyDecision = 3;
-/**
- * ApprovalRequest is the legacy shape for tool-approval interrupts. It maps
- * 1:1 to InterruptRequest{Kind: InterruptKindApproval, Approval: ...}.
- */
-export interface ApprovalRequest {
-  ID: string;
-  ToolCall: ToolCallEntry;
-  Reason: string;
-  CreatedAt: string;
-}
-/**
- * ApprovalResponse is the legacy shape for tool-approval responses. It maps
- * to InterruptResponse fields (ID, Approved, ModifiedArgs).
- */
-export interface ApprovalResponse {
-  ID: string;
-  Approved: boolean;
-  ModifiedArgs: string;
-}
-/**
- * ApprovalGate is a backwards-compatible facade over *InterruptGate scoped
- * to InterruptKindApproval requests. New code should use *InterruptGate
- * directly via Runtime.WithInterrupts.
- */
-export interface ApprovalGate {
-}
-/**
- * HumanApprovalFilter is a SafetyFilter that pauses the agent loop and waits
- * for human approval before allowing certain tool calls to execute.
- */
-export interface HumanApprovalFilter {
 }
 
 //////////
@@ -1040,6 +1181,111 @@ export interface RoutedLLMProvider {
 }
 
 //////////
+// source: memdir.go
+
+/**
+ * MemoryType is the closed four-type taxonomy for persistent memory entries.
+ * Content NOT derivable from the project (preferences, corrections, ongoing
+ * initiatives, external pointers) goes into one of these types. Code patterns,
+ * architecture, and git history are derivable and must NOT be stored as memory.
+ */
+export type MemoryType = string;
+export const MemoryTypeUser: MemoryType = "user"; // user role, preferences, knowledge
+export const MemoryTypeFeedback: MemoryType = "feedback"; // corrections + validated approaches
+export const MemoryTypeProject: MemoryType = "project"; // ongoing work, deadlines, motivations
+export const MemoryTypeReference: MemoryType = "reference"; // pointers to external systems
+/**
+ * MemoryStat is metadata returned by MemoryStater.
+ */
+export interface MemoryStat {
+  MtimeMs: number /* int64 */; // Unix milliseconds of last modification
+  Size: number /* int64 */;
+  IsDir: boolean;
+}
+/**
+ * MemoryStater is an optional interface a MemoryProvider may implement to
+ * expose mtime/size. memdir uses it for age annotations and freshness sorting.
+ * Providers that don't implement it fall back to time.Now() — relative age
+ * will be "today".
+ */
+export type MemoryStater = unknown;
+/**
+ * MemoryHeader is the parsed-frontmatter metadata for a single memory file.
+ */
+export interface MemoryHeader {
+  scope: Scope;
+  path: string; // path within the scope, e.g. "/feedback/testing.md"
+  filename: string;
+  name?: string;
+  description?: string;
+  type?: MemoryType;
+  mtime_ms?: number /* int64 */;
+}
+/**
+ * MaxMemoryFilesScanned caps the manifest size for relevance selection.
+ */
+export const MaxMemoryFilesScanned = 200;
+/**
+ * MemorySelector picks up to N memory headers most relevant to a query. The
+ * default is a keyword-overlap selector (KeywordMemorySelector); callers can
+ * plug in an LLM-backed selector for higher-fidelity recall.
+ */
+export type MemorySelector = unknown;
+/**
+ * KeywordMemorySelector ranks headers by keyword overlap between the query
+ * and each header's name+description+type+path. No LLM call required.
+ */
+export interface KeywordMemorySelector {
+}
+/**
+ * FindRelevantMemoriesOptions configures a relevance lookup.
+ */
+export interface FindRelevantMemoriesOptions {
+  Scopes: Scope[]; // defaults to {ScopeUser, ScopeProject}
+  Dir: string; // root dir per scope (default "/")
+  Limit: number /* int */; // defaults to 5
+  Selector: MemorySelector; // defaults to KeywordMemorySelector
+  AlreadySurfaced: { [key: string]: boolean}; // {scope|path} keys to exclude (already shown)
+}
+/**
+ * RelevantMemory pairs a header with its (already-loaded) content for direct
+ * injection into the prompt. Content is best-effort; on read error the
+ * memory is dropped.
+ */
+export interface RelevantMemory {
+  Header: MemoryHeader;
+  Content: string;
+}
+/**
+ * ReadBeforeWriteTracker enforces the contract that a memory file must be
+ * viewed (or freshly created) in the current session before it can be
+ * updated or deleted. Mirrors Claude Code's "read-before-write" guard for
+ * FileEditTool, applied to typed memory.
+ * Safe for concurrent use within a session.
+ */
+export interface ReadBeforeWriteTracker {
+}
+/**
+ * MemoryFrontmatter is the canonical header for a typed-memory file.
+ */
+export interface MemoryFrontmatter {
+  Name: string;
+  Description: string;
+  Type: MemoryType;
+}
+/**
+ * MemdirEntrypointFilename is the bootstrap memory index, loaded eagerly into
+ * the system prompt every turn. Contents follow Claude Code's contract: a
+ * concise list of pointers to typed memory files, no memory content directly.
+ */
+export const MemdirEntrypointFilename = "MEMORY.md";
+/**
+ * MaxMemdirEntrypointLines caps how many lines of MEMORY.md are spliced into
+ * the system prompt. Keeps token usage predictable when an index grows.
+ */
+export const MaxMemdirEntrypointLines = 200;
+
+//////////
 // source: memory.go
 
 /**
@@ -1085,6 +1331,57 @@ export interface MemoryEntry {
 export interface MemorySearchResult {
   MemoryEntry: MemoryEntry;
   score: number /* float64 */; // relevance 0-1
+}
+
+//////////
+// source: memory_tool.go
+
+/**
+ * MemoryToolConfig configures NewMemoryTool.
+ */
+export interface MemoryToolConfig {
+  /**
+   * Provider is the backing MemoryProvider. Required.
+   */
+  Provider: MemoryProvider;
+  /**
+   * Selector picks relevant memories for `find_relevant`.
+   * Defaults to KeywordMemorySelector (no LLM call).
+   */
+  Selector: MemorySelector;
+  /**
+   * Tracker enforces the read-before-write contract.
+   * If nil, a fresh in-memory tracker is created per tool instance.
+   */
+  Tracker?: ReadBeforeWriteTracker;
+  /**
+   * DefaultScope is used when the model omits the `scope` argument.
+   * Defaults to ScopeProject.
+   */
+  DefaultScope: Scope;
+  /**
+   * AllowedScopes limits which scopes the model can write to. nil =
+   * {ScopeUser, ScopeProject}. Reads always allow either scope.
+   */
+  AllowedScopes: Scope[];
+  /**
+   * DisableReadBeforeWrite turns the contract off (default: enforced).
+   * Disable only for tests / scripted seeding.
+   */
+  DisableReadBeforeWrite: boolean;
+  /**
+   * DisableTaxonomy allows create/str_replace without a `type` argument
+   * (default: required).
+   */
+  DisableTaxonomy: boolean;
+  /**
+   * DisableAntiMerge skips type-mismatch protection on writes (default: on).
+   */
+  DisableAntiMerge: boolean;
+  /**
+   * FindRelevantLimit caps `find_relevant` result count. Defaults to 5.
+   */
+  FindRelevantLimit: number /* int */;
 }
 
 //////////
@@ -1216,6 +1513,152 @@ export interface StaticModeProvider {
 export type Option = unknown;
 
 //////////
+// source: permissions.go
+
+/**
+ * PermissionBehavior is the outcome of a rule match or full Decide() call.
+ */
+export type PermissionBehavior = string;
+export const PermissionBehaviorAllow: PermissionBehavior = "allow";
+export const PermissionBehaviorDeny: PermissionBehavior = "deny";
+export const PermissionBehaviorAsk: PermissionBehavior = "ask";
+/**
+ * PermissionMode mirrors Claude Code's PermissionMode set.
+ */
+export type PermissionMode = string;
+export const PermissionModeDefault: PermissionMode = "default";
+export const PermissionModeAcceptEdits: PermissionMode = "acceptEdits";
+export const PermissionModePlan: PermissionMode = "plan";
+export const PermissionModeBypass: PermissionMode = "bypassPermissions";
+export const PermissionModeDontAsk: PermissionMode = "dontAsk";
+/**
+ * PermissionRuleSource records where a rule originated. Mirrors Claude
+ * Code's PermissionRuleSource.
+ */
+export type PermissionRuleSource = string;
+export const RuleSourceUserSettings: PermissionRuleSource = "userSettings";
+export const RuleSourceProjectSettings: PermissionRuleSource = "projectSettings";
+export const RuleSourceLocalSettings: PermissionRuleSource = "localSettings";
+export const RuleSourceFlagSettings: PermissionRuleSource = "flagSettings";
+export const RuleSourcePolicySettings: PermissionRuleSource = "policySettings";
+export const RuleSourceCLI: PermissionRuleSource = "cliArg";
+export const RuleSourceCommand: PermissionRuleSource = "command";
+export const RuleSourceSession: PermissionRuleSource = "session";
+/**
+ * PermissionRuleValue selects which tool the rule applies to and, optionally,
+ * a per-tool input subset (RuleContent). RuleContent is matched by the tool's
+ * registered RuleMatcher; semantics are tool-specific.
+ * 	{ToolName: "Bash", RuleContent: "npm install"} → Bash command prefix rule
+ * 	{ToolName: "Read", RuleContent: "/src/**"}     → file path glob rule
+ * 	{ToolName: "WebFetch", RuleContent: ""}        → tool-wide rule
+ */
+export interface PermissionRuleValue {
+  tool_name: string;
+  rule_content?: string;
+}
+/**
+ * PermissionRule pairs a value with its source and behavior.
+ */
+export interface PermissionRule {
+  source: PermissionRuleSource;
+  rule_behavior: PermissionBehavior;
+  rule_value: PermissionRuleValue;
+}
+/**
+ * PermissionDecisionV3 is the Decide() outcome. UpdatedInput optionally
+ * rewrites the args before execution (e.g. inject defaults, sanitize paths);
+ * nil = pass-through.
+ */
+export interface PermissionDecisionV3 {
+  behavior: PermissionBehavior;
+  reason?: string;
+  updated_input?: { [key: string]: unknown};
+  matched_rule?: PermissionRule;
+}
+/**
+ * RuleMatcher decides whether a single rule applies to a specific tool call.
+ * Matchers are registered per tool name; if none is registered, the engine
+ * falls back to ExactMatcher (treats RuleContent as an exact match against
+ * a stringified primary argument or, when empty, a tool-wide allow).
+ */
+export type RuleMatcher = unknown;
+/**
+ * RuleMatcherFunc adapts a function into a RuleMatcher.
+ */
+export type RuleMatcherFunc = unknown;
+/**
+ * PermissionApprover bridges an `ask` decision to a human (or remote agent).
+ * Implementations may pop a UI dialog, post to Slack, call a webhook, etc.
+ * Returning behavior=ask collapses to deny — implementations must ultimately
+ * resolve to allow or deny.
+ */
+export type PermissionApprover = unknown;
+/**
+ * PermissionApprovalRequest is the payload handed to the approver.
+ */
+export interface PermissionApprovalRequest {
+  tool_name: string;
+  input: { [key: string]: unknown};
+  reason?: string;
+}
+/**
+ * InterruptGateApprover routes `ask` requests through an InterruptGate so the
+ * existing chat front-end (SSE / WebSocket) can render an approval dialog.
+ */
+export interface InterruptGateApprover {
+  Gate?: InterruptGate;
+}
+/**
+ * ApproverFunc adapts a function into a PermissionApprover.
+ */
+export type ApproverFunc = unknown;
+/**
+ * PermissionEngine is the central decision point. Safe for concurrent use.
+ */
+export interface PermissionEngine {
+}
+
+//////////
+// source: plan_tool.go
+
+/**
+ * PlanController holds the shared state for a session's plan mode. Construct
+ * one per Runtime and pass it to NewPlanTool. Safe for concurrent use.
+ */
+export interface PlanController {
+  /**
+   * Optional callback fired when the user approves an exit. The runtime/host
+   * can use this to persist the plan, surface it in the UI, or kick off
+   * the implementation phase.
+   */
+  OnApproved: unknown;
+  /**
+   * Optional callback fired when the user rejects an exit. The agent stays
+   * in plan mode; hosts may use this to surface the rejection reason.
+   */
+  OnRejected: unknown;
+  /**
+   * OnStateChanged fires after Enter/Exit. The host (runtime/backend) uses
+   * this to publish StreamEventPlanModeChanged on the live SSE channel.
+   */
+  OnStateChanged: unknown;
+}
+/**
+ * PlanToolConfig configures the plan-mode tool pair.
+ */
+export interface PlanToolConfig {
+  /**
+   * Controller is required — it owns mode state and the plan buffer.
+   */
+  Controller?: PlanController;
+  /**
+   * AutoApprove skips the InterruptKindApproval call on Exit. Useful in
+   * non-interactive contexts (eval harness, scripted runs).
+   */
+  AutoApprove: boolean;
+}
+
+//////////
 // source: protocol.go
 
 /**
@@ -1313,7 +1756,6 @@ export interface Snapshot {
   turns: number /* int */;
   usage: TokenUsage;
   stop_reason: string;
-  skills_loaded?: string[];
   memory_written?: string[];
   captured_at: string;
 }
@@ -1328,8 +1770,6 @@ export interface SnapshotDiff {
   length_delta: number /* int */;
   turns_delta: number /* int */;
   usage_delta: TokenUsage;
-  skills_added?: string[];
-  skills_removed?: string[];
 }
 
 //////////
@@ -1361,10 +1801,6 @@ export type Tokenizer = unknown;
  */
 export interface HeuristicTokenizer {
 }
-/**
- * MemoryTriggerDetector inspects a user message for memory write intent.
- */
-export type MemoryTriggerDetector = unknown;
 export interface RuntimeResult {
   response: string;
   turns: number /* int */;
@@ -1372,10 +1808,8 @@ export interface RuntimeResult {
   stop_reason: string;
   trace?: Span[];
   trace_id?: string;
-  skills_loaded?: string[];
   memory_read: boolean;
   memory_written?: string[];
-  inferred_facts?: InferredFact[];
   warnings?: string[];
   enforcement?: EnforcementResult;
   started_at: string;
@@ -1574,7 +2008,6 @@ need. The [Runtime] orchestrator connects the providers automatically.
   - [SystemPromptBuilder]— layered system prompt assembly
   - [MemoryProvider]     — persistent two-scope memory (User / Project)
   - [ObservationStore]   — session-scoped working memory (not persistent)
-  - [SkillProvider]      — on-demand knowledge loading with scored matching
   - [ToolRegistry]       — typed tool definitions with JSON Schema
   - [ModeProvider]       — execution modes with model + tool config
   - [LLMProvider]        — chat completion backend (use [RoutedLLMProvider]
@@ -1683,92 +2116,157 @@ export type SessionContextProvider = unknown;
 export type SessionContextProviderFunc = unknown;
 
 //////////
-// source: skill.go
+// source: skill_tool.go
+/*
+Package autobuild — SkillTool v3.
+
+Mirrors Claude Code's SkillTool faithfully but stays agnostic:
+  - no provider lock-in (no Anthropic/Claude hardcodes)
+  - no language defaults (no Spanish/English keyword detection)
+  - variables are ${SKILL_DIR} and ${SESSION_ID} (not ${CLAUDE_*})
+  - the caller wires sources, session id, and bash executor
+
+Design (verified against /Users/jussmor/Developer/Claude Code/):
+
+  - Tool name: "Skill". Input: { skill: string, args?: string }.
+  - Skills are NOT loaded into the system prompt. Available skills are
+    surfaced via DynamicReminder as a <system-reminder> attachment, with
+    a 1% character budget over the model's context window.
+  - Layout: <root>/<skill-name>/SKILL.md only. Single .md files in a root
+    are not supported (matches Claude Code's loadSkillsFromSkillsDir).
+  - Lazy: only frontmatter + body are read at startup. Argument
+    substitution, ${SKILL_DIR}/${SESSION_ID} expansion, and bash
+    injection (!`cmd`) all run on each invoke via getPromptForCommand.
+  - Bash injection requires an opt-in BashExecutor and is gated by the
+    skill's allowed-tools whitelist. MCP / remote skills NEVER get bash
+    injection (untrusted).
+
+Cross-reference: see /memories/session/skill-tool-v3-spec.md for the
+full mapping from Claude Code source to this port.
+*/
 
 /**
- * SkillMeta holds the YAML frontmatter metadata required in every SKILL.md.
- * Example frontmatter:
- * 	---
- * 	name: agentic-execution-planning
- * 	version: 1.0.0
- * 	description: Turn an approved spec into an execution plan.
- * 	category: autobuild
- * 	triggers:
- * 	  - execution planning
- * 	  - dependency dag
- * 	author: obvious-team
- * 	created: 2026-04-06
- * 	---
+ * SkillSourceKind identifies where a Skill was loaded from. Used by the
+ * SkillTool to apply different security policies (e.g. no bash injection
+ * for remote sources).
  */
-export interface SkillMeta {
-  name: string;
-  version: string;
-  description: string;
-  category: string;
-  triggers: string[];
-  author: string;
-  created: string; // YYYY-MM-DD
-  /**
-   * Optional fields
-   */
-  requiredFeatureFlag?: string;
-  grantedTools?: string[];
-  /**
-   * Requires lists skills that must be loaded before this one.
-   * When this skill is loaded, each dependency is automatically loaded too.
-   * Circular dependencies are detected and skipped.
-   */
-  requires?: string[];
-}
+export type SkillSourceKind = string;
+export const SkillSourceBundled: SkillSourceKind = "bundled";
+export const SkillSourceFilesystem: SkillSourceKind = "filesystem";
+export const SkillSourceRemote: SkillSourceKind = "remote"; // MCP-equivalent
 /**
- * Skill is a package of domain-specific knowledge that the agent loads
- * on-demand. Skills override training data when there is a conflict.
- * A Skill is typically parsed from a SKILL.md file containing YAML
- * frontmatter (SkillMeta) followed by markdown content.
+ * Skill is a single invocable capability resolved at startup time.
+ * The Body is read eagerly; argument substitution and variable expansion
+ * happen at invoke time, not at load time.
  */
 export interface Skill {
   /**
-   * Meta holds all frontmatter fields parsed from the SKILL.md header.
+   * Identity
    */
-  meta: SkillMeta;
+  Name: string; // canonical name; matches the directory name
+  DisplayName: string; // optional override from frontmatter `name:`
+  Description: string;
+  WhenToUse: string;
   /**
-   * Name is the unique identifier (e.g. "writing", "user-cutlist-domain-model").
-   * Populated from Meta.Name for convenience.
+   * Behaviour
    */
-  name: string;
+  AllowedTools: string[]; // bash-injection whitelist (allowed-tools frontmatter)
+  ArgumentHint: string;
+  ArgumentNames: string[]; // named placeholders ($foo, $bar, ...)
+  Version: string;
+  Model: string; // "" = inherit
+  Effort: string; // "low" | "medium" | "high" | numeric string | ""
   /**
-   * Domain describes the knowledge area in human terms.
-   * Populated from Meta.Category for convenience.
+   * Discoverability
    */
-  domain: string;
+  DisableModelInvocation: boolean; // hidden from the SkillTool listing
+  UserInvocable: boolean; // default true; false hides from /commands UI
+  Paths: string[];
   /**
-   * Triggers are keywords that activate this skill.
-   * Populated from Meta.Triggers for convenience.
+   * Execution context
    */
-  triggers: string[];
+  ContextFork: boolean; // run in a forked subagent (reserved for a future release)
+  Agent: string; // optional agent override
   /**
-   * GrantedTools are additional tool names that become available when
-   * this skill is loaded.
+   * Storage
    */
-  granted_tools?: string[];
+  Body: string; // SKILL.md body (after frontmatter stripping)
+  BaseDir: string; // absolute path of the skill's directory; "" for bundled/remote
   /**
-   * Content is the full markdown body (everything after the frontmatter).
+   * Provenance
    */
-  content: string;
+  Source: SkillSourceKind;
 }
 /**
- * SkillMatch is a skill plus its relevance score for a given query.
+ * SkillSource is a pluggable source of skills. Implementations include
+ * FilesystemSkillSource (this file), but callers can supply bundled or
+ * remote sources without modifying the SDK.
  */
-export interface SkillMatch {
-  skill?: Skill;
-  score: number /* float64 */; // 0-1, higher = more relevant
-  matched_on: string; // which trigger fired
+export type SkillSource = unknown;
+/**
+ * FilesystemSkillSource scans `<Root>/<skill-name>/SKILL.md` directory
+ * layouts. Mirrors Claude Code's loadSkillsFromSkillsDir.
+ */
+export interface FilesystemSkillSource {
+  Root: string;
+  Label: string; // optional override for SourceName()
+  Kind: SkillSourceKind; // defaults to SkillSourceFilesystem
 }
 /**
- * SkillProvider abstracts loading, unloading, and discovering skills.
- * Loaded skills persist in the agent's context for the lifetime of the thread.
+ * Skill listing constants (mirror Claude Code).
  */
-export type SkillProvider = unknown;
+export const SkillBudgetContextPercent = 0.01;
+/**
+ * Skill listing constants (mirror Claude Code).
+ */
+export const SkillCharsPerToken = 4;
+/**
+ * Skill listing constants (mirror Claude Code).
+ */
+export const SkillDefaultCharBudget = 8_000;
+/**
+ * Skill listing constants (mirror Claude Code).
+ */
+export const SkillMaxListingDescChars = 250;
+/**
+ * Skill listing constants (mirror Claude Code).
+ */
+export const SkillMinDescLen = 20;
+/**
+ * SkillBashExecutor lets callers wire bash-injection (!`cmd` syntax in
+ * skill bodies) to whatever sandbox they use. It is opt-in: when nil,
+ * !`cmd` blocks are left as-is in the rendered prompt and the model sees
+ * them verbatim.
+ * The SDK guarantees executor is NEVER invoked for SkillSourceRemote
+ * skills (untrusted). For local/bundled skills, the SDK passes the
+ * allowed-tools list so the executor can enforce the whitelist.
+ */
+export type SkillBashExecutor = unknown;
+/**
+ * SkillToolConfig wires a SkillTool. All fields are agnostic — no
+ * provider-specific or language-specific defaults.
+ */
+export interface SkillToolConfig {
+  /**
+   * Sources discover skills. Order matters: earlier sources win on name
+   * collisions (matches Claude Code's uniqBy(localCommands, mcpSkills)).
+   */
+  Sources: SkillSource[];
+  /**
+   * SessionIDFn supplies the current session ID for ${SESSION_ID}
+   * expansion. May be nil (variable then expands to "").
+   */
+  SessionIDFn: unknown;
+  /**
+   * BashExecutor enables !`cmd` injection. May be nil.
+   */
+  BashExecutor: SkillBashExecutor;
+  /**
+   * ContextWindowTokens is used to compute the dynamic listing budget.
+   * 0 → use SkillDefaultCharBudget.
+   */
+  ContextWindowTokens: number /* int */;
+}
 
 //////////
 // source: streaming.go
@@ -1797,9 +2295,9 @@ export interface StreamEvent {
    */
   tool_result?: ToolResult;
   /**
-   * SubagentResult is set when Type=StreamEventSubagentResult.
+   * AgentResult is set when Type=StreamEventAgentResult.
    */
-  subagent_result?: SubagentResult;
+  agent_result?: AgentResult;
   /**
    * Interrupt is set when Type=StreamEventInterruptRequired or
    * Type=StreamEventInterruptResolved. Discriminate sub-variants on Kind.
@@ -1815,6 +2313,54 @@ export interface StreamEvent {
    * Final is the complete accumulated response when Type=StreamEventDone.
    */
   final?: AgentLoopResult;
+  /**
+   * Compaction is set when Type=StreamEventCompaction. Reports that the
+   * runtime had to summarise older history because the context budget
+   * was exceeded; the frontend can surface a "memory compacted" indicator.
+   */
+  compaction?: CompactionEvent;
+  /**
+   * PlanMode is set when Type=StreamEventPlanModeChanged. Reports a
+   * transition into or out of plan mode (EnterPlanMode / approved or
+   * rejected ExitPlanMode).
+   */
+  plan_mode?: PlanModeEvent;
+}
+/**
+ * CompactionEvent is the payload of StreamEventCompaction.
+ */
+export interface CompactionEvent {
+  /**
+   * MessagesDropped is how many ChatMessages were summarised away.
+   */
+  messages_dropped: number /* int */;
+  /**
+   * OverflowTokens is how many tokens the budget was over before
+   * enforcement (0 if the trigger was something else).
+   */
+  overflow_tokens: number /* int */;
+  /**
+   * Summary is the formatted human-readable summary of the dropped
+   * messages. Empty when no compactor is installed.
+   */
+  summary?: string;
+}
+/**
+ * PlanModeEvent is the payload of StreamEventPlanModeChanged.
+ */
+export interface PlanModeEvent {
+  /**
+   * State is "entered" | "exited".
+   */
+  state: string;
+  /**
+   * Plan is the most recent plan text (populated on exited approvals).
+   */
+  plan?: string;
+  /**
+   * Reason is an optional human-readable reason (e.g. rejection text).
+   */
+  reason?: string;
 }
 /**
  * StreamEventType discriminates between event kinds.
@@ -1864,15 +2410,28 @@ export const StreamEventToolResult: StreamEventType = "tool_result";
  */
 export const StreamEventTurnComplete: StreamEventType = "turn_complete";
 /**
- * StreamEventSubagentResult fires once per subagent as they complete.
- * Consumers can stream partial results to the user as each parallel task finishes.
+ * StreamEventAgentResult fires once per spawned Agent as it completes.
+ * Consumers can stream partial results to the user as each parallel
+ * Agent invocation finishes.
  */
-export const StreamEventSubagentResult: StreamEventType = "subagent_result";
+export const StreamEventAgentResult: StreamEventType = "agent_result";
 /**
  * StreamEventDone fires once when the entire agent loop has finished.
  * Final field is populated.
  */
 export const StreamEventDone: StreamEventType = "done";
+/**
+ * StreamEventCompaction fires when the runtime summarised older history
+ * because the context budget was exceeded. StreamEvent.Compaction
+ * carries the details (count, overflow, summary).
+ */
+export const StreamEventCompaction: StreamEventType = "compaction";
+/**
+ * StreamEventPlanModeChanged fires on plan-mode transitions
+ * (EnterPlanMode, approved/rejected ExitPlanMode). StreamEvent.PlanMode
+ * carries the new state.
+ */
+export const StreamEventPlanModeChanged: StreamEventType = "plan_mode_changed";
 /**
  * StreamEventError reports a fatal error. No further events follow.
  */
@@ -1885,89 +2444,6 @@ export const StreamEventError: StreamEventType = "error";
  */
 export type StreamingLLMProvider = 
     LLMProvider;
-
-//////////
-// source: subagent.go
-
-/**
- * Subagent is an isolated agent loop that runs a focused task, optionally
- * sharing state with the parent through a persistent Conversation.
- * Key properties:
- *   - Configurable system prompt, mode, model, and tool set
- *   - Persistent conversation — the coordinator can send follow-up messages
- *     to the same subagent and it retains context from previous turns
- *   - Timeout and max-turn caps prevent runaway subagents
- */
-export interface Subagent {
-  /**
-   * ID identifies this subagent for tracing.
-   */
-  ID: string;
-  /**
-   * Task is the initial user message sent to the subagent.
-   * Should be self-contained — the subagent has no implicit parent context.
-   */
-  Task: string;
-  /**
-   * SystemPrompt overrides the default generic subagent prompt.
-   * Use this to give subagents distinct personas:
-   *   "You are a code reviewer. Focus on security and correctness."
-   *   "You are a research agent. Search and synthesize, never guess."
-   * Empty → defaults to a generic focused-subagent prompt.
-   */
-  SystemPrompt: string;
-  /**
-   * Engine is a (possibly stripped-down) Engine for this subagent.
-   * Typically shares LLM and Memory with parent but has restricted Tools.
-   */
-  Engine?: Engine;
-  /**
-   * Mode is the active mode for the subagent (e.g. "research", "validator").
-   */
-  Mode: string;
-  /**
-   * Model overrides the engine's default model for this subagent.
-   * Useful for coordinator (Opus) + specialist (Haiku) patterns.
-   */
-  Model: string;
-  /**
-   * MaxTurns caps the subagent loop. Default 10.
-   */
-  MaxTurns: number /* int */;
-  /**
-   * Timeout caps wall-clock duration. Default 60s.
-   */
-  Timeout: number;
-  /**
-   * Conversation is the persistent conversation for this subagent.
-   * When set, the subagent retains state across multiple Run() calls,
-   * enabling coordinator follow-ups. When nil, each Run() starts fresh.
-   */
-  Conversation?: Conversation;
-}
-/**
- * SubagentResult is what a subagent returns to its parent.
- */
-export interface SubagentResult {
-  id: string;
-  task: string;
-  output: string;
-  turns: number /* int */;
-  usage: TokenUsage;
-  stop_reason: string;
-  duration_ms: number;
-  trace?: ReasoningStep[];
-  /**
-   * Model is the model name used by this subagent (bare, no routing prefix).
-   * Populated from Subagent.Model if set.
-   */
-  model?: string;
-  /**
-   * SystemPrompt is the system prompt used by this subagent, if overridden.
-   * Populated from Subagent.SystemPrompt if set.
-   */
-  system_prompt?: string;
-}
 
 //////////
 // source: system_prompt.go
@@ -2005,11 +2481,6 @@ export const LayerBehavior: SystemPromptLayer = "behavior";
  */
 export const LayerMemory: SystemPromptLayer = "memory";
 /**
- * LayerSkills contains the content of currently loaded skills.
- * Added/removed dynamically as skills are loaded/unloaded.
- */
-export const LayerSkills: SystemPromptLayer = "skills";
-/**
  * LayerSession holds ephemeral situational context for this conversation.
  * Includes: current time, active thread ID, what the user is viewing,
  * recent observations worth surfacing.
@@ -2028,11 +2499,23 @@ export const LayerMode: SystemPromptLayer = "mode";
  * 	builder := NewSystemPromptBuilder()
  * 	builder.Set(LayerCore, corePrompt)
  * 	builder.Set(LayerMemory, memoryContent)
- * 	builder.Set(LayerSkills, skill1.Content+"\n\n"+skill2.Content)
  * 	prompt := builder.Build()
  */
 export interface SystemPromptBuilder {
 }
+
+//////////
+// source: system_reminder.go
+
+/**
+ * SystemReminderTag is the canonical XML-ish wrapper used to inject
+ * out-of-band guidance into the conversation. Mirrors the convention used by
+ * Claude Code (see /Users/jussmor/Developer/Claude Code/constants/prompts.ts).
+ * Anything wrapped in <system-reminder>...</system-reminder> is treated by the
+ * model as a non-user, non-assistant directive: it must be obeyed but not
+ * echoed back, never quoted, and never mentioned to the user.
+ */
+export const SystemReminderTag = "system-reminder";
 
 //////////
 // source: thread.go
@@ -2101,7 +2584,58 @@ export const ToolCategoryCustom: ToolCategory = "custom";
  */
 export type ToolExecuteFunc = unknown;
 /**
+ * ToolPredicate evaluates a tool input. Used for IsReadOnly / IsConcurrencySafe /
+ * IsDestructive. Defaults documented per-field on Tool.
+ */
+export type ToolPredicate = unknown;
+/**
+ * ToolValidator runs before execution and may reject the call with a user-visible error.
+ * Returning a non-nil error short-circuits the dispatcher with that message; the LLM
+ * sees the error string as the tool result.
+ */
+export type ToolValidator = unknown;
+/**
+ * PermissionDecision is the outcome of a permission check. Mirrors Claude Code's
+ * PermissionResult shape.
+ */
+export type PermissionDecision = string;
+export const PermissionAllow: PermissionDecision = "allow";
+export const PermissionDeny: PermissionDecision = "deny";
+export const PermissionAskUser: PermissionDecision = "ask_user";
+/**
+ * PermissionResult is what a Tool's CheckPermissions returns.
+ * Reason is shown to the user (and the LLM on deny).
+ */
+export interface PermissionResult {
+  decision: PermissionDecision;
+  reason?: string;
+  /**
+   * UpdatedArgs lets a permission policy rewrite the args before execution
+   * (e.g. inject default flags). nil = use original args.
+   */
+  updated_args?: { [key: string]: unknown};
+}
+/**
+ * ToolPermissionFn is the optional permission gate.
+ */
+export type ToolPermissionFn = unknown;
+/**
+ * ToolReminderFn returns markdown to be injected as a per-turn system-reminder
+ * attachment on behalf of this tool. Used by Skill / Task tools to publish
+ * dynamic listings ("Available skills:...", "Available agents:...") without
+ * stuffing the cache-stable tool description.
+ * Returning empty string means no attachment this turn.
+ */
+export type ToolReminderFn = unknown;
+/**
  * Tool defines a single executable capability exposed to the agent.
+ * All optional fields default to safe behavior when nil:
+ *   - IsReadOnly       → false (assume mutates state)
+ *   - IsConcurrencySafe → false (assume serial)
+ *   - IsDestructive    → false (no confirmation prompt by default)
+ *   - Validate         → no validation
+ *   - CheckPermissions → always allow
+ *   - DynamicReminder  → no per-turn attachment
  */
 export interface Tool {
   name: string;
@@ -2109,11 +2643,39 @@ export interface Tool {
   category: ToolCategory;
   parameters: ToolFuncParams;
   /**
+   * Aliases are alternate names accepted by the dispatcher for backwards
+   * compatibility after a rename. Lookup by alias still resolves to this tool.
+   */
+  aliases?: string[];
+  /**
+   * SearchHint is short keyword text used by ToolSearch ranking. If empty,
+   * search falls back to Name + Description.
+   */
+  search_hint?: string;
+  /**
+   * Visibility / loading.
    * Hidden tools are present in the registry but excluded from ToolDefs.
    * Use Search + Reveal to expose them to the LLM dynamically.
-   * This mirrors Claude's tool_search pattern: visible list is partial.
    */
   hidden?: boolean;
+  /**
+   * Deferred tools are excluded from the initial ToolDefs but become
+   * callable once discovered via ToolSearch (similar to Hidden, but with
+   * search-driven activation semantics).
+   */
+  deferred?: boolean;
+  /**
+   * AlwaysLoad forces the tool into the initial ToolDefs even when other
+   * heuristics would defer it. Mirrors Claude Code's alwaysLoad flag for
+   * tools whose presence is mandatory (e.g. memory tools, todo tools).
+   */
+  always_load?: boolean;
+  /**
+   * MaxResultSizeChars is the soft cap (in characters) on the tool result
+   * returned to the LLM. 0 = unlimited. Above this, the runtime persists
+   * the full result to disk and substitutes a truncated handle.
+   */
+  max_result_size_chars?: number /* int */;
 }
 /**
  * ToolFuncParams is a JSON-Schema-like description of a tool's input.

@@ -12,14 +12,23 @@ import (
 // It parses the JSON arguments, finds the tool in the registry, executes it,
 // and returns the result as a string ready to be fed back to the LLM.
 type ToolDispatcher struct {
-	tools   *ToolRegistry
-	sandbox SandboxDriver
+	tools       *ToolRegistry
+	sandbox     SandboxDriver
+	permissions *PermissionEngine // optional v3 permission engine
 }
 
 // NewToolDispatcher creates a dispatcher bound to a tool registry and
 // an optional sandbox (for tools that need a sandboxID).
 func NewToolDispatcher(tools *ToolRegistry, sandbox SandboxDriver) *ToolDispatcher {
 	return &ToolDispatcher{tools: tools, sandbox: sandbox}
+}
+
+// WithPermissions attaches a v3 PermissionEngine. When set, the engine runs
+// BEFORE the legacy per-tool CheckPermissions path (the engine itself folds
+// CheckPermissions in as step 6 of its algorithm).
+func (d *ToolDispatcher) WithPermissions(eng *PermissionEngine) *ToolDispatcher {
+	d.permissions = eng
+	return d
 }
 
 // ToolResult holds the outcome of dispatching a single tool call.
@@ -69,6 +78,81 @@ func (d *ToolDispatcher) Dispatch(ctx context.Context, call ToolCallEntry, sandb
 		args = make(map[string]any)
 	}
 
+	// Pre-execution validation. Lets the tool reject bad input with a clear
+	// message that the LLM can act on (e.g. "path must be absolute").
+	if tool.Validate != nil {
+		if err := tool.Validate(ctx, args); err != nil {
+			return ToolResult{
+				ToolCallID: call.ID,
+				Name:       call.Name,
+				Content:    fmt.Sprintf("error: %v", err),
+				Error:      err,
+			}
+		}
+	}
+
+	// Permission gate. When the v3 PermissionEngine is wired, it runs the
+	// full algorithm (mode + alwaysAllow/Deny rules + tool fallback +
+	// approver). Otherwise we fall back to the per-tool CheckPermissions
+	// callback for backwards compatibility. ask_user without an engine is
+	// treated as a deny — front-ends wanting interactive confirmation must
+	// register a PermissionEngine with an Approver.
+	if d.permissions != nil {
+		dec := d.permissions.Decide(ctx, tool, args)
+		switch dec.Behavior {
+		case PermissionBehaviorDeny, PermissionBehaviorAsk:
+			reason := strings.TrimSpace(dec.Reason)
+			if reason == "" {
+				reason = "permission denied"
+			}
+			// Make the failure unmistakable to the LLM. Sonnet-class models
+			// otherwise tend to gloss over a soft "error: ..." tool result
+			// and claim success in the next assistant turn. The explicit
+			// directive below mirrors Claude Code's permission-deny payload.
+			content := fmt.Sprintf(
+				"<tool_use_error>The user did not approve this %s call. Reason: %s.\n\nThe tool was NOT executed. Do NOT claim success. Do NOT retry the same call. Acknowledge the rejection and ask the user how to proceed (or stop).</tool_use_error>",
+				tool.Name, reason,
+			)
+			return ToolResult{
+				ToolCallID: call.ID,
+				Name:       call.Name,
+				Content:    content,
+				Error:      fmt.Errorf("%s", reason),
+			}
+		case PermissionBehaviorAllow:
+			if dec.UpdatedInput != nil {
+				args = dec.UpdatedInput
+			}
+		}
+	} else if tool.CheckPermissions != nil {
+		decision, err := tool.CheckPermissions(ctx, args)
+		if err != nil {
+			return ToolResult{
+				ToolCallID: call.ID,
+				Name:       call.Name,
+				Content:    fmt.Sprintf("error: permission check failed: %v", err),
+				Error:      err,
+			}
+		}
+		switch decision.Decision {
+		case PermissionDeny, PermissionAskUser:
+			reason := strings.TrimSpace(decision.Reason)
+			if reason == "" {
+				reason = "permission denied"
+			}
+			return ToolResult{
+				ToolCallID: call.ID,
+				Name:       call.Name,
+				Content:    fmt.Sprintf("error: %s", reason),
+				Error:      fmt.Errorf("%s", reason),
+			}
+		case PermissionAllow, "":
+			if decision.UpdatedArgs != nil {
+				args = decision.UpdatedArgs
+			}
+		}
+	}
+
 	// Execute
 	result, err := tool.Execute(ctx, sandboxID, args)
 	if err != nil {
@@ -105,6 +189,11 @@ func (d *ToolDispatcher) DispatchAll(ctx context.Context, calls []ToolCallEntry,
 // dependent calls serialize. The caller decides which calls are independent
 // (typically the LLM, but a static analyzer could too).
 //
+// Tools whose IsConcurrencySafe predicate returns false are executed serially
+// AFTER the parallel batch finishes, preserving order in the output slice.
+// This protects tools that touch shared mutable state (e.g. memory writes,
+// sandbox file edits) from racing with each other.
+//
 // All goroutines share the parent context. If ctx is cancelled, in-flight
 // tools see the cancellation but already-returned results are preserved.
 func (d *ToolDispatcher) DispatchParallel(ctx context.Context, calls []ToolCallEntry, sandboxID string) []ToolResult {
@@ -116,17 +205,43 @@ func (d *ToolDispatcher) DispatchParallel(ctx context.Context, calls []ToolCallE
 	}
 
 	results := make([]ToolResult, len(calls))
-	var wg sync.WaitGroup
-	wg.Add(len(calls))
 
-	for i, call := range calls {
-		go func(idx int, c ToolCallEntry) {
-			defer wg.Done()
-			results[idx] = d.Dispatch(ctx, c, sandboxID)
-		}(i, call)
+	// Partition by ConcurrencySafe.
+	type indexedCall struct {
+		idx  int
+		call ToolCallEntry
+	}
+	var safe, unsafe []indexedCall
+	for i, c := range calls {
+		t := d.tools.Get(c.Name)
+		isSafe := false
+		if t != nil {
+			var parsed map[string]any
+			if c.Arguments != "" && c.Arguments != "{}" {
+				_ = json.Unmarshal([]byte(c.Arguments), &parsed)
+			}
+			isSafe = t.ConcurrencySafe(parsed)
+		}
+		if isSafe {
+			safe = append(safe, indexedCall{i, c})
+		} else {
+			unsafe = append(unsafe, indexedCall{i, c})
+		}
 	}
 
+	var wg sync.WaitGroup
+	wg.Add(len(safe))
+	for _, ic := range safe {
+		go func(ic indexedCall) {
+			defer wg.Done()
+			results[ic.idx] = d.Dispatch(ctx, ic.call, sandboxID)
+		}(ic)
+	}
 	wg.Wait()
+
+	for _, ic := range unsafe {
+		results[ic.idx] = d.Dispatch(ctx, ic.call, sandboxID)
+	}
 	return results
 }
 

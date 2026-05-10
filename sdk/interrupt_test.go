@@ -7,28 +7,29 @@ import (
 	"time"
 )
 
-// TestInterruptGate_ApprovalRoundTrip exercises the legacy ApprovalGate facade
-// over the new InterruptGate.
+// TestInterruptGate_ApprovalRoundTrip exercises an Approval interrupt
+// directly on InterruptGate.
 func TestInterruptGate_ApprovalRoundTrip(t *testing.T) {
-	gate := NewApprovalGate(4)
+	gate := NewInterruptGate(4)
 
 	go func() {
 		req := <-gate.Requests()
-		if req.ID == "" || req.ToolCall.Name != "bash" {
+		if req.ID == "" || req.Kind != InterruptKindApproval || req.Approval == nil || req.Approval.ToolCall.Name != "bash" {
 			t.Errorf("unexpected request: %#v", req)
 		}
-		if !gate.Respond(ApprovalResponse{ID: req.ID, Approved: true}) {
+		if !gate.Respond(InterruptResponse{ID: req.ID, Approved: true}) {
 			t.Errorf("respond returned false")
 		}
 	}()
 
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
-	resp, err := gate.Wait(ctx, ApprovalRequest{
+	resp, err := gate.Wait(ctx, InterruptRequest{
 		ID:        "apr_test",
-		ToolCall:  ToolCallEntry{Name: "bash", Arguments: `{"cmd":"ls"}`},
+		Kind:      InterruptKindApproval,
 		Reason:    "test",
 		CreatedAt: time.Now(),
+		Approval:  &ApprovalPayload{ToolCall: ToolCallEntry{Name: "bash", Arguments: `{"cmd":"ls"}`}},
 	})
 	if err != nil {
 		t.Fatalf("wait error: %v", err)

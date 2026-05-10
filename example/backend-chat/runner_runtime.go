@@ -22,10 +22,10 @@ type agentRuntime struct {
 	engine         *ab.Engine
 	runtime        *ab.Runtime
 	subagentEngine *ab.Engine
-	skills         ab.SkillProvider
 	memory         ab.MemoryProvider
 	convStore      ab.ConversationStore
 	execCtx        *ab.InMemoryExecutionContext // task checklist (TodoWrite/TodoRead)
+	planCtl        *ab.PlanController           // plan-mode controller (EnterPlanMode/ExitPlanMode)
 }
 
 // ── Tool registries ──────────────────────────────────────────────────────────
@@ -33,12 +33,24 @@ type agentRuntime struct {
 func (r *agentRuntime) buildToolRegistry() *ab.ToolRegistry {
 	reg := ab.NewToolRegistry()
 	reg.Register(r.newTodoTool())
+	// Plan-mode pair (EnterPlanMode / ExitPlanMode). Controller is created
+	// lazily here; main.go binds the PermissionEngine to it after the
+	// runtime is constructed.
+	if r.planCtl == nil {
+		r.planCtl = ab.NewPlanController(nil)
+	}
+	enter, exit := ab.NewPlanTools(ab.PlanToolConfig{Controller: r.planCtl})
+	reg.Register(enter)
+	reg.Register(exit)
 	// Prefer sandbox file tools when available to avoid writing local host files.
 	if !isSandboxAvailable() || r.chatID <= 0 {
 		reg.Register(r.newDocumentTool())
 	}
-	if r.skills != nil {
-		reg.Register(r.newSkillsTool())
+	if tool := r.newSkillsTool(); tool != nil {
+		reg.Register(tool)
+	}
+	if tool := r.newAgentTool(); tool != nil {
+		reg.Register(tool)
 	}
 	if r.memory != nil {
 		reg.Register(r.newMemoryTool())
@@ -90,163 +102,74 @@ func (r *agentRuntime) buildSubagentToolRegistry() *ab.ToolRegistry {
 // ── Tool definitions ─────────────────────────────────────────────────────────
 
 func (r *agentRuntime) newMemoryTool() *ab.Tool {
-	return &ab.Tool{
-		Name:        "memory-operations",
-		Description: "View and edit persistent memory in user or project scope.",
-		Category:    ab.ToolCategoryMemory,
-		Parameters: ab.ToolFuncParams{
-			Type: "object",
-			Properties: map[string]ab.ToolParam{
-				"operation": {
-					Type:        "string",
-					Description: "One of: view, create, str_replace, delete, rename, list, search.",
-					Enum:        []string{"view", "create", "str_replace", "delete", "rename", "list", "search"},
-				},
-				"scope":   {Type: "string", Description: "user or project", Enum: []string{"user", "project", "*"}},
-				"path":    {Type: "string", Description: "Memory path."},
-				"content": {Type: "string", Description: "File content for create."},
-				"oldStr":  {Type: "string", Description: "Old string for str_replace."},
-				"newStr":  {Type: "string", Description: "New string for str_replace."},
-				"oldPath": {Type: "string", Description: "Source path for rename."},
-				"newPath": {Type: "string", Description: "Destination path for rename."},
-				"query":   {Type: "string", Description: "Query text for search."},
-			},
-			Required: []string{"operation"},
-		},
-		Execute: func(ctx context.Context, _ string, args map[string]any) (string, error) {
-			if r.memory == nil {
-				return "memory provider not configured", nil
-			}
-			op := strings.ToLower(strings.TrimSpace(asString(args["operation"])))
-			scope := parseMemoryScope(asString(args["scope"]))
-
-			switch op {
-			case "view":
-				out, err := r.memory.View(ctx, scope, asString(args["path"]))
-				return out, err
-			case "create":
-				if err := r.memory.Create(ctx, ensureWritableScope(scope), asString(args["path"]), asString(args["content"])); err != nil {
-					return "", err
-				}
-				return "memory created", nil
-			case "str_replace":
-				if err := r.memory.StrReplace(ctx, ensureWritableScope(scope), asString(args["path"]), asString(args["oldStr"]), asString(args["newStr"])); err != nil {
-					return "", err
-				}
-				return "memory updated", nil
-			case "delete":
-				if err := r.memory.Delete(ctx, ensureWritableScope(scope), asString(args["path"])); err != nil {
-					return "", err
-				}
-				return "memory deleted", nil
-			case "rename":
-				if err := r.memory.Rename(ctx, ensureWritableScope(scope), asString(args["oldPath"]), asString(args["newPath"])); err != nil {
-					return "", err
-				}
-				return "memory renamed", nil
-			case "list":
-				items, err := r.memory.List(ctx, scope, asString(args["path"]))
-				if err != nil {
-					return "", err
-				}
-				return strings.Join(items, "\n"), nil
-			case "search":
-				entries, err := r.memory.Search(ctx, scope, asString(args["query"]))
-				if err != nil {
-					return "", err
-				}
-				lines := make([]string, 0, len(entries))
-				for _, e := range entries {
-					lines = append(lines, fmt.Sprintf("- [%s] %s", e.Scope, e.Path))
-				}
-				return strings.Join(lines, "\n"), nil
-			}
-			return "unsupported operation", nil
-		},
+	if r.memory == nil {
+		return nil
 	}
+	return ab.NewMemoryTool(ab.MemoryToolConfig{
+		Provider:     r.memory,
+		DefaultScope: ab.ScopeProject,
+		// Selector defaults to KeywordMemorySelector (no extra LLM call).
+		// Read-before-write, taxonomy, and anti-merge are all on by default.
+	})
 }
 
 func (r *agentRuntime) newSkillsTool() *ab.Tool {
-	return &ab.Tool{
-		Name:        "skills-operations",
-		Description: "List, match, inspect, load, and unload backend skills.",
-		Category:    ab.ToolCategoryPlanning,
-		Parameters: ab.ToolFuncParams{
-			Type: "object",
-			Properties: map[string]ab.ToolParam{
-				"operation": {Type: "string", Enum: []string{"list", "match", "get", "load", "unload"}},
-				"skillName": {Type: "string", Description: "Skill name for get/load/unload."},
-				"query":     {Type: "string", Description: "Text to match triggers against."},
-			},
-			Required: []string{"operation"},
-		},
-		Execute: func(ctx context.Context, _ string, args map[string]any) (string, error) {
-			if r.skills == nil {
-				return "skills provider not configured", nil
-			}
-			op := strings.ToLower(strings.TrimSpace(asString(args["operation"])))
-			skillName := strings.TrimSpace(asString(args["skillName"]))
-			query := strings.TrimSpace(asString(args["query"]))
-
-			switch op {
-			case "list":
-				names, err := r.skills.List(ctx)
-				if err != nil {
-					return "", err
-				}
-				if len(names) == 0 {
-					return "No skills available.", nil
-				}
-				for i := range names {
-					names[i] = "- " + names[i]
-				}
-				return "Available skills:\n" + strings.Join(names, "\n"), nil
-			case "match":
-				if query == "" {
-					return "query is required for match", nil
-				}
-				matched, err := r.skills.Match(ctx, query)
-				if err != nil {
-					return "", err
-				}
-				if len(matched) == 0 {
-					return "No skills matched.", nil
-				}
-				lines := make([]string, 0, len(matched))
-				for _, m := range matched {
-					lines = append(lines, fmt.Sprintf("- %s (score %.2f): %s", m.Skill.Name, m.Score, m.Skill.Meta.Description))
-				}
-				return "Matched skills:\n" + strings.Join(lines, "\n"), nil
-			case "get":
-				if skillName == "" {
-					return "skillName is required", nil
-				}
-				skill, err := r.skills.Get(ctx, skillName)
-				if err != nil {
-					return "", err
-				}
-				return fmt.Sprintf("Skill %s\n\n%s", skill.Name, strings.TrimSpace(skill.Content)), nil
-			case "load":
-				if skillName == "" {
-					return "skillName is required", nil
-				}
-				skill, err := r.skills.Load(ctx, skillName)
-				if err != nil {
-					return "", err
-				}
-				return fmt.Sprintf("Loaded skill %s\n\n%s", skill.Name, strings.TrimSpace(skill.Content)), nil
-			case "unload":
-				if skillName == "" {
-					return "skillName is required", nil
-				}
-				if err := r.skills.Unload(ctx, skillName); err != nil {
-					return "", err
-				}
-				return fmt.Sprintf("Unloaded skill %s", skillName), nil
-			}
-			return "unsupported operation", nil
-		},
+	root := resolveSkillsRoot()
+	if root == "" {
+		return nil
 	}
+	return ab.NewSkillTool(ab.SkillToolConfig{
+		Sources: []ab.SkillSource{
+			&ab.FilesystemSkillSource{Root: root, Label: "backend-skills"},
+		},
+		SessionIDFn:         func() string { return fmt.Sprintf("chat-%d", r.chatID) },
+		ContextWindowTokens: 128_000,
+		// BashExecutor: TODO wire to sandbox bash when chatID > 0
+	})
+}
+
+// resolveSkillsRoot picks the first existing skills directory.
+func resolveSkillsRoot() string {
+	candidates := []string{
+		"skills",
+		filepath.Join("example", "backend-chat", "skills"),
+		filepath.Join("..", "backend-chat", "skills"),
+	}
+	for _, c := range candidates {
+		if info, err := os.Stat(c); err == nil && info.IsDir() {
+			return c
+		}
+	}
+	return ""
+}
+
+func (r *agentRuntime) newAgentTool() *ab.Tool {
+	root := resolveAgentsRoot()
+	if root == "" || r.engine == nil {
+		return nil
+	}
+	return ab.NewAgentTool(ab.AgentToolConfig{
+		Sources: []ab.AgentSource{
+			&ab.FilesystemAgentSource{Root: root, Label: "backend-agents"},
+		},
+		ParentEngine:    r.engine,
+		DefaultModel:    r.modelName,
+		DefaultMaxTurns: 10,
+	})
+}
+
+func resolveAgentsRoot() string {
+	candidates := []string{
+		"agents",
+		filepath.Join("example", "backend-chat", "agents"),
+		filepath.Join("..", "backend-chat", "agents"),
+	}
+	for _, c := range candidates {
+		if info, err := os.Stat(c); err == nil && info.IsDir() {
+			return c
+		}
+	}
+	return ""
 }
 
 func (r *agentRuntime) newTodoTool() *ab.Tool {
@@ -488,24 +411,6 @@ func (r *agentRuntime) newDocumentTool() *ab.Tool {
 
 // ── helpers ──────────────────────────────────────────────────────────────────
 
-func parseMemoryScope(value string) ab.Scope {
-	switch strings.ToLower(strings.TrimSpace(value)) {
-	case "user":
-		return ab.ScopeUser
-	case "*", "all":
-		return ab.Scope("*")
-	default:
-		return ab.ScopeProject
-	}
-}
-
-func ensureWritableScope(scope ab.Scope) ab.Scope {
-	if scope == ab.Scope("*") {
-		return ab.ScopeProject
-	}
-	return scope
-}
-
 func asString(value any) string {
 	if value == nil {
 		return ""
@@ -600,7 +505,7 @@ func (r *agentRuntime) newSubagentDispatchTool() *ab.Tool {
 				)
 			}
 
-			subs := make([]ab.Subagent, 0, len(rawTasks))
+			subs := make([]ab.AgentInvocation, 0, len(rawTasks))
 			for i, raw := range rawTasks {
 				m, ok := raw.(map[string]any)
 				if !ok {
@@ -618,37 +523,34 @@ func (r *agentRuntime) newSubagentDispatchTool() *ab.Tool {
 				if v, ok := m["max_turns"].(float64); ok && v > 0 {
 					maxTurns = int(v)
 				}
-				timeout := 120 * time.Second
-				if v, ok := m["timeout_seconds"].(float64); ok && v > 0 {
-					timeout = time.Duration(v) * time.Second
-				}
 				systemPrompt := strings.TrimSpace(asString(m["system_prompt"]))
 				model := strings.TrimSpace(asString(m["model"]))
 
 				// Keep the routing prefix (e.g. "anthropic/...") so the
 				// RoutedLLMProvider can dispatch to the correct backend.
-				// RunAgentLoopWithEngine strips the prefix internally after
-				// resolving the provider. Stripping here would send a bare
-				// model name to the router, which has no match and falls
-				// back to the raw engine.LLM with an empty model — the
-				// Anthropic API then returns 404 with `model: <nil>`.
 				effectiveModel := model
 				if effectiveModel == "" {
 					effectiveModel = r.modelName
 				}
-				subs = append(subs, ab.Subagent{
-					ID:           id,
-					Task:         task,
-					Engine:       subEngine,
-					Mode:         strings.TrimSpace(asString(m["mode"])),
-					MaxTurns:     maxTurns,
-					Timeout:      timeout,
-					SystemPrompt: systemPrompt,
-					Model:        effectiveModel,
+				// Synthetic agent: ad-hoc task with the supplied prompt.
+				ag := &ab.Agent{
+					Type:        id,
+					Description: task,
+					Body:        systemPrompt,
+					Model:       effectiveModel,
+					MaxTurns:    maxTurns,
+					Source:      ab.AgentSourceFilesystem,
+				}
+				subs = append(subs, ab.AgentInvocation{
+					Agent:       ag,
+					Description: task,
+					Prompt:      task,
+					MaxTurns:    maxTurns,
+					Model:       effectiveModel,
 				})
 			}
 
-			results := ab.RunSubagentsInParallel(ctx, subs)
+			results := ab.RunAgentsInParallel(ctx, subEngine, subs, 4, r.modelName)
 
 			// Build LLM-friendly summary: keep it compact, surface errors clearly.
 			summaries := make([]map[string]any, 0, len(results))
@@ -657,7 +559,7 @@ func (r *agentRuntime) newSubagentDispatchTool() *ab.Tool {
 					continue
 				}
 				entry := map[string]any{
-					"id":          res.ID,
+					"id":          res.Type,
 					"task":        res.Task,
 					"output":      truncate(res.Output, 2000),
 					"turns":       res.Turns,

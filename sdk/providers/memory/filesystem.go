@@ -305,5 +305,23 @@ func tokenize(text string) []string {
 	return terms
 }
 
+// Stat returns mtime/size metadata for a memory entry. Implements the
+// optional autobuild.MemoryStater interface used by memdir.
+func (m *FilesystemMemory) Stat(_ context.Context, scope autobuild.Scope, path string) (autobuild.MemoryStat, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	full := m.scopePath(scope, path)
+	info, err := os.Stat(full)
+	if err != nil {
+		return autobuild.MemoryStat{}, err
+	}
+	return autobuild.MemoryStat{
+		MtimeMs: info.ModTime().UnixMilli(),
+		Size:    info.Size(),
+		IsDir:   info.IsDir(),
+	}, nil
+}
+
 var _ autobuild.MemoryProvider = (*FilesystemMemory)(nil)
+var _ autobuild.MemoryStater = (*FilesystemMemory)(nil)
 

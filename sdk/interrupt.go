@@ -332,3 +332,16 @@ func newInterruptID(kind InterruptKind) string {
 // hexEncode is a re-export to keep callers from importing encoding/hex
 // just for trivial conversions.
 func hexEncode(b []byte) string { return hex.EncodeToString(b) }
+
+// ── Runtime wiring ───────────────────────────────────────────────────────────
+
+// WithInterrupts attaches an InterruptGate to the runtime. When set, the
+// runtime fans out interrupt requests on the streaming channel so the
+// front-end can render approval / question / form-input UIs.
+func (r *Runtime) WithInterrupts(gate *InterruptGate) *Runtime {
+	r.interruptGate = gate
+	return r
+}
+
+// InterruptGate returns the gate currently attached to the runtime, or nil.
+func (r *Runtime) InterruptGate() *InterruptGate { return r.interruptGate }

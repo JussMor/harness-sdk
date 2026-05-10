@@ -55,12 +55,16 @@ type MemoryRoot struct {
 	Label string // injected as a header before the content in LayerMemory
 }
 
-// DefaultMemoryRoots mirrors Claude's memory structure:
-// user profile/preferences, user facts, and project context read separately.
+// DefaultMemoryRoots lists the scopes the runtime bootstraps at orientation.
+// In the Claude Code-aligned model the runtime no longer dumps arbitrary
+// directory contents into the system prompt — instead it reads each scope's
+// MEMORY.md (the index) and lets the LLM fetch individual files via the
+// memory tool. This list is therefore just the ordered set of scopes the
+// runtime should consult; the Path/Label fields are retained for backwards
+// compatibility with older callers but are no longer used.
 var DefaultMemoryRoots = []MemoryRoot{
-	{Scope: ScopeUser, Path: "/profile", Label: "User profile & preferences"},
-	{Scope: ScopeUser, Path: "/facts", Label: "Remembered facts"},
-	{Scope: ScopeProject, Path: "/", Label: "Project context"},
+	{Scope: ScopeUser, Path: "/", Label: "User memory"},
+	{Scope: ScopeProject, Path: "/", Label: "Project memory"},
 }
 
 // MemoryEntry represents a single memory file with its metadata.

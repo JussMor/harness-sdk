@@ -586,15 +586,33 @@ func (a *BackendChatApp) handleStream(w http.ResponseWriter, r *http.Request, ch
 	}
 
 	// Interrupts: always wire an InterruptGate so tools like await_component_input
-	// can pause and ask for user input. When HIL is enabled, also prepend a
-	// HumanApprovalFilter that requires approval for dangerous tool calls.
+	// can pause and ask for user input. When HIL is enabled, attach a
+	// PermissionEngine that auto-allows known-safe tools and routes everything
+	// else through the same gate via InterruptGateApprover.
 	gate := ab.NewInterruptGate(8)
 	agentRT.runtime = agentRT.runtime.WithInterrupts(gate)
+	// Always create a PermissionEngine so EnterPlanMode/ExitPlanMode can
+	// toggle the session mode. With HIL off we leave it in default+empty
+	// rules — every tool falls through (no ask), only plan mode constrains.
+	permEng := ab.NewPermissionEngine(ab.PermissionModeDefault)
 	if req.HumanInLoop {
-		_, agentRT.runtime = agentRT.runtime.WithHumanApproval(ab.DefaultApprovalPolicy)
+		permEng.SetApprover(&ab.InterruptGateApprover{Gate: gate})
+		// Auto-allow safe / read-only tools. Anything not listed falls
+		// through to the engine's default `ask` step, which routes to
+		// the InterruptGate approver and surfaces an approval prompt.
+		for _, safe := range []string{
+			"file_read", "list_dir", "search", "grep",
+			"memory", "Skill", "Agent",
+			"EnterPlanMode", "ExitPlanMode",
+		} {
+			permEng.AddAllowString(ab.RuleSourceSession, safe)
+		}
 	}
-	// Register the runtime's actual gate — WithHumanApproval may have replaced
-	// the original gate with its own internal one.
+	agentRT.runtime = agentRT.runtime.WithPermissions(permEng)
+	if agentRT.planCtl != nil {
+		agentRT.planCtl.SetPermissions(permEng)
+		agentRT.runtime = agentRT.runtime.WithPlanController(agentRT.planCtl)
+	}
 	ensureInterruptRegistry().Register(chatID, agentRT.runtime.InterruptGate())
 	defer ensureInterruptRegistry().Unregister(chatID)
 
@@ -768,32 +786,48 @@ func (a *BackendChatApp) handleStream(w http.ResponseWriter, r *http.Request, ch
 				sseWrite(eventName, string(d))
 			}
 
-		case ab.StreamEventSubagentResult:
-			if ev.SubagentResult != nil {
+		case ab.StreamEventAgentResult:
+			if ev.AgentResult != nil {
 				errMsg := ""
-				if ev.SubagentResult.Error != nil {
-					errMsg = ev.SubagentResult.Error.Error()
+				if ev.AgentResult.Error != nil {
+					errMsg = ev.AgentResult.Error.Error()
 				}
 				payload := map[string]any{
-					"id":            ev.SubagentResult.ID,
-					"task":          ev.SubagentResult.Task,
-					"output":        ev.SubagentResult.Output,
-					"turns":         ev.SubagentResult.Turns,
-					"stop_reason":   ev.SubagentResult.StopReason,
-					"duration_ms":   ev.SubagentResult.Duration.Milliseconds(),
+					"type":          ev.AgentResult.Type,
+					"description":   ev.AgentResult.Description,
+					"task":          ev.AgentResult.Task,
+					"output":        ev.AgentResult.Output,
+					"turns":         ev.AgentResult.Turns,
+					"stop_reason":   ev.AgentResult.StopReason,
+					"duration_ms":   ev.AgentResult.Duration.Milliseconds(),
 					"error":         errMsg,
 				}
-				// Include model and system_prompt when set — frontend uses them for display
-				if ev.SubagentResult.Model != "" {
-					payload["model"] = ev.SubagentResult.Model
+				if ev.AgentResult.Model != "" {
+					payload["model"] = ev.AgentResult.Model
 				}
-				if ev.SubagentResult.SystemPrompt != "" {
-					payload["system_prompt"] = ev.SubagentResult.SystemPrompt
+				if ev.AgentResult.SystemPrompt != "" {
+					payload["system_prompt"] = ev.AgentResult.SystemPrompt
 				}
 				d, _ := json.Marshal(payload)
-				sseWrite("subagent_result", string(d))
-				log.Printf("stream.subagent_result chat_id=%d run_id=%s agent_id=%s turns=%d",
-					chatID, runID, ev.SubagentResult.ID, ev.SubagentResult.Turns)
+				sseWrite("agent_result", string(d))
+				log.Printf("stream.agent_result chat_id=%d run_id=%s type=%s turns=%d",
+					chatID, runID, ev.AgentResult.Type, ev.AgentResult.Turns)
+			}
+
+		case ab.StreamEventCompaction:
+			if ev.Compaction != nil {
+				d, _ := json.Marshal(ev.Compaction)
+				sseWrite("compaction", string(d))
+				log.Printf("stream.compaction chat_id=%d run_id=%s dropped=%d overflow=%d",
+					chatID, runID, ev.Compaction.MessagesDropped, ev.Compaction.OverflowTokens)
+			}
+
+		case ab.StreamEventPlanModeChanged:
+			if ev.PlanMode != nil {
+				d, _ := json.Marshal(ev.PlanMode)
+				sseWrite("plan_mode_changed", string(d))
+				log.Printf("stream.plan_mode chat_id=%d run_id=%s state=%s",
+					chatID, runID, ev.PlanMode.State)
 			}
 
 		case ab.StreamEventDone:
@@ -852,12 +886,59 @@ func (a *BackendChatApp) handleStream(w http.ResponseWriter, r *http.Request, ch
 			if ev.Error != nil {
 				msg = ev.Error.Error()
 			}
-			d, _ := json.Marshal(map[string]string{"error": msg})
+			category, friendly := classifyStreamError(msg)
+			d, _ := json.Marshal(map[string]string{
+				"error":    friendly,
+				"category": category,
+				"detail":   msg,
+			})
 			sseWrite("error", string(d))
-			log.Printf("stream.error chat_id=%d run_id=%s error=%s", chatID, runID, msg)
+			log.Printf("stream.error chat_id=%d run_id=%s category=%s error=%s", chatID, runID, category, msg)
+			// Persist a placeholder assistant message so the chat history
+			// reflects the failure instead of an empty bubble, then signal
+			// done so the frontend stops waiting.
+			placeholder := "_⚠️ " + friendly + "_"
+			assistantMsg, _ := InsertMessage(ctx, a.db, chatID, "assistant", placeholder, effectiveModel)
+			_ = a.pub.PublishChatMessage(ctx, chatID, assistantMsg)
+			doneData, _ := json.Marshal(map[string]any{"runId": runID, "messageId": assistantMsg.ID, "error": friendly})
+			sseWrite("done", string(doneData))
 		}
 		}
 	}
+}
+
+// classifyStreamError converts a raw provider/sdk error string into a stable
+// category and a user-facing message. Categories are kept short so the
+// frontend can render badges; the original error is preserved separately
+// under "detail" for debugging.
+func classifyStreamError(raw string) (category, friendly string) {
+	low := strings.ToLower(raw)
+	switch {
+	case strings.Contains(low, "credit balance is too low"),
+		strings.Contains(low, "insufficient_quota"),
+		strings.Contains(low, "billing"):
+		return "billing", "El proveedor de IA reportó saldo insuficiente. Revisa tu plan o crea créditos antes de reintentar."
+	case strings.Contains(low, "rate limit"),
+		strings.Contains(low, "429"):
+		return "rate_limit", "El proveedor está limitando las peticiones. Espera unos segundos y vuelve a intentar."
+	case strings.Contains(low, "401"),
+		strings.Contains(low, "unauthorized"),
+		strings.Contains(low, "invalid api key"),
+		strings.Contains(low, "authentication"):
+		return "auth", "La API key configurada fue rechazada por el proveedor. Verifica las variables de entorno."
+	case strings.Contains(low, "context_length_exceeded"),
+		strings.Contains(low, "context length"),
+		strings.Contains(low, "maximum context"):
+		return "context_length", "El historial superó el contexto máximo del modelo. Inicia una conversación nueva o cambia a un modelo más grande."
+	case strings.Contains(low, "timeout"),
+		strings.Contains(low, "context deadline exceeded"):
+		return "timeout", "El proveedor tardó demasiado en responder. Reintenta."
+	case strings.Contains(low, "network"),
+		strings.Contains(low, "connection"),
+		strings.Contains(low, "eof"):
+		return "network", "Hubo un problema de red al hablar con el proveedor. Reintenta."
+	}
+	return "unknown", "Ocurrió un error procesando la respuesta. Reintenta o revisa los logs del backend."
 }
 
 func withCORS(next http.Handler) http.Handler {

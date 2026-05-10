@@ -113,25 +113,23 @@ func (s *FilesystemStore) Delete(_ context.Context, id string) error {
 // ── Serialization ─────────────────────────────────────────────────────────────
 
 type serializableConv struct {
-	ID           string                           `json:"id"`
-	ThreadID     string                           `json:"thread_id,omitempty"`
-	Messages     []autobuild.ChatMessage          `json:"messages"`
-	LoadedSkills map[string]autobuild.LoadedSkill `json:"loaded_skills,omitempty"`
-	MemoryRead   bool                             `json:"memory_read"`
-	TurnCount    int                              `json:"turn_count"`
-	CreatedAt    string                           `json:"created_at"`
-	LastTurnAt   string                           `json:"last_turn_at,omitempty"`
+	ID         string                  `json:"id"`
+	ThreadID   string                  `json:"thread_id,omitempty"`
+	Messages   []autobuild.ChatMessage `json:"messages"`
+	MemoryRead bool                    `json:"memory_read"`
+	TurnCount  int                     `json:"turn_count"`
+	CreatedAt  string                  `json:"created_at"`
+	LastTurnAt string                  `json:"last_turn_at,omitempty"`
 }
 
 func toSerializable(c *autobuild.Conversation) serializableConv {
 	sc := serializableConv{
-		ID:           c.ID,
-		ThreadID:     c.ThreadID,
-		Messages:     c.Messages,
-		LoadedSkills: c.LoadedSkills,
-		MemoryRead:   c.MemoryRead,
-		TurnCount:    c.TurnCount,
-		CreatedAt:    c.CreatedAt.Format("2006-01-02T15:04:05Z07:00"),
+		ID:         c.ID,
+		ThreadID:   c.ThreadID,
+		Messages:   c.Messages,
+		MemoryRead: c.MemoryRead,
+		TurnCount:  c.TurnCount,
+		CreatedAt:  c.CreatedAt.Format("2006-01-02T15:04:05Z07:00"),
 	}
 	if !c.LastTurnAt.IsZero() {
 		sc.LastTurnAt = c.LastTurnAt.Format("2006-01-02T15:04:05Z07:00")
@@ -147,9 +145,6 @@ func fromSerializable(data []byte) (*autobuild.Conversation, error) {
 	conv := autobuild.NewConversation(sc.ID)
 	conv.ThreadID = sc.ThreadID
 	conv.Messages = sc.Messages
-	if sc.LoadedSkills != nil {
-		conv.LoadedSkills = sc.LoadedSkills
-	}
 	conv.MemoryRead = sc.MemoryRead
 	return conv, nil
 }

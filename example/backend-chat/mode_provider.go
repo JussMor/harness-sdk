@@ -6,17 +6,12 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
-	"sync"
 
 	ab "github.com/everfaz/autobuild-sdk"
 	sdktokenizers "github.com/everfaz/autobuild-sdk/providers/tokenizers"
 )
 
-var (
-	backendSkillsOnce     sync.Once
-	backendSkillsProvider ab.SkillProvider
-	backendSkillsErr      error
-)
+// Skills are loaded on demand via the Skill tool (sdk/skill_tool.go).
 
 // newModeEngine builds a fully-wired agentRuntime using the SDK Runtime.
 func newModeEngine(provider ab.LLMProvider, model string, logContext RuntimeLogContext) (*ab.Engine, *agentRuntime, error) {
@@ -24,10 +19,6 @@ func newModeEngine(provider ab.LLMProvider, model string, logContext RuntimeLogC
 }
 
 func newModeEngineWithDB(provider ab.LLMProvider, model string, logContext RuntimeLogContext, db *sql.DB, threads ab.ThreadProvider) (*ab.Engine, *agentRuntime, error) {
-	backendSkillsOnce.Do(func() {
-		backendSkillsProvider, backendSkillsErr = loadBackendSkills()
-	})
-	skills := backendSkillsProvider
 	memory, memRoots, err := loadBackendMemory()
 	if err != nil {
 		memory = nil
@@ -43,7 +34,6 @@ func newModeEngineWithDB(provider ab.LLMProvider, model string, logContext Runti
 	rt := &agentRuntime{
 		chatID:    logContext.ChatID,
 		modelName: model,
-		skills:    skills,
 		memory:    memory,
 		execCtx:   ab.NewExecutionContext(),
 	}
@@ -54,7 +44,6 @@ func newModeEngineWithDB(provider ab.LLMProvider, model string, logContext Runti
 	// Main engine with all providers
 	engine := ab.NewWithDefaults(128_000)
 	engine.LLM = provider
-	engine.Skills = skills
 	engine.Memory = memory
 	engine.Tools = rt.tools
 	engine.Threads = threads
@@ -102,14 +91,6 @@ func newModeEngineWithDB(provider ab.LLMProvider, model string, logContext Runti
 			Provider: provider,
 			Model:    bareModel,
 			MaxWords: 200,
-		}).
-		WithMaxSkillTokens(6_000).
-		WithMemoryWriter(&ab.InferredMemoryWriter{
-			Provider:        provider,
-			Model:           bareModel,
-			MaxFacts:        3,
-			MinConfidence:   0.75,
-			DedupeThreshold: 0.6,
 		}).
 		WithThinkingBudget(resolveThinkingBudget(logContext.Mode)).
 		WithSessionContext(ab.LocalTimeSessionContext()).
@@ -170,11 +151,26 @@ Use **todo_write** to track progress on any task that requires more than two ste
 3. Mark it completed as soon as it's done — never leave stale in_progress items.
 4. The user can see this list; it keeps you accountable and helps them follow along.
 
+The current task checklist is surfaced as a <system-reminder> on every turn — check it before deciding what to do next.
+
 Use **glob** to explore the file structure before reading or editing files.
 Use **grep** to find definitions, usages, and references across the workspace.
 Use **bash** for running commands, tests, builds, and one-off scripts.
 Use **file_write** / **file_read** to create and read files in the sandbox.
 Use **dispatch-subagents** for fan-out work: independent research tasks, creating multiple files in parallel, or validating from multiple angles at once.
+
+## Skills
+
+When skills are available they are listed in the <system-reminder> attached to each turn. Invoke them with the **Skill** tool — pass the exact skill name from that listing. If the user asks "what skills do you have?", read the listing and answer truthfully. Never claim you have no skills if the listing is non-empty.
+
+## Persistent memory
+
+Available memory files (if any) are also listed in the <system-reminder>. Use **memory-operations** to read existing entries and to save:
+- User preferences (language, tone, schedule, recurring constraints).
+- Stable facts the user shares about themselves, their team, or their project.
+- Decisions you make together that should outlive this conversation.
+
+When the user mentions something worth keeping ("recuerda que…", "para futuras conversaciones…", "mi nombre es…", project conventions, API keys to never log, etc.) — save it now via ` + "`memory-operations`" + ` (operation=create or str_replace). Do not promise "I'll remember"; actually call the tool.
 
 ## Generative-UI components
 

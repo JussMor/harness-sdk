@@ -24,8 +24,8 @@ type StreamEvent struct {
 	// ToolResult is set when Type=StreamEventToolResult.
 	ToolResult *ToolResult `json:"tool_result,omitempty"`
 
-	// SubagentResult is set when Type=StreamEventSubagentResult.
-	SubagentResult *SubagentResult `json:"subagent_result,omitempty"`
+	// AgentResult is set when Type=StreamEventAgentResult.
+	AgentResult *AgentResult `json:"agent_result,omitempty"`
 
 	// Interrupt is set when Type=StreamEventInterruptRequired or
 	// Type=StreamEventInterruptResolved. Discriminate sub-variants on Kind.
@@ -39,8 +39,40 @@ type StreamEvent struct {
 	// Final is the complete accumulated response when Type=StreamEventDone.
 	Final *AgentLoopResult `json:"final,omitempty"`
 
+	// Compaction is set when Type=StreamEventCompaction. Reports that the
+	// runtime had to summarise older history because the context budget
+	// was exceeded; the frontend can surface a "memory compacted" indicator.
+	Compaction *CompactionEvent `json:"compaction,omitempty"`
+
+	// PlanMode is set when Type=StreamEventPlanModeChanged. Reports a
+	// transition into or out of plan mode (EnterPlanMode / approved or
+	// rejected ExitPlanMode).
+	PlanMode *PlanModeEvent `json:"plan_mode,omitempty"`
+
 	// Error is set when Type=StreamEventError.
 	Error error `json:"-"`
+}
+
+// CompactionEvent is the payload of StreamEventCompaction.
+type CompactionEvent struct {
+	// MessagesDropped is how many ChatMessages were summarised away.
+	MessagesDropped int `json:"messages_dropped"`
+	// OverflowTokens is how many tokens the budget was over before
+	// enforcement (0 if the trigger was something else).
+	OverflowTokens int `json:"overflow_tokens"`
+	// Summary is the formatted human-readable summary of the dropped
+	// messages. Empty when no compactor is installed.
+	Summary string `json:"summary,omitempty"`
+}
+
+// PlanModeEvent is the payload of StreamEventPlanModeChanged.
+type PlanModeEvent struct {
+	// State is "entered" | "exited".
+	State string `json:"state"`
+	// Plan is the most recent plan text (populated on exited approvals).
+	Plan string `json:"plan,omitempty"`
+	// Reason is an optional human-readable reason (e.g. rejection text).
+	Reason string `json:"reason,omitempty"`
 }
 
 // StreamEventType discriminates between event kinds.
@@ -81,13 +113,24 @@ const (
 	// (one request/response cycle within the agent loop).
 	StreamEventTurnComplete StreamEventType = "turn_complete"
 
-	// StreamEventSubagentResult fires once per subagent as they complete.
-	// Consumers can stream partial results to the user as each parallel task finishes.
-	StreamEventSubagentResult StreamEventType = "subagent_result"
+	// StreamEventAgentResult fires once per spawned Agent as it completes.
+	// Consumers can stream partial results to the user as each parallel
+	// Agent invocation finishes.
+	StreamEventAgentResult StreamEventType = "agent_result"
 
 	// StreamEventDone fires once when the entire agent loop has finished.
 	// Final field is populated.
 	StreamEventDone StreamEventType = "done"
+
+	// StreamEventCompaction fires when the runtime summarised older history
+	// because the context budget was exceeded. StreamEvent.Compaction
+	// carries the details (count, overflow, summary).
+	StreamEventCompaction StreamEventType = "compaction"
+
+	// StreamEventPlanModeChanged fires on plan-mode transitions
+	// (EnterPlanMode, approved/rejected ExitPlanMode). StreamEvent.PlanMode
+	// carries the new state.
+	StreamEventPlanModeChanged StreamEventType = "plan_mode_changed"
 
 	// StreamEventError reports a fatal error. No further events follow.
 	StreamEventError StreamEventType = "error"
@@ -179,6 +222,17 @@ func (r *Runtime) runStreamInternal(
 	streamProv StreamingLLMProvider,
 	out chan<- StreamEvent,
 ) error {
+	// Wire the runtime emitter so phases (preparation, plan-mode toggles)
+	// can publish out-of-band events. Cleared on return so a follow-up
+	// sync Run() doesn't accidentally inherit the channel.
+	r.emit = func(ev StreamEvent) {
+		select {
+		case <-ctx.Done():
+		case out <- ev:
+		}
+	}
+	defer func() { r.emit = nil }()
+
 	conv.AppendUser(userMessage)
 
 	if conv.IsCold() {
@@ -209,6 +263,9 @@ func (r *Runtime) runStreamInternal(
 	}
 
 	dispatcher := NewToolDispatcher(r.engine.Tools, r.engine.Sandbox)
+	if r.permissions != nil {
+		dispatcher.WithPermissions(r.permissions)
+	}
 
 	// Forward interrupt requests to the stream
 	if r.interruptGate != nil {
