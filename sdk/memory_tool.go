@@ -95,6 +95,16 @@ current project state:
 DO NOT save: code patterns, architecture, file paths, git history, or anything
 already in CLAUDE.md / a SKILL.md.
 
+**Read-first protocol — when answering questions about the user, project, or
+prior decisions, NEVER call 'create'.** Use the read-only ops first; they are
+cheap and never fail with collisions:
+  1. The per-turn <system-reminder> already lists every memory file with its
+     description. If that's enough, just answer.
+  2. Otherwise call 'find_relevant' (semantic) or 'view' (exact path).
+  3. Only call 'create' when you have *new* information that does not match
+     any existing file's path. If you get "already exists", that means the
+     file is there — switch to 'view' (to read) or 'str_replace' (to amend).
+
 Contract:
   - Always supply 'path' for any operation that targets a file. Paths look
     like "/preferences.md" or "/feedback/testing.md" — leading slash, no scope.
@@ -102,8 +112,8 @@ Contract:
   - Each memory is its own file with frontmatter (name, description, type).
   - Never merge content of one type into a file of a different type — create
     a new file instead.
-  - After 'create', also append a one-line pointer to the scope's
-    /MEMORY.md index: "- [Title](file.md) — one-line hook".
+  - 'create' auto-updates the scope's /MEMORY.md index for you; you do not
+    need a second call to maintain it.
 
 Operations: view, create, str_replace, delete, rename, list, search,
 find_relevant.`
@@ -354,7 +364,7 @@ func executeMemoryTool(ctx context.Context, cfg *MemoryToolConfig, allowed map[S
 				if !cfg.DisableAntiMerge && fm.Type != "" && mt != "" && fm.Type != mt {
 					return "", fmt.Errorf("anti-merge: %s is type=%s; cannot create %s content here. Use a separate file.", path, fm.Type, mt)
 				}
-				return "", fmt.Errorf("memory %s already exists; use str_replace or rename", path)
+				return "", fmt.Errorf("memory %s already exists — use 'view' to read it, or 'str_replace' to modify it. Do NOT call 'create' again.", path)
 			}
 		}
 		body := asMemString(args["content"])
