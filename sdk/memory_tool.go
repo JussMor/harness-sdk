@@ -81,7 +81,7 @@ func (c *MemoryToolConfig) defaults() {
 	}
 }
 
-const memoryToolPrompt = `Persistent typed-memory store.
+const memoryToolPrompt = `Persistent typed-memory store. **Use the memory tool — do NOT shell out to the filesystem; memory is host-managed and not visible under any directory you can list with bash/find.**
 
 Memories are constrained to four types capturing context NOT derivable from the
 current project state:
@@ -96,10 +96,14 @@ DO NOT save: code patterns, architecture, file paths, git history, or anything
 already in CLAUDE.md / a SKILL.md.
 
 Contract:
+  - Always supply 'path' for any operation that targets a file. Paths look
+    like "/preferences.md" or "/feedback/testing.md" — leading slash, no scope.
   - Always 'view' or 'list' before 'str_replace' / 'delete' / 'rename'.
   - Each memory is its own file with frontmatter (name, description, type).
   - Never merge content of one type into a file of a different type — create
     a new file instead.
+  - After 'create', also append a one-line pointer to the scope's
+    /MEMORY.md index: "- [Title](file.md) — one-line hook".
 
 Operations: view, create, str_replace, delete, rename, list, search,
 find_relevant.`
@@ -321,18 +325,37 @@ func executeMemoryTool(ctx context.Context, cfg *MemoryToolConfig, allowed map[S
 		if !allowed[scope] {
 			return "", fmt.Errorf("scope %q is not writable", scope)
 		}
+		if path == "" || strings.HasSuffix(path, "/") {
+			return "", fmt.Errorf("'path' is required and must point to a file (e.g. \"/preferences.md\")")
+		}
 		mt := ParseMemoryType(asMemString(args["type"]))
 		if !cfg.DisableTaxonomy && mt == "" {
 			return "", fmt.Errorf("'type' is required and must be one of: %s", joinMemoryTypes())
 		}
 		// Anti-merge: if the file already exists, refuse — caller should pick a
 		// different filename rather than reusing one of a different type.
-		if existing, err := cfg.Provider.View(ctx, scope, path); err == nil && existing != "" {
-			fm, _ := ParseMemoryFrontmatter(existing)
-			if !cfg.DisableAntiMerge && fm.Type != "" && mt != "" && fm.Type != mt {
-				return "", fmt.Errorf("anti-merge: %s is type=%s; cannot create %s content here. Use a separate file.", path, fm.Type, mt)
+		// stat first so we don't confuse an existing directory listing (View
+		// returns content for dirs too) with an actual file collision.
+		exists := false
+		if stater != nil {
+			if st, err := stater.Stat(ctx, scope, path); err == nil && !st.IsDir {
+				exists = true
 			}
-			return "", fmt.Errorf("memory %s already exists; use str_replace or rename", path)
+		} else {
+			// No stater — fall back to View. Reasonable for filesystem
+			// providers but may produce false positives for directories.
+			if c, err := cfg.Provider.View(ctx, scope, path); err == nil && c != "" {
+				exists = true
+			}
+		}
+		if exists {
+			if existing, err := cfg.Provider.View(ctx, scope, path); err == nil && existing != "" {
+				fm, _ := ParseMemoryFrontmatter(existing)
+				if !cfg.DisableAntiMerge && fm.Type != "" && mt != "" && fm.Type != mt {
+					return "", fmt.Errorf("anti-merge: %s is type=%s; cannot create %s content here. Use a separate file.", path, fm.Type, mt)
+				}
+				return "", fmt.Errorf("memory %s already exists; use str_replace or rename", path)
+			}
 		}
 		body := asMemString(args["content"])
 		fm := MemoryFrontmatter{
@@ -350,6 +373,9 @@ func executeMemoryTool(ctx context.Context, cfg *MemoryToolConfig, allowed map[S
 	case "str_replace":
 		if !allowed[scope] {
 			return "", fmt.Errorf("scope %q is not writable", scope)
+		}
+		if path == "" {
+			return "", fmt.Errorf("'path' is required (e.g. \"/preferences.md\")")
 		}
 		// Read-before-write
 		if !cfg.DisableReadBeforeWrite {
@@ -378,6 +404,9 @@ func executeMemoryTool(ctx context.Context, cfg *MemoryToolConfig, allowed map[S
 	case "delete":
 		if !allowed[scope] {
 			return "", fmt.Errorf("scope %q is not writable", scope)
+		}
+		if path == "" {
+			return "", fmt.Errorf("'path' is required")
 		}
 		if !cfg.DisableReadBeforeWrite && !cfg.Tracker.HasRead(scope, path) {
 			return "", fmt.Errorf("memory %s not read in this session — view it before deleting", path)
