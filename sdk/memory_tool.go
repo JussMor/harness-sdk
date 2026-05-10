@@ -368,7 +368,8 @@ func executeMemoryTool(ctx context.Context, cfg *MemoryToolConfig, allowed map[S
 			return "", err
 		}
 		cfg.Tracker.MarkRead(scope, path, statMtime(scope, path))
-		return fmt.Sprintf("created %s [%s]", path, mt), nil
+		indexNote := maybeAppendMemoryIndex(ctx, cfg.Provider, scope, path, fm)
+		return fmt.Sprintf("created %s [%s]%s", path, mt, indexNote), nil
 
 	case "str_replace":
 		if !allowed[scope] {
@@ -442,6 +443,55 @@ func joinMemoryTypes() string {
 		parts[i] = string(t)
 	}
 	return strings.Join(parts, ", ")
+}
+
+// maybeAppendMemoryIndex appends a one-line pointer to /MEMORY.md when a new
+// memory file is created. Returns a human-readable suffix to append to the
+// tool result (e.g. " (+ index updated)") or an empty string. Failures are
+// swallowed: the create itself already succeeded.
+func maybeAppendMemoryIndex(ctx context.Context, p MemoryProvider, scope Scope, path string, fm MemoryFrontmatter) string {
+	indexPath := "/" + MemdirEntrypointFilename
+	if path == indexPath || strings.EqualFold(path, indexPath) {
+		return ""
+	}
+	base := path
+	if i := strings.LastIndex(base, "/"); i >= 0 {
+		base = base[i+1:]
+	}
+	rel := strings.TrimPrefix(path, "/")
+	title := fm.Name
+	if title == "" {
+		title = strings.TrimSuffix(base, ".md")
+	}
+	hook := fm.Description
+	if hook == "" {
+		hook = string(fm.Type)
+	}
+	line := fmt.Sprintf("- [%s](%s) — %s", title, rel, hook)
+
+	cur, err := p.View(ctx, scope, indexPath)
+	if err != nil || cur == "" {
+		// Seed a minimal MEMORY.md so the index always exists.
+		seed := "# Memory Index\n\n" + line + "\n"
+		if cerr := p.Create(ctx, scope, indexPath, seed); cerr == nil {
+			return " (+ MEMORY.md created)"
+		}
+		return ""
+	}
+	// Idempotent: skip if the link target is already referenced.
+	if strings.Contains(cur, "("+rel+")") {
+		return ""
+	}
+	body := cur
+	if !strings.HasSuffix(body, "\n") {
+		body += "\n"
+	}
+	body += line + "\n"
+	// Use str_replace to overwrite the file entirely.
+	if err := p.StrReplace(ctx, scope, indexPath, cur, body); err == nil {
+		return " (+ index updated)"
+	}
+	return ""
 }
 
 func parseToolScope(raw string, def Scope) Scope {
