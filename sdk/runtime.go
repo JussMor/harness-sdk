@@ -174,9 +174,9 @@ func (r *Runtime) WithThinkingBudget(budgetTokens int) *Runtime {
 	return r
 }
 
-// Run executes a conversation turn. The Conversation accumulates state
-// across calls — first call is "cold" (full orientation), subsequent calls
-// are "warm" (reuse loaded skills and memory).
+// Run executes a synchronous (non-streaming) conversation turn. Intended for
+// evals, replay, and batch processing. For real-time UIs use RunStream —
+// all production traffic should go through the streaming path.
 func (r *Runtime) Run(ctx context.Context, conv *Conversation, userMessage string) (*RuntimeResult, error) {
 	if !r.engine.HasLLM() {
 		return nil, fmt.Errorf("runtime: no LLM provider — set engine.LLM")
