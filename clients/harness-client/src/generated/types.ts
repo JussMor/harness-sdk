@@ -1181,6 +1181,111 @@ export interface RoutedLLMProvider {
 }
 
 //////////
+// source: memdir.go
+
+/**
+ * MemoryType is the closed four-type taxonomy for persistent memory entries.
+ * Content NOT derivable from the project (preferences, corrections, ongoing
+ * initiatives, external pointers) goes into one of these types. Code patterns,
+ * architecture, and git history are derivable and must NOT be stored as memory.
+ */
+export type MemoryType = string;
+export const MemoryTypeUser: MemoryType = "user"; // user role, preferences, knowledge
+export const MemoryTypeFeedback: MemoryType = "feedback"; // corrections + validated approaches
+export const MemoryTypeProject: MemoryType = "project"; // ongoing work, deadlines, motivations
+export const MemoryTypeReference: MemoryType = "reference"; // pointers to external systems
+/**
+ * MemoryStat is metadata returned by MemoryStater.
+ */
+export interface MemoryStat {
+  MtimeMs: number /* int64 */; // Unix milliseconds of last modification
+  Size: number /* int64 */;
+  IsDir: boolean;
+}
+/**
+ * MemoryStater is an optional interface a MemoryProvider may implement to
+ * expose mtime/size. memdir uses it for age annotations and freshness sorting.
+ * Providers that don't implement it fall back to time.Now() — relative age
+ * will be "today".
+ */
+export type MemoryStater = unknown;
+/**
+ * MemoryHeader is the parsed-frontmatter metadata for a single memory file.
+ */
+export interface MemoryHeader {
+  scope: Scope;
+  path: string; // path within the scope, e.g. "/feedback/testing.md"
+  filename: string;
+  name?: string;
+  description?: string;
+  type?: MemoryType;
+  mtime_ms?: number /* int64 */;
+}
+/**
+ * MaxMemoryFilesScanned caps the manifest size for relevance selection.
+ */
+export const MaxMemoryFilesScanned = 200;
+/**
+ * MemorySelector picks up to N memory headers most relevant to a query. The
+ * default is a keyword-overlap selector (KeywordMemorySelector); callers can
+ * plug in an LLM-backed selector for higher-fidelity recall.
+ */
+export type MemorySelector = unknown;
+/**
+ * KeywordMemorySelector ranks headers by keyword overlap between the query
+ * and each header's name+description+type+path. No LLM call required.
+ */
+export interface KeywordMemorySelector {
+}
+/**
+ * FindRelevantMemoriesOptions configures a relevance lookup.
+ */
+export interface FindRelevantMemoriesOptions {
+  Scopes: Scope[]; // defaults to {ScopeUser, ScopeProject}
+  Dir: string; // root dir per scope (default "/")
+  Limit: number /* int */; // defaults to 5
+  Selector: MemorySelector; // defaults to KeywordMemorySelector
+  AlreadySurfaced: { [key: string]: boolean}; // {scope|path} keys to exclude (already shown)
+}
+/**
+ * RelevantMemory pairs a header with its (already-loaded) content for direct
+ * injection into the prompt. Content is best-effort; on read error the
+ * memory is dropped.
+ */
+export interface RelevantMemory {
+  Header: MemoryHeader;
+  Content: string;
+}
+/**
+ * ReadBeforeWriteTracker enforces the contract that a memory file must be
+ * viewed (or freshly created) in the current session before it can be
+ * updated or deleted. Mirrors Claude Code's "read-before-write" guard for
+ * FileEditTool, applied to typed memory.
+ * Safe for concurrent use within a session.
+ */
+export interface ReadBeforeWriteTracker {
+}
+/**
+ * MemoryFrontmatter is the canonical header for a typed-memory file.
+ */
+export interface MemoryFrontmatter {
+  Name: string;
+  Description: string;
+  Type: MemoryType;
+}
+/**
+ * MemdirEntrypointFilename is the bootstrap memory index, loaded eagerly into
+ * the system prompt every turn. Contents follow Claude Code's contract: a
+ * concise list of pointers to typed memory files, no memory content directly.
+ */
+export const MemdirEntrypointFilename = "MEMORY.md";
+/**
+ * MaxMemdirEntrypointLines caps how many lines of MEMORY.md are spliced into
+ * the system prompt. Keeps token usage predictable when an index grows.
+ */
+export const MaxMemdirEntrypointLines = 200;
+
+//////////
 // source: memory.go
 
 /**
@@ -1226,6 +1331,57 @@ export interface MemoryEntry {
 export interface MemorySearchResult {
   MemoryEntry: MemoryEntry;
   score: number /* float64 */; // relevance 0-1
+}
+
+//////////
+// source: memory_tool.go
+
+/**
+ * MemoryToolConfig configures NewMemoryTool.
+ */
+export interface MemoryToolConfig {
+  /**
+   * Provider is the backing MemoryProvider. Required.
+   */
+  Provider: MemoryProvider;
+  /**
+   * Selector picks relevant memories for `find_relevant`.
+   * Defaults to KeywordMemorySelector (no LLM call).
+   */
+  Selector: MemorySelector;
+  /**
+   * Tracker enforces the read-before-write contract.
+   * If nil, a fresh in-memory tracker is created per tool instance.
+   */
+  Tracker?: ReadBeforeWriteTracker;
+  /**
+   * DefaultScope is used when the model omits the `scope` argument.
+   * Defaults to ScopeProject.
+   */
+  DefaultScope: Scope;
+  /**
+   * AllowedScopes limits which scopes the model can write to. nil =
+   * {ScopeUser, ScopeProject}. Reads always allow either scope.
+   */
+  AllowedScopes: Scope[];
+  /**
+   * DisableReadBeforeWrite turns the contract off (default: enforced).
+   * Disable only for tests / scripted seeding.
+   */
+  DisableReadBeforeWrite: boolean;
+  /**
+   * DisableTaxonomy allows create/str_replace without a `type` argument
+   * (default: required).
+   */
+  DisableTaxonomy: boolean;
+  /**
+   * DisableAntiMerge skips type-mismatch protection on writes (default: on).
+   */
+  DisableAntiMerge: boolean;
+  /**
+   * FindRelevantLimit caps `find_relevant` result count. Defaults to 5.
+   */
+  FindRelevantLimit: number /* int */;
 }
 
 //////////
@@ -1460,6 +1616,46 @@ export type ApproverFunc = unknown;
  * PermissionEngine is the central decision point. Safe for concurrent use.
  */
 export interface PermissionEngine {
+}
+
+//////////
+// source: plan_tool.go
+
+/**
+ * PlanController holds the shared state for a session's plan mode. Construct
+ * one per Runtime and pass it to NewPlanTool. Safe for concurrent use.
+ */
+export interface PlanController {
+  /**
+   * Optional callback fired when the user approves an exit. The runtime/host
+   * can use this to persist the plan, surface it in the UI, or kick off
+   * the implementation phase.
+   */
+  OnApproved: unknown;
+  /**
+   * Optional callback fired when the user rejects an exit. The agent stays
+   * in plan mode; hosts may use this to surface the rejection reason.
+   */
+  OnRejected: unknown;
+  /**
+   * OnStateChanged fires after Enter/Exit. The host (runtime/backend) uses
+   * this to publish StreamEventPlanModeChanged on the live SSE channel.
+   */
+  OnStateChanged: unknown;
+}
+/**
+ * PlanToolConfig configures the plan-mode tool pair.
+ */
+export interface PlanToolConfig {
+  /**
+   * Controller is required — it owns mode state and the plan buffer.
+   */
+  Controller?: PlanController;
+  /**
+   * AutoApprove skips the InterruptKindApproval call on Exit. Useful in
+   * non-interactive contexts (eval harness, scripted runs).
+   */
+  AutoApprove: boolean;
 }
 
 //////////
@@ -2117,6 +2313,54 @@ export interface StreamEvent {
    * Final is the complete accumulated response when Type=StreamEventDone.
    */
   final?: AgentLoopResult;
+  /**
+   * Compaction is set when Type=StreamEventCompaction. Reports that the
+   * runtime had to summarise older history because the context budget
+   * was exceeded; the frontend can surface a "memory compacted" indicator.
+   */
+  compaction?: CompactionEvent;
+  /**
+   * PlanMode is set when Type=StreamEventPlanModeChanged. Reports a
+   * transition into or out of plan mode (EnterPlanMode / approved or
+   * rejected ExitPlanMode).
+   */
+  plan_mode?: PlanModeEvent;
+}
+/**
+ * CompactionEvent is the payload of StreamEventCompaction.
+ */
+export interface CompactionEvent {
+  /**
+   * MessagesDropped is how many ChatMessages were summarised away.
+   */
+  messages_dropped: number /* int */;
+  /**
+   * OverflowTokens is how many tokens the budget was over before
+   * enforcement (0 if the trigger was something else).
+   */
+  overflow_tokens: number /* int */;
+  /**
+   * Summary is the formatted human-readable summary of the dropped
+   * messages. Empty when no compactor is installed.
+   */
+  summary?: string;
+}
+/**
+ * PlanModeEvent is the payload of StreamEventPlanModeChanged.
+ */
+export interface PlanModeEvent {
+  /**
+   * State is "entered" | "exited".
+   */
+  state: string;
+  /**
+   * Plan is the most recent plan text (populated on exited approvals).
+   */
+  plan?: string;
+  /**
+   * Reason is an optional human-readable reason (e.g. rejection text).
+   */
+  reason?: string;
 }
 /**
  * StreamEventType discriminates between event kinds.
@@ -2176,6 +2420,18 @@ export const StreamEventAgentResult: StreamEventType = "agent_result";
  * Final field is populated.
  */
 export const StreamEventDone: StreamEventType = "done";
+/**
+ * StreamEventCompaction fires when the runtime summarised older history
+ * because the context budget was exceeded. StreamEvent.Compaction
+ * carries the details (count, overflow, summary).
+ */
+export const StreamEventCompaction: StreamEventType = "compaction";
+/**
+ * StreamEventPlanModeChanged fires on plan-mode transitions
+ * (EnterPlanMode, approved/rejected ExitPlanMode). StreamEvent.PlanMode
+ * carries the new state.
+ */
+export const StreamEventPlanModeChanged: StreamEventType = "plan_mode_changed";
 /**
  * StreamEventError reports a fatal error. No further events follow.
  */
