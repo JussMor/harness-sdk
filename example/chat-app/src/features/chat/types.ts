@@ -103,7 +103,10 @@ export type StreamEvent =
   | { type: "compaction"; data: StreamCompaction }
   | { type: "plan_mode_changed"; data: StreamPlanMode }
   | { type: "done"; data: StreamDone }
-  | { type: "error"; data: { error?: string } }
+  | {
+      type: "error"
+      data: { error?: string; category?: string; detail?: string }
+    }
 
 // ── Generic interrupt types (new HIL system) ─────────────────────────────────
 

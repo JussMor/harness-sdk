@@ -377,7 +377,10 @@ function adaptSSEEvent(type: string, dataText: string): StreamEvent | null {
         data: parsed as { runId?: string; messageId?: number },
       }
     case "error":
-      return { type: "error", data: parsed as { error?: string } }
+      return {
+        type: "error",
+        data: parsed as { error?: string; category?: string; detail?: string },
+      }
     default:
       return null
   }

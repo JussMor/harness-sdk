@@ -19,6 +19,7 @@ import type {
 import { componentCatalog } from "@/lib/component-catalog"
 import { ArtifactRenderer } from "@harness/react"
 import {
+  AlertTriangle,
   Bot,
   Brain,
   Check,
@@ -120,6 +121,16 @@ export function ChatMain({
     at: number
     dropped: number
     summary?: string
+  } | null>(null)
+
+  // ── Stream error banner ──────────────────────────────────────────────────
+  // Last fatal stream error (e.g. provider billing / rate limit). Renders a
+  // dismissible banner above the input. Cleared on next sendPrompt or by the
+  // user.
+  const [streamError, setStreamError] = useState<{
+    message: string
+    category?: string
+    detail?: string
   } | null>(null)
 
   // ── Generative UI artifacts (component artifacts from the SDK) ─────────────
@@ -600,8 +611,26 @@ export function ChatMain({
       }
 
       if (event.type === "error") {
-        const errorMessage = event.data.error || "Unknown stream error"
+        const errorMessage =
+          event.data.error ||
+          "Ocurrió un error procesando la respuesta. Reintenta."
+        const category = event.data.category
+        const detail = event.data.detail
+        setStreamError({ message: errorMessage, category, detail })
         pushTimeline(`Stream error: ${errorMessage}`, "error")
+        // Replace the pending assistant bubble with the error so the chat
+        // history reflects what happened instead of staying blank.
+        setMessages((prev) =>
+          prev.map((m) =>
+            m.id === pendingAssistantId
+              ? {
+                  ...m,
+                  pending: false,
+                  content: m.content || `⚠️ ${errorMessage}`,
+                }
+              : m
+          )
+        )
         return
       }
 
@@ -784,6 +813,7 @@ export function ChatMain({
     setInput("")
     setStatusText("Streaming response...")
     setIsStreaming(true)
+    setStreamError(null)
 
     // Reset artifact detector for the new response
     detectorRef.current = createDetectorState()
@@ -943,6 +973,68 @@ export function ChatMain({
               className="chat-compaction-banner-close"
               onClick={() => setLastCompaction(null)}
               aria-label="Dismiss"
+            >
+              ×
+            </button>
+          </div>
+        ) : null}
+
+        {streamError ? (
+          <div
+            className="chat-error-banner"
+            role="alert"
+            aria-live="assertive"
+            style={{
+              display: "flex",
+              alignItems: "flex-start",
+              gap: 8,
+              padding: "10px 14px",
+              margin: "8px 12px",
+              borderRadius: 8,
+              background: "rgba(220, 38, 38, 0.08)",
+              border: "1px solid rgba(220, 38, 38, 0.35)",
+              color: "var(--text, #b91c1c)",
+              fontSize: 13,
+            }}
+          >
+            <AlertTriangle size={16} style={{ flexShrink: 0, marginTop: 2 }} />
+            <div style={{ flex: 1 }}>
+              <div style={{ fontWeight: 600 }}>
+                {streamError.category && streamError.category !== "unknown"
+                  ? `Error (${streamError.category})`
+                  : "Error"}
+              </div>
+              <div>{streamError.message}</div>
+              {streamError.detail ? (
+                <details style={{ marginTop: 4, opacity: 0.75 }}>
+                  <summary style={{ cursor: "pointer", fontSize: 12 }}>
+                    Detalle técnico
+                  </summary>
+                  <pre
+                    style={{
+                      whiteSpace: "pre-wrap",
+                      wordBreak: "break-word",
+                      fontSize: 11,
+                      marginTop: 4,
+                    }}
+                  >
+                    {streamError.detail}
+                  </pre>
+                </details>
+              ) : null}
+            </div>
+            <button
+              type="button"
+              onClick={() => setStreamError(null)}
+              aria-label="Dismiss"
+              style={{
+                background: "transparent",
+                border: "none",
+                cursor: "pointer",
+                color: "inherit",
+                fontSize: 18,
+                lineHeight: 1,
+              }}
             >
               ×
             </button>
