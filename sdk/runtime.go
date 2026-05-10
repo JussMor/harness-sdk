@@ -33,6 +33,11 @@ type Runtime struct {
 	thinkingBudget  int
 	interruptGate   *InterruptGate
 	permissions     *PermissionEngine
+	planController  *PlanController
+
+	// emit is set during streaming runs so phases (preparation, plan-mode
+	// transitions) can publish out-of-band events. Nil during sync Run.
+	emit func(StreamEvent)
 }
 
 // Tokenizer estimates token count for a string. Replace the default heuristic
@@ -119,6 +124,27 @@ func (r *Runtime) WithSessionContext(p SessionContextProvider) *Runtime {
 // messages are silently lost. With it, a summary is injected into LayerMemory.
 func (r *Runtime) WithCompactor(c Compactor) *Runtime {
 	r.compactor = c
+	return r
+}
+
+// WithPlanController binds a PlanController so plan-mode transitions
+// (Enter/Exit) publish StreamEventPlanModeChanged on streaming runs.
+// The runtime takes over OnStateChanged and forwards previously-set
+// callbacks if any.
+func (r *Runtime) WithPlanController(pc *PlanController) *Runtime {
+	if pc == nil {
+		return r
+	}
+	prev := pc.OnStateChanged
+	pc.OnStateChanged = func(ev PlanModeEvent) {
+		if prev != nil {
+			prev(ev)
+		}
+		if r.emit != nil {
+			r.emit(StreamEvent{Type: StreamEventPlanModeChanged, PlanMode: &ev})
+		}
+	}
+	r.planController = pc
 	return r
 }
 
@@ -247,32 +273,28 @@ func (r *Runtime) Run(ctx context.Context, conv *Conversation, userMessage strin
 // ── Orientation (cold start only) ────────────────────────────────────────────
 
 func (r *Runtime) orientation(ctx context.Context, userMessage string, conv *Conversation, rr *RuntimeResult) error {
-	// Read memory → LayerMemory using labeled roots
+	// Memory → LayerMemory using the Claude Code memdir contract:
+	//
+	//   1. Inject the static behavioural prompt (taxonomy, two-step save,
+	//      freshness, read-before-write).
+	//   2. Inline the MEMORY.md index for each requested scope. The index
+	//      is short by contract — full memory bodies are read on demand
+	//      via the memory tool, NOT stuffed into the system prompt.
+	//
+	// Per-turn dynamic manifest + freshness reminders are added separately
+	// by the memory tool's DynamicReminder hook in execution().
 	if r.engine.HasMemory() && r.engine.HasPrompt() {
-		roots := r.memoryRootsV2
-		if len(roots) == 0 {
-			roots = DefaultMemoryRoots
+		scopes := uniqueScopesFromRoots(r.memoryRootsV2)
+		if len(scopes) == 0 {
+			scopes = []Scope{ScopeUser, ScopeProject}
 		}
-		var memContent strings.Builder
-		for _, root := range roots {
-			content, err := r.engine.Memory.View(ctx, root.Scope, root.Path)
-			if err != nil || strings.TrimSpace(content) == "" {
-				continue
+		section := BuildMemdirPromptSection(ctx, r.engine.Memory, scopes...)
+		if section != "" {
+			if r.maxMemoryTokens > 0 && r.tokenizer != nil &&
+				r.tokenizer.Count(section) > r.maxMemoryTokens {
+				section = evictMemoryToTokenBudget(section, r.maxMemoryTokens, r.tokenizer)
 			}
-			if root.Label != "" {
-				memContent.WriteString("## ")
-				memContent.WriteString(root.Label)
-				memContent.WriteString("\n\n")
-			}
-			memContent.WriteString(strings.TrimSpace(content))
-			memContent.WriteString("\n\n")
-		}
-		if memContent.Len() > 0 {
-			memStr := memContent.String()
-			if r.maxMemoryTokens > 0 && r.tokenizer.Count(memStr) > r.maxMemoryTokens {
-				memStr = evictMemoryToTokenBudget(memStr, r.maxMemoryTokens, r.tokenizer)
-			}
-			r.engine.Prompt.Set(LayerMemory, memStr)
+			r.engine.Prompt.Set(LayerMemory, section)
 			rr.MemoryRead = true
 			conv.MemoryRead = true
 		}
@@ -281,6 +303,25 @@ func (r *Runtime) orientation(ctx context.Context, userMessage string, conv *Con
 	// Skills are loaded lazily by the Skill tool — no orientation-time matching.
 	r.buildSessionLayer(ctx, conv, userMessage)
 	return nil
+}
+
+// uniqueScopesFromRoots collapses the legacy MemoryRoot list into the set
+// of distinct scopes the caller wants bootstrapped. Order is preserved on
+// first occurrence.
+func uniqueScopesFromRoots(roots []MemoryRoot) []Scope {
+	if len(roots) == 0 {
+		return nil
+	}
+	seen := make(map[Scope]bool, len(roots))
+	out := make([]Scope, 0, len(roots))
+	for _, r := range roots {
+		if r.Scope == "" || seen[r.Scope] {
+			continue
+		}
+		seen[r.Scope] = true
+		out = append(out, r.Scope)
+	}
+	return out
 }
 
 // ── Warm turn refresh ─────────────────────────────────────────────────────────
@@ -341,6 +382,19 @@ func (r *Runtime) preparation(ctx context.Context, conv *Conversation, rr *Runti
 		if compResult.Summary != "" && r.engine.HasPrompt() {
 			r.engine.Prompt.Append(LayerMemory, "\n\nContext summary (from earlier turns):\n"+compResult.Summary)
 		}
+		// Surface the compaction signal to streaming consumers so the UI
+		// can show a "memory compacted" indicator. Only emitted when
+		// history was truncated.
+		if r.emit != nil && enforce.TruncatedHistory {
+			r.emit(StreamEvent{
+				Type: StreamEventCompaction,
+				Compaction: &CompactionEvent{
+					MessagesDropped: enforce.HistoryDropped,
+					OverflowTokens:  enforce.OverflowTokens,
+					Summary:         compResult.Summary,
+				},
+			})
+		}
 	}
 	return nil
 }
@@ -385,18 +439,25 @@ func (r *Runtime) execution(ctx context.Context, conv *Conversation, rr *Runtime
 		cfg.SystemPrompt = r.engine.Prompt.Build()
 	}
 
-	// Inject per-turn dynamic reminders (skills listing, agents listing, …)
-	// as <system-reminder> blocks appended to the system prompt. Without this
-	// the LLM is unaware of the lazy-loaded skills/agents catalog and tells
-	// the user it has none.
-	if r.engine.HasTools() {
+	// Per-turn dynamic reminders — skill listing, agent listing, etc.
+	// Tools opt in via the Tool.DynamicReminder hook. Without this, the
+	// LLM never sees which skills/agents are available and replies as if
+	// none exist. Reminders are appended to the system prompt as a
+	// <system-reminder> block so they ride alongside the static layers.
+	if r.engine.Tools != nil {
 		if blocks, err := r.engine.Tools.CollectDynamicReminders(ctx); err == nil && len(blocks) > 0 {
-			reminder := SystemReminder(JoinSystemReminders(blocks...))
-			if reminder != "" {
+			wrapped := make([]string, 0, len(blocks))
+			for _, b := range blocks {
+				if w := SystemReminder(b); w != "" {
+					wrapped = append(wrapped, w)
+				}
+			}
+			joined := JoinSystemReminders(wrapped...)
+			if joined != "" {
 				if cfg.SystemPrompt != "" {
-					cfg.SystemPrompt += "\n\n" + reminder
+					cfg.SystemPrompt += "\n\n" + joined
 				} else {
-					cfg.SystemPrompt = reminder
+					cfg.SystemPrompt = joined
 				}
 			}
 		}

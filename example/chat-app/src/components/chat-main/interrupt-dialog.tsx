@@ -5,6 +5,8 @@
 
 import type { StreamInterruptRequest } from "@/features/chat/types"
 import { useState } from "react"
+import ReactMarkdown from "react-markdown"
+import remarkGfm from "remark-gfm"
 
 export interface InterruptDialogProps {
   request: StreamInterruptRequest
@@ -49,7 +51,64 @@ export function InterruptDialog({
 
 function ApprovalView({ request, onResolve }: InterruptDialogProps) {
   const tool = request.approval?.tool_call?.name ?? "unknown"
-  const args = request.approval?.tool_call?.args
+  // Tool args arrive on the SSE wire as a JSON-encoded string under
+  // `arguments` (matches sdk.ToolCallEntry.Arguments). Older payloads may
+  // expose a pre-parsed `args` object — accept either.
+  const rawArgs = request.approval?.tool_call?.arguments
+  let parsedArgs: Record<string, unknown> | undefined =
+    request.approval?.tool_call?.args
+  if (!parsedArgs && typeof rawArgs === "string" && rawArgs.length > 0) {
+    try {
+      parsedArgs = JSON.parse(rawArgs) as Record<string, unknown>
+    } catch {
+      parsedArgs = undefined
+    }
+  }
+  const args = parsedArgs
+
+  // Specialise ExitPlanMode → render the plan as markdown with explicit
+  // "Approve plan" / "Keep planning" buttons. The agent only escapes plan
+  // mode when the user approves, so the dialog is the gate for switching
+  // from research → execution.
+  if (tool === "ExitPlanMode") {
+    const plan = typeof args?.plan === "string" ? args.plan : ""
+    return (
+      <div className="space-y-3 rounded-md border bg-card p-4">
+        <div className="flex items-center gap-2 font-medium">
+          <span>Plan ready for review</span>
+          <span className="rounded-full bg-amber-100 px-2 py-0.5 text-xs text-amber-900">
+            Plan mode
+          </span>
+        </div>
+        <div className="text-sm text-muted-foreground">
+          The agent gathered context in plan mode and proposes the steps below.
+          Approving exits plan mode and lets the agent execute.
+        </div>
+        <div className="prose prose-sm dark:prose-invert max-h-80 max-w-none overflow-auto rounded bg-muted p-3">
+          {plan ? (
+            <ReactMarkdown remarkPlugins={[remarkGfm]}>{plan}</ReactMarkdown>
+          ) : (
+            <p className="text-muted-foreground">No plan provided.</p>
+          )}
+        </div>
+        <div className="flex justify-end gap-2">
+          <button
+            className="rounded border px-3 py-1"
+            onClick={() => onResolve({ approved: false })}
+          >
+            Keep planning
+          </button>
+          <button
+            className="rounded bg-primary px-3 py-1 text-primary-foreground"
+            onClick={() => onResolve({ approved: true })}
+          >
+            Approve plan
+          </button>
+        </div>
+      </div>
+    )
+  }
+
   return (
     <div className="space-y-3 rounded-md border bg-card p-4">
       <div className="font-medium">Approval requested</div>

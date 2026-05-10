@@ -24,7 +24,9 @@ import {
   Check,
   ChevronDown,
   ChevronRight,
+  ClipboardList,
   Copy,
+  Database,
   LoaderCircle,
   RefreshCw,
   SendHorizontal,
@@ -103,6 +105,22 @@ export function ChatMain({
   const [hilEnabled, setHilEnabled] = useState(true)
   const [pendingInterrupt, setPendingInterrupt] =
     useState<StreamInterruptRequest | null>(null)
+
+  // ── Plan-mode state ──────────────────────────────────────────────────────
+  // The agent has entered plan mode (EnterPlanMode tool fired). The flag
+  // remains true until a plan_mode_changed event with state === "exited"
+  // arrives (approval, rejection, or auto-restore).
+  const [inPlanMode, setInPlanMode] = useState(false)
+
+  // ── Compaction signal ────────────────────────────────────────────────────
+  // Last compaction event the runtime emitted. When non-null, a transient
+  // banner shows "Memory compacted — N messages summarised". Cleared after
+  // a few seconds.
+  const [lastCompaction, setLastCompaction] = useState<{
+    at: number
+    dropped: number
+    summary?: string
+  } | null>(null)
 
   // ── Generative UI artifacts (component artifacts from the SDK) ─────────────
   const [componentArtifacts, setComponentArtifacts] = useState<
@@ -337,6 +355,14 @@ export function ChatMain({
       streamControllerRef.current?.abort()
     }
   }, [])
+
+  // Auto-dismiss the "memory compacted" banner after a short window so it
+  // doesn't linger across turns. Cleared eagerly when a new event arrives.
+  useEffect(() => {
+    if (!lastCompaction) return
+    const t = setTimeout(() => setLastCompaction(null), 6000)
+    return () => clearTimeout(t)
+  }, [lastCompaction])
 
   const stopStream = useCallback(() => {
     if (!streamControllerRef.current) {
@@ -692,6 +718,41 @@ export function ChatMain({
         return
       }
 
+      if (event.type === "compaction") {
+        // Surface a transient banner + timeline note. Lets the user know
+        // why earlier messages might appear summarised in subsequent turns.
+        const dropped = event.data.messages_dropped ?? 0
+        setLastCompaction({
+          at: Date.now(),
+          dropped,
+          summary: event.data.summary,
+        })
+        pushTimeline(
+          dropped > 0
+            ? `Memory compacted — ${dropped} message${dropped === 1 ? "" : "s"} summarised`
+            : "Memory compacted",
+          "info"
+        )
+        return
+      }
+
+      if (event.type === "plan_mode_changed") {
+        const state = event.data.state
+        if (state === "entered") {
+          setInPlanMode(true)
+          pushTimeline("Plan mode engaged — agent will not edit", "info")
+        } else {
+          setInPlanMode(false)
+          pushTimeline(
+            event.data.reason
+              ? `Plan mode exited: ${event.data.reason}`
+              : "Plan mode exited",
+            "info"
+          )
+        }
+        return
+      }
+
       if (event.type === "done") {
         // Mark stream as done — syncMessages() after streamChat resolves
         // handles full message and artifact restoration from backend.
@@ -830,6 +891,15 @@ export function ChatMain({
             {activeChatID ? `Chat #${activeChatID}` : "New Chat"}
           </span>
           <span className="chat-main-header-sub">{selectedMode}</span>
+          {inPlanMode ? (
+            <span
+              className="chat-mode-badge chat-mode-badge--plan"
+              title="Plan mode — agent is gathering info and will not modify anything until you approve"
+            >
+              <ClipboardList size={12} />
+              Plan mode
+            </span>
+          ) : null}
           <button
             type="button"
             title={
@@ -852,6 +922,32 @@ export function ChatMain({
             <span>{statusText}</span>
           </div>
         </header>
+
+        {lastCompaction ? (
+          <div
+            className="chat-compaction-banner"
+            role="status"
+            aria-live="polite"
+          >
+            <Database size={14} />
+            <span>
+              Memory compacted
+              {lastCompaction.dropped > 0
+                ? ` — ${lastCompaction.dropped} earlier message${
+                    lastCompaction.dropped === 1 ? "" : "s"
+                  } summarised`
+                : ""}
+            </span>
+            <button
+              type="button"
+              className="chat-compaction-banner-close"
+              onClick={() => setLastCompaction(null)}
+              aria-label="Dismiss"
+            >
+              ×
+            </button>
+          </div>
+        ) : null}
 
         <div className="chat-main-toolbar">
           <select
@@ -1031,25 +1127,56 @@ export function ChatMain({
 
             {allArtifacts.length > 0 && (
               <div className="chat-artifacts-list">
-                <h3 className="chat-artifacts-list__title">Artifacts</h3>
-                {allArtifacts.map((artifact) => (
-                  <button
-                    key={artifact.id}
-                    type="button"
-                    className={`chat-artifact-item ${activeArtifact?.id === artifact.id ? "chat-artifact-item--active" : ""}`}
-                    onClick={() => {
-                      setActiveArtifact(artifact)
-                      setIsArtifactStreaming(false)
-                    }}
-                  >
-                    <span className="chat-artifact-item__lang">
-                      {artifact.language}
+                <div className="chat-artifacts-list__header">
+                  <h3 className="chat-artifacts-list__title">
+                    Artifacts
+                    <span className="chat-artifacts-list__count">
+                      {allArtifacts.length}
                     </span>
-                    <span className="chat-artifact-item__name">
-                      {artifact.title || `${artifact.language} artifact`}
-                    </span>
-                  </button>
-                ))}
+                  </h3>
+                </div>
+                <div className="chat-artifacts-list__grid">
+                  {allArtifacts.map((artifact) => {
+                    const isActive = activeArtifact?.id === artifact.id
+                    const title =
+                      artifact.title ||
+                      `${artifact.language || "text"} artifact`
+                    const lang = (artifact.language || "txt").toLowerCase()
+                    const lines = artifact.content
+                      ? artifact.content.split("\n").length
+                      : 0
+                    return (
+                      <button
+                        key={artifact.id}
+                        type="button"
+                        className={`chat-artifact-card ${isActive ? "chat-artifact-card--active" : ""}`}
+                        onClick={() => {
+                          setActiveArtifact(artifact)
+                          setIsArtifactStreaming(false)
+                        }}
+                        title={title}
+                      >
+                        <span
+                          className="chat-artifact-card__lang"
+                          data-lang={lang}
+                        >
+                          {lang}
+                        </span>
+                        <span className="chat-artifact-card__body">
+                          <span className="chat-artifact-card__name">
+                            {title}
+                          </span>
+                          <span className="chat-artifact-card__meta">
+                            {lines > 0
+                              ? `${lines} line${lines === 1 ? "" : "s"}`
+                              : "—"}
+                            {!artifact.complete ? " · streaming" : ""}
+                          </span>
+                        </span>
+                      </button>
+                    )
+                  })}
+                </div>
               </div>
             )}
 

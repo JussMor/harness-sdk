@@ -591,19 +591,27 @@ func (a *BackendChatApp) handleStream(w http.ResponseWriter, r *http.Request, ch
 	// else through the same gate via InterruptGateApprover.
 	gate := ab.NewInterruptGate(8)
 	agentRT.runtime = agentRT.runtime.WithInterrupts(gate)
+	// Always create a PermissionEngine so EnterPlanMode/ExitPlanMode can
+	// toggle the session mode. With HIL off we leave it in default+empty
+	// rules — every tool falls through (no ask), only plan mode constrains.
+	permEng := ab.NewPermissionEngine(ab.PermissionModeDefault)
 	if req.HumanInLoop {
-		eng := ab.NewPermissionEngine(ab.PermissionModeDefault)
-		eng.SetApprover(&ab.InterruptGateApprover{Gate: gate})
+		permEng.SetApprover(&ab.InterruptGateApprover{Gate: gate})
 		// Auto-allow safe / read-only tools. Anything not listed falls
 		// through to the engine's default `ask` step, which routes to
 		// the InterruptGate approver and surfaces an approval prompt.
 		for _, safe := range []string{
 			"file_read", "list_dir", "search", "grep",
 			"memory", "Skill", "Agent",
+			"EnterPlanMode", "ExitPlanMode",
 		} {
-			eng.AddAllowString(ab.RuleSourceSession, safe)
+			permEng.AddAllowString(ab.RuleSourceSession, safe)
 		}
-		agentRT.runtime = agentRT.runtime.WithPermissions(eng)
+	}
+	agentRT.runtime = agentRT.runtime.WithPermissions(permEng)
+	if agentRT.planCtl != nil {
+		agentRT.planCtl.SetPermissions(permEng)
+		agentRT.runtime = agentRT.runtime.WithPlanController(agentRT.planCtl)
 	}
 	ensureInterruptRegistry().Register(chatID, agentRT.runtime.InterruptGate())
 	defer ensureInterruptRegistry().Unregister(chatID)
@@ -804,6 +812,22 @@ func (a *BackendChatApp) handleStream(w http.ResponseWriter, r *http.Request, ch
 				sseWrite("agent_result", string(d))
 				log.Printf("stream.agent_result chat_id=%d run_id=%s type=%s turns=%d",
 					chatID, runID, ev.AgentResult.Type, ev.AgentResult.Turns)
+			}
+
+		case ab.StreamEventCompaction:
+			if ev.Compaction != nil {
+				d, _ := json.Marshal(ev.Compaction)
+				sseWrite("compaction", string(d))
+				log.Printf("stream.compaction chat_id=%d run_id=%s dropped=%d overflow=%d",
+					chatID, runID, ev.Compaction.MessagesDropped, ev.Compaction.OverflowTokens)
+			}
+
+		case ab.StreamEventPlanModeChanged:
+			if ev.PlanMode != nil {
+				d, _ := json.Marshal(ev.PlanMode)
+				sseWrite("plan_mode_changed", string(d))
+				log.Printf("stream.plan_mode chat_id=%d run_id=%s state=%s",
+					chatID, runID, ev.PlanMode.State)
 			}
 
 		case ab.StreamEventDone:

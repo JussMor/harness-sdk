@@ -361,6 +361,16 @@ function adaptSSEEvent(type: string, dataText: string): StreamEvent | null {
         type: "artifact_updated",
         data: parsed as import("./types").StreamComponentArtifact,
       }
+    case "compaction":
+      return {
+        type: "compaction",
+        data: parsed as import("./types").StreamCompaction,
+      }
+    case "plan_mode_changed":
+      return {
+        type: "plan_mode_changed",
+        data: parsed as import("./types").StreamPlanMode,
+      }
     case "done":
       return {
         type: "done",

@@ -25,6 +25,7 @@ type agentRuntime struct {
 	memory         ab.MemoryProvider
 	convStore      ab.ConversationStore
 	execCtx        *ab.InMemoryExecutionContext // task checklist (TodoWrite/TodoRead)
+	planCtl        *ab.PlanController           // plan-mode controller (EnterPlanMode/ExitPlanMode)
 }
 
 // ── Tool registries ──────────────────────────────────────────────────────────
@@ -32,6 +33,15 @@ type agentRuntime struct {
 func (r *agentRuntime) buildToolRegistry() *ab.ToolRegistry {
 	reg := ab.NewToolRegistry()
 	reg.Register(r.newTodoTool())
+	// Plan-mode pair (EnterPlanMode / ExitPlanMode). Controller is created
+	// lazily here; main.go binds the PermissionEngine to it after the
+	// runtime is constructed.
+	if r.planCtl == nil {
+		r.planCtl = ab.NewPlanController(nil)
+	}
+	enter, exit := ab.NewPlanTools(ab.PlanToolConfig{Controller: r.planCtl})
+	reg.Register(enter)
+	reg.Register(exit)
 	// Prefer sandbox file tools when available to avoid writing local host files.
 	if !isSandboxAvailable() || r.chatID <= 0 {
 		reg.Register(r.newDocumentTool())
@@ -92,105 +102,15 @@ func (r *agentRuntime) buildSubagentToolRegistry() *ab.ToolRegistry {
 // ── Tool definitions ─────────────────────────────────────────────────────────
 
 func (r *agentRuntime) newMemoryTool() *ab.Tool {
-	return &ab.Tool{
-		Name:        "memory-operations",
-		Description: "View and edit persistent memory in user or project scope.",
-		Category:    ab.ToolCategoryMemory,
-		// DynamicReminder lists the memory files the model can read from /
-		// write to. Without this the model has no way to know what's already
-		// saved and tends to either skip writes ("yo le mencione algo y nunca
-		// guardo en memoria") or duplicate facts.
-		DynamicReminder: func(ctx context.Context) (string, error) {
-			if r.memory == nil {
-				return "", nil
-			}
-			var b strings.Builder
-			b.WriteString("Persistent memory you can read or update via `memory-operations`:\n")
-			any := false
-			for _, sc := range []ab.Scope{ab.ScopeUser, ab.ScopeProject} {
-				items, err := r.memory.List(ctx, sc, "")
-				if err != nil || len(items) == 0 {
-					continue
-				}
-				any = true
-				fmt.Fprintf(&b, "- [%s] %s\n", sc, strings.Join(items, ", "))
-			}
-			if !any {
-				b.WriteString("- (no memory files yet — empty store)\n")
-			}
-			b.WriteString("\nWhen the user shares a persistent fact about themselves, their preferences, their project, or a key decision: save it with `memory-operations` (operation=\"create\" for new, \"str_replace\" to update). Read existing entries before duplicating.")
-			return b.String(), nil
-		},
-		Parameters: ab.ToolFuncParams{
-			Type: "object",
-			Properties: map[string]ab.ToolParam{
-				"operation": {
-					Type:        "string",
-					Description: "One of: view, create, str_replace, delete, rename, list, search.",
-					Enum:        []string{"view", "create", "str_replace", "delete", "rename", "list", "search"},
-				},
-				"scope":   {Type: "string", Description: "user or project", Enum: []string{"user", "project", "*"}},
-				"path":    {Type: "string", Description: "Memory path."},
-				"content": {Type: "string", Description: "File content for create."},
-				"oldStr":  {Type: "string", Description: "Old string for str_replace."},
-				"newStr":  {Type: "string", Description: "New string for str_replace."},
-				"oldPath": {Type: "string", Description: "Source path for rename."},
-				"newPath": {Type: "string", Description: "Destination path for rename."},
-				"query":   {Type: "string", Description: "Query text for search."},
-			},
-			Required: []string{"operation"},
-		},
-		Execute: func(ctx context.Context, _ string, args map[string]any) (string, error) {
-			if r.memory == nil {
-				return "memory provider not configured", nil
-			}
-			op := strings.ToLower(strings.TrimSpace(asString(args["operation"])))
-			scope := parseMemoryScope(asString(args["scope"]))
-
-			switch op {
-			case "view":
-				out, err := r.memory.View(ctx, scope, asString(args["path"]))
-				return out, err
-			case "create":
-				if err := r.memory.Create(ctx, ensureWritableScope(scope), asString(args["path"]), asString(args["content"])); err != nil {
-					return "", err
-				}
-				return "memory created", nil
-			case "str_replace":
-				if err := r.memory.StrReplace(ctx, ensureWritableScope(scope), asString(args["path"]), asString(args["oldStr"]), asString(args["newStr"])); err != nil {
-					return "", err
-				}
-				return "memory updated", nil
-			case "delete":
-				if err := r.memory.Delete(ctx, ensureWritableScope(scope), asString(args["path"])); err != nil {
-					return "", err
-				}
-				return "memory deleted", nil
-			case "rename":
-				if err := r.memory.Rename(ctx, ensureWritableScope(scope), asString(args["oldPath"]), asString(args["newPath"])); err != nil {
-					return "", err
-				}
-				return "memory renamed", nil
-			case "list":
-				items, err := r.memory.List(ctx, scope, asString(args["path"]))
-				if err != nil {
-					return "", err
-				}
-				return strings.Join(items, "\n"), nil
-			case "search":
-				entries, err := r.memory.Search(ctx, scope, asString(args["query"]))
-				if err != nil {
-					return "", err
-				}
-				lines := make([]string, 0, len(entries))
-				for _, e := range entries {
-					lines = append(lines, fmt.Sprintf("- [%s] %s", e.Scope, e.Path))
-				}
-				return strings.Join(lines, "\n"), nil
-			}
-			return "unsupported operation", nil
-		},
+	if r.memory == nil {
+		return nil
 	}
+	return ab.NewMemoryTool(ab.MemoryToolConfig{
+		Provider:     r.memory,
+		DefaultScope: ab.ScopeProject,
+		// Selector defaults to KeywordMemorySelector (no extra LLM call).
+		// Read-before-write, taxonomy, and anti-merge are all on by default.
+	})
 }
 
 func (r *agentRuntime) newSkillsTool() *ab.Tool {
@@ -257,30 +177,6 @@ func (r *agentRuntime) newTodoTool() *ab.Tool {
 		Name:        "todo_write",
 		Description: "Manage the task checklist for the current session. Use this to track multi-step work so you always know what's done and what's next. Update the list as you go — mark items in_progress when you start them, completed when done.",
 		Category:    ab.ToolCategoryPlanning,
-		// DynamicReminder injects the current task list as a per-turn
-		// <system-reminder>, mirroring Claude Code's TodoWrite reminder.
-		// This keeps the model honest about what's done vs. pending without
-		// requiring an explicit `read` call before every reasoning turn.
-		DynamicReminder: func(_ context.Context) (string, error) {
-			todos := r.execCtx.Todos()
-			if len(todos) == 0 {
-				return "Current task checklist is empty. Use `todo_write` (operation=\"write\") to create one when starting any task that needs more than two distinct steps.", nil
-			}
-			var b strings.Builder
-			b.WriteString("Current task checklist (from `todo_write`):\n")
-			for _, t := range todos {
-				marker := "[ ]"
-				switch t.Status {
-				case ab.TodoStatusInProgress:
-					marker = "[~]"
-				case ab.TodoStatusCompleted:
-					marker = "[x]"
-				}
-				fmt.Fprintf(&b, "- %s %s — %s\n", marker, t.ID, t.Content)
-			}
-			b.WriteString("\nKeep this list current: mark items in_progress before working on them, completed once done.")
-			return b.String(), nil
-		},
 		Parameters: ab.ToolFuncParams{
 			Type: "object",
 			Properties: map[string]ab.ToolParam{
@@ -514,24 +410,6 @@ func (r *agentRuntime) newDocumentTool() *ab.Tool {
 }
 
 // ── helpers ──────────────────────────────────────────────────────────────────
-
-func parseMemoryScope(value string) ab.Scope {
-	switch strings.ToLower(strings.TrimSpace(value)) {
-	case "user":
-		return ab.ScopeUser
-	case "*", "all":
-		return ab.Scope("*")
-	default:
-		return ab.ScopeProject
-	}
-}
-
-func ensureWritableScope(scope ab.Scope) ab.Scope {
-	if scope == ab.Scope("*") {
-		return ab.ScopeProject
-	}
-	return scope
-}
 
 func asString(value any) string {
 	if value == nil {
