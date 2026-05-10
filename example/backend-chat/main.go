@@ -79,6 +79,7 @@ func main() {
 	mux.HandleFunc("/api/webhooks", app.handleWebhooks)
 	mux.HandleFunc("/api/webhooks/", app.handleWebhookByID)
 	mux.HandleFunc("/api/interrupts/", app.handleInterruptResolve)
+	mux.HandleFunc("/api/confirm", app.handleInterruptResolve)
 	mux.HandleFunc("/admin/eval", app.handleEval)
 	mux.HandleFunc("/api/threads", app.handleThreads)
 	mux.HandleFunc("/api/threads/", app.handleThreadRoutes)
@@ -130,6 +131,7 @@ type MessageMetadata struct {
 }
 
 type MetadataToolCall struct {
+	ID     string `json:"id,omitempty"`
 	Name   string `json:"name"`
 	Args   any    `json:"args,omitempty"`
 	Result string `json:"result,omitempty"`
@@ -137,9 +139,11 @@ type MetadataToolCall struct {
 }
 
 type MetadataArtifact struct {
+	ID       string `json:"id,omitempty"`
 	Path     string `json:"path"`
 	Language string `json:"language"`
 	Content  string `json:"content"`
+	Title    string `json:"title,omitempty"`
 }
 
 func (a *BackendChatApp) handleHealth(w http.ResponseWriter, _ *http.Request) {
@@ -387,8 +391,92 @@ func (a *BackendChatApp) handleMessages(w http.ResponseWriter, r *http.Request, 
 
 
 
+// handleInterruptResolve handles POST /api/interrupts/{chatID}[/resolve]
+// and POST /api/confirm — both resolve a pending interrupt for a streaming session.
+func (a *BackendChatApp) handleInterruptResolve(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+
+	var req struct {
+		ChatID       int64           `json:"chat_id"`
+		ID           string          `json:"id"`
+		Approved     bool            `json:"approved"`
+		Answer       json.RawMessage `json:"answer,omitempty"`
+		ModifiedArgs string          `json:"modified_args"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeErr(w, http.StatusBadRequest, err)
+		return
+	}
+
+	// Derive chatID from URL path if not supplied in body.
+	// Path shape: /api/interrupts/{token}[/resolve]
+	pathTail := strings.TrimPrefix(r.URL.Path, "/api/interrupts/")
+	pathTail = strings.TrimSuffix(strings.Trim(pathTail, "/"), "/resolve")
+	if req.ChatID == 0 {
+		if id, err := strconv.ParseInt(pathTail, 10, 64); err == nil {
+			req.ChatID = id
+		}
+	}
+	// Backfill the interrupt ID from the URL when the frontend only sent
+	// it in the path (current chat-app behaviour). Without this the gate
+	// receives an empty ID, never matches, and always returns 409.
+	if req.ID == "" && pathTail != "" && !isAllDigits(pathTail) {
+		req.ID = pathTail
+	}
+
+	if req.ChatID == 0 {
+		writeErr(w, http.StatusBadRequest, fmt.Errorf("chat_id is required"))
+		return
+	}
+
+	gate, ok := ensureInterruptRegistry().Get(req.ChatID)
+	if !ok {
+		writeErr(w, http.StatusNotFound, fmt.Errorf("no active interrupt for chat %d", req.ChatID))
+		return
+	}
+
+	resp := ab.InterruptResponse{
+		ID:       req.ID,
+		Approved: req.Approved,
+		Answer:   req.Answer,
+	}
+
+	// Path tokens minted via IssueResolutionToken contain a `.` separating
+	// body and HMAC signature. Use ResolveByToken to verify+decode in one go.
+	if strings.Contains(pathTail, ".") {
+		if err := gate.ResolveByToken(pathTail, resp); err != nil {
+			writeErr(w, http.StatusConflict, err)
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+		return
+	}
+
+	if !gate.Respond(resp) {
+		writeErr(w, http.StatusConflict, fmt.Errorf("interrupt already resolved or expired"))
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+}
+
 func newRunID() string {
 	return fmt.Sprintf("run_%d", time.Now().UnixNano())
+}
+
+// isAllDigits reports whether s consists solely of ASCII digits (and is non-empty).
+func isAllDigits(s string) bool {
+	if s == "" {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		if s[i] < '0' || s[i] > '9' {
+			return false
+		}
+	}
+	return true
 }
 
 // handleStream is the real-time streaming endpoint for LLM generation.
@@ -498,15 +586,33 @@ func (a *BackendChatApp) handleStream(w http.ResponseWriter, r *http.Request, ch
 	}
 
 	// Interrupts: always wire an InterruptGate so tools like await_component_input
-	// can pause and ask for user input. When HIL is enabled, also prepend a
-	// HumanApprovalFilter that requires approval for dangerous tool calls.
+	// can pause and ask for user input. When HIL is enabled, attach a
+	// PermissionEngine that auto-allows known-safe tools and routes everything
+	// else through the same gate via InterruptGateApprover.
 	gate := ab.NewInterruptGate(8)
 	agentRT.runtime = agentRT.runtime.WithInterrupts(gate)
+	// Always create a PermissionEngine so EnterPlanMode/ExitPlanMode can
+	// toggle the session mode. With HIL off we leave it in default+empty
+	// rules — every tool falls through (no ask), only plan mode constrains.
+	permEng := ab.NewPermissionEngine(ab.PermissionModeDefault)
 	if req.HumanInLoop {
-		_, agentRT.runtime = agentRT.runtime.WithHumanApproval(ab.DefaultApprovalPolicy)
+		permEng.SetApprover(&ab.InterruptGateApprover{Gate: gate})
+		// Auto-allow safe / read-only tools. Anything not listed falls
+		// through to the engine's default `ask` step, which routes to
+		// the InterruptGate approver and surfaces an approval prompt.
+		for _, safe := range []string{
+			"file_read", "list_dir", "search", "grep",
+			"memory", "Skill", "Agent",
+			"EnterPlanMode", "ExitPlanMode",
+		} {
+			permEng.AddAllowString(ab.RuleSourceSession, safe)
+		}
 	}
-	// Register the runtime's actual gate — WithHumanApproval may have replaced
-	// the original gate with its own internal one.
+	agentRT.runtime = agentRT.runtime.WithPermissions(permEng)
+	if agentRT.planCtl != nil {
+		agentRT.planCtl.SetPermissions(permEng)
+		agentRT.runtime = agentRT.runtime.WithPlanController(agentRT.planCtl)
+	}
 	ensureInterruptRegistry().Register(chatID, agentRT.runtime.InterruptGate())
 	defer ensureInterruptRegistry().Unregister(chatID)
 
@@ -526,7 +632,8 @@ func (a *BackendChatApp) handleStream(w http.ResponseWriter, r *http.Request, ch
 
 	var fullResponse strings.Builder
 	var streamMeta MessageMetadata
-	var lastToolCall string // track last tool_call name for pairing with result
+	// callIndex maps ToolCallEntry.ID → index in streamMeta.ToolCalls for O(1) pairing.
+	callIndex := make(map[string]int)
 	// Pending file_write artifacts queued at tool_call time. Only committed to
 	// streamMeta.Artifacts when the matching tool_result reports success — this
 	// prevents rejected/blocked file writes from leaking into the canvas.
@@ -579,12 +686,11 @@ func (a *BackendChatApp) handleStream(w http.ResponseWriter, r *http.Request, ch
 					parsedArgs = ev.ToolCall.Arguments // fallback to raw string
 				}
 				d, _ := json.Marshal(map[string]any{
+					"id":   ev.ToolCall.ID,
 					"name": ev.ToolCall.Name,
 					"args": parsedArgs,
 				})
 				sseWrite("tool_call", string(d))
-
-				lastToolCall = ev.ToolCall.Name
 
 				// Queue file_write as a pending artifact. We only commit it to
 				// streamMeta.Artifacts (which is what gets persisted + emitted as
@@ -604,8 +710,10 @@ func (a *BackendChatApp) handleStream(w http.ResponseWriter, r *http.Request, ch
 					}
 				}
 
-				// Track tool call in metadata
+				// Track tool call — record index for ID-based result pairing.
+				callIndex[ev.ToolCall.ID] = len(streamMeta.ToolCalls)
 				streamMeta.ToolCalls = append(streamMeta.ToolCalls, MetadataToolCall{
+					ID:   ev.ToolCall.ID,
 					Name: ev.ToolCall.Name,
 					Args: parsedArgs,
 				})
@@ -632,15 +740,11 @@ func (a *BackendChatApp) handleStream(w http.ResponseWriter, r *http.Request, ch
 					}
 				}
 
-				// Pair result with last matching tool call in metadata
-				for i := len(streamMeta.ToolCalls) - 1; i >= 0; i-- {
-					if streamMeta.ToolCalls[i].Name == ev.ToolResult.Name && streamMeta.ToolCalls[i].Result == "" {
-						streamMeta.ToolCalls[i].Result = ev.ToolResult.Content
-						streamMeta.ToolCalls[i].Error = ev.ToolResult.Error != nil
-						break
-					}
+				// Pair result with its originating tool call by ID (O(1), handles duplicates).
+				if i, ok := callIndex[ev.ToolResult.ToolCallID]; ok {
+					streamMeta.ToolCalls[i].Result = ev.ToolResult.Content
+					streamMeta.ToolCalls[i].Error = ev.ToolResult.Error != nil
 				}
-				_ = lastToolCall // used above
 
 				// For sandbox tools, emit structured sandbox_output event
 				if isSandboxOutput(ev.ToolResult.Name, agentRT.tools) {
@@ -682,59 +786,52 @@ func (a *BackendChatApp) handleStream(w http.ResponseWriter, r *http.Request, ch
 				sseWrite(eventName, string(d))
 			}
 
-		case ab.StreamEventPlanProposed:
-			if ev.Plan != nil {
-				executables := make([]map[string]any, 0, len(ev.Plan.Executables))
-				for _, exec := range ev.Plan.Executables {
-					executables = append(executables, map[string]any{
-						"id":           exec.ID,
-						"name":         exec.Name,
-						"description":  exec.Description,
-						"dependencies": exec.Dependencies,
-						"status":       string(exec.Status),
-					})
-				}
-				d, _ := json.Marshal(map[string]any{
-					"id":          ev.Plan.ID,
-					"title":       ev.Plan.Title,
-					"objective":   ev.Plan.Objective,
-					"executables": executables,
-				})
-				sseWrite("plan_proposed", string(d))
-				log.Printf("stream.plan_proposed chat_id=%d run_id=%s executables=%d",
-					chatID, runID, len(ev.Plan.Executables))
-			}
-
-		case ab.StreamEventSubagentResult:
-			if ev.SubagentResult != nil {
+		case ab.StreamEventAgentResult:
+			if ev.AgentResult != nil {
 				errMsg := ""
-				if ev.SubagentResult.Error != nil {
-					errMsg = ev.SubagentResult.Error.Error()
+				if ev.AgentResult.Error != nil {
+					errMsg = ev.AgentResult.Error.Error()
 				}
 				payload := map[string]any{
-					"id":            ev.SubagentResult.ID,
-					"task":          ev.SubagentResult.Task,
-					"output":        ev.SubagentResult.Output,
-					"turns":         ev.SubagentResult.Turns,
-					"stop_reason":   ev.SubagentResult.StopReason,
-					"duration_ms":   ev.SubagentResult.Duration.Milliseconds(),
+					"type":          ev.AgentResult.Type,
+					"description":   ev.AgentResult.Description,
+					"task":          ev.AgentResult.Task,
+					"output":        ev.AgentResult.Output,
+					"turns":         ev.AgentResult.Turns,
+					"stop_reason":   ev.AgentResult.StopReason,
+					"duration_ms":   ev.AgentResult.Duration.Milliseconds(),
 					"error":         errMsg,
 				}
-				// Include model and system_prompt when set — frontend uses them for display
-				if ev.SubagentResult.Model != "" {
-					payload["model"] = ev.SubagentResult.Model
+				if ev.AgentResult.Model != "" {
+					payload["model"] = ev.AgentResult.Model
 				}
-				if ev.SubagentResult.SystemPrompt != "" {
-					payload["system_prompt"] = ev.SubagentResult.SystemPrompt
+				if ev.AgentResult.SystemPrompt != "" {
+					payload["system_prompt"] = ev.AgentResult.SystemPrompt
 				}
 				d, _ := json.Marshal(payload)
-				sseWrite("subagent_result", string(d))
-				log.Printf("stream.subagent_result chat_id=%d run_id=%s agent_id=%s turns=%d",
-					chatID, runID, ev.SubagentResult.ID, ev.SubagentResult.Turns)
+				sseWrite("agent_result", string(d))
+				log.Printf("stream.agent_result chat_id=%d run_id=%s type=%s turns=%d",
+					chatID, runID, ev.AgentResult.Type, ev.AgentResult.Turns)
+			}
+
+		case ab.StreamEventCompaction:
+			if ev.Compaction != nil {
+				d, _ := json.Marshal(ev.Compaction)
+				sseWrite("compaction", string(d))
+				log.Printf("stream.compaction chat_id=%d run_id=%s dropped=%d overflow=%d",
+					chatID, runID, ev.Compaction.MessagesDropped, ev.Compaction.OverflowTokens)
+			}
+
+		case ab.StreamEventPlanModeChanged:
+			if ev.PlanMode != nil {
+				d, _ := json.Marshal(ev.PlanMode)
+				sseWrite("plan_mode_changed", string(d))
+				log.Printf("stream.plan_mode chat_id=%d run_id=%s state=%s",
+					chatID, runID, ev.PlanMode.State)
 			}
 
 		case ab.StreamEventDone:
-			// Persist assistant message with metadata
+			// Persist assistant message with metadata (artifacts without IDs yet).
 			var metaOpt []MessageMetadata
 			if len(streamMeta.ToolCalls) > 0 || len(streamMeta.Artifacts) > 0 {
 				metaOpt = []MessageMetadata{streamMeta}
@@ -742,14 +839,19 @@ func (a *BackendChatApp) handleStream(w http.ResponseWriter, r *http.Request, ch
 			assistantMsg, _ := InsertMessage(ctx, a.db, chatID, "assistant", fullResponse.String(), effectiveModel, metaOpt...)
 			_ = a.pub.PublishChatMessage(ctx, chatID, assistantMsg)
 
-			// Auto-persist artifacts detected from stream (file_write tool calls)
-			// and emit as unified SDK Artifact shape via "artifact_created".
-			for _, metaArt := range streamMeta.Artifacts {
+			// Auto-persist artifacts detected from stream (file_write tool calls),
+			// emit as unified SDK Artifact shape via "artifact_created", and patch
+			// the artifact ID back into streamMeta so the message metadata is complete.
+			metaUpdated := false
+			for i, metaArt := range streamMeta.Artifacts {
 				art, ver, err := CreateArtifact(ctx, a.db, a.r2,
 					chatID, &assistantMsg.ID,
 					metaArt.Language, metaArt.Path, metaArt.Content,
 				)
 				if err == nil {
+					streamMeta.Artifacts[i].ID = art.ID
+					streamMeta.Artifacts[i].Title = art.Title
+					metaUpdated = true
 					unified := ab.Artifact{
 						ID:        art.ID,
 						Kind:      ab.ArtifactKindFile,
@@ -768,6 +870,11 @@ func (a *BackendChatApp) handleStream(w http.ResponseWriter, r *http.Request, ch
 					sseWrite("artifact_created", string(d))
 				}
 			}
+			// Patch message metadata with the real artifact UUIDs so they survive
+			// page reloads — the initial InsertMessage call didn't have them yet.
+			if metaUpdated {
+				_ = UpdateMessageMetadata(ctx, a.db, assistantMsg.ID, streamMeta)
+			}
 
 			d, _ := json.Marshal(map[string]any{"runId": runID, "messageId": assistantMsg.ID})
 			sseWrite("done", string(d))
@@ -779,12 +886,59 @@ func (a *BackendChatApp) handleStream(w http.ResponseWriter, r *http.Request, ch
 			if ev.Error != nil {
 				msg = ev.Error.Error()
 			}
-			d, _ := json.Marshal(map[string]string{"error": msg})
+			category, friendly := classifyStreamError(msg)
+			d, _ := json.Marshal(map[string]string{
+				"error":    friendly,
+				"category": category,
+				"detail":   msg,
+			})
 			sseWrite("error", string(d))
-			log.Printf("stream.error chat_id=%d run_id=%s error=%s", chatID, runID, msg)
+			log.Printf("stream.error chat_id=%d run_id=%s category=%s error=%s", chatID, runID, category, msg)
+			// Persist a placeholder assistant message so the chat history
+			// reflects the failure instead of an empty bubble, then signal
+			// done so the frontend stops waiting.
+			placeholder := "_⚠️ " + friendly + "_"
+			assistantMsg, _ := InsertMessage(ctx, a.db, chatID, "assistant", placeholder, effectiveModel)
+			_ = a.pub.PublishChatMessage(ctx, chatID, assistantMsg)
+			doneData, _ := json.Marshal(map[string]any{"runId": runID, "messageId": assistantMsg.ID, "error": friendly})
+			sseWrite("done", string(doneData))
 		}
 		}
 	}
+}
+
+// classifyStreamError converts a raw provider/sdk error string into a stable
+// category and a user-facing message. Categories are kept short so the
+// frontend can render badges; the original error is preserved separately
+// under "detail" for debugging.
+func classifyStreamError(raw string) (category, friendly string) {
+	low := strings.ToLower(raw)
+	switch {
+	case strings.Contains(low, "credit balance is too low"),
+		strings.Contains(low, "insufficient_quota"),
+		strings.Contains(low, "billing"):
+		return "billing", "El proveedor de IA reportó saldo insuficiente. Revisa tu plan o crea créditos antes de reintentar."
+	case strings.Contains(low, "rate limit"),
+		strings.Contains(low, "429"):
+		return "rate_limit", "El proveedor está limitando las peticiones. Espera unos segundos y vuelve a intentar."
+	case strings.Contains(low, "401"),
+		strings.Contains(low, "unauthorized"),
+		strings.Contains(low, "invalid api key"),
+		strings.Contains(low, "authentication"):
+		return "auth", "La API key configurada fue rechazada por el proveedor. Verifica las variables de entorno."
+	case strings.Contains(low, "context_length_exceeded"),
+		strings.Contains(low, "context length"),
+		strings.Contains(low, "maximum context"):
+		return "context_length", "El historial superó el contexto máximo del modelo. Inicia una conversación nueva o cambia a un modelo más grande."
+	case strings.Contains(low, "timeout"),
+		strings.Contains(low, "context deadline exceeded"):
+		return "timeout", "El proveedor tardó demasiado en responder. Reintenta."
+	case strings.Contains(low, "network"),
+		strings.Contains(low, "connection"),
+		strings.Contains(low, "eof"):
+		return "network", "Hubo un problema de red al hablar con el proveedor. Reintenta."
+	}
+	return "unknown", "Ocurrió un error procesando la respuesta. Reintenta o revisa los logs del backend."
 }
 
 func withCORS(next http.Handler) http.Handler {

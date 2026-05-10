@@ -305,106 +305,23 @@ func tokenize(text string) []string {
 	return terms
 }
 
-var _ autobuild.MemoryProvider = (*FilesystemMemory)(nil)
-
-// ── LayeredFilesystemMemory ───────────────────────────────────────────────────
-
-// LayeredFilesystemMemory extends FilesystemMemory with layer-aware operations.
-// Layer metadata is stored as a YAML-like frontmatter header in each file:
-//
-//	---
-//	layer: explicit
-//	confidence: 0.9
-//	source: user
-//	---
-//	Actual content here
-type LayeredFilesystemMemory struct {
-	*FilesystemMemory
-}
-
-// NewLayeredFilesystem creates a LayeredFilesystemMemory.
-func NewLayeredFilesystem(root string) (*LayeredFilesystemMemory, error) {
-	fs, err := NewFilesystem(root)
+// Stat returns mtime/size metadata for a memory entry. Implements the
+// optional autobuild.MemoryStater interface used by memdir.
+func (m *FilesystemMemory) Stat(_ context.Context, scope autobuild.Scope, path string) (autobuild.MemoryStat, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	full := m.scopePath(scope, path)
+	info, err := os.Stat(full)
 	if err != nil {
-		return nil, err
+		return autobuild.MemoryStat{}, err
 	}
-	return &LayeredFilesystemMemory{FilesystemMemory: fs}, nil
-}
-
-func (m *LayeredFilesystemMemory) WriteLayered(ctx context.Context, scope autobuild.Scope, path string, content string, layer autobuild.MemoryLayer) error {
-	full := "---\nlayer: " + string(layer) + "\n---\n" + content
-	if err := m.Create(ctx, scope, path, full); err != nil {
-		// If exists, update
-		existing, readErr := m.View(ctx, scope, path)
-		if readErr != nil {
-			return err
-		}
-		return m.StrReplace(ctx, scope, path, existing, full)
-	}
-	return nil
-}
-
-func (m *LayeredFilesystemMemory) ReadLayered(ctx context.Context, scope autobuild.Scope, path string) (*autobuild.LayeredMemoryEntry, error) {
-	content, err := m.View(ctx, scope, path)
-	if err != nil {
-		return nil, err
-	}
-	layer, clean := parseFrontmatter(content)
-	return &autobuild.LayeredMemoryEntry{
-		MemoryEntry: autobuild.MemoryEntry{
-			Path:    path,
-			Scope:   scope,
-			Content: clean,
-			Layer:   layer,
-		},
-		Layer:    layer,
-		Priority: 0,
+	return autobuild.MemoryStat{
+		MtimeMs: info.ModTime().UnixMilli(),
+		Size:    info.Size(),
+		IsDir:   info.IsDir(),
 	}, nil
 }
 
-func (m *LayeredFilesystemMemory) SearchLayered(ctx context.Context, scope autobuild.Scope, query string) ([]autobuild.LayeredMemoryEntry, error) {
-	entries, err := m.Search(ctx, scope, query)
-	if err != nil {
-		return nil, err
-	}
-	var layered []autobuild.LayeredMemoryEntry
-	for _, e := range entries {
-		layer, clean := parseFrontmatter(e.Content)
-		e.Content = clean
-		e.Layer = layer
-		layered = append(layered, autobuild.LayeredMemoryEntry{
-			MemoryEntry: e,
-			Layer:       layer,
-		})
-	}
-	autobuild.SortByPriority(layered)
-	return layered, nil
-}
+var _ autobuild.MemoryProvider = (*FilesystemMemory)(nil)
+var _ autobuild.MemoryStater = (*FilesystemMemory)(nil)
 
-func (m *LayeredFilesystemMemory) ClearSession(_ context.Context) error {
-	// Session entries are not persisted to disk in FilesystemMemory —
-	// they live in ObservationStore only. Nothing to clear here.
-	return nil
-}
-
-// parseFrontmatter extracts layer from YAML frontmatter if present.
-func parseFrontmatter(content string) (autobuild.MemoryLayer, string) {
-	if !strings.HasPrefix(content, "---\n") {
-		return autobuild.MemoryLayerInferred, content
-	}
-	end := strings.Index(content[4:], "\n---\n")
-	if end < 0 {
-		return autobuild.MemoryLayerInferred, content
-	}
-	header := content[4 : end+4]
-	body := content[end+9:]
-	var layer autobuild.MemoryLayer = autobuild.MemoryLayerInferred
-	for _, line := range strings.Split(header, "\n") {
-		if strings.HasPrefix(line, "layer: ") {
-			layer = autobuild.MemoryLayer(strings.TrimPrefix(line, "layer: "))
-		}
-	}
-	return layer, strings.TrimSpace(body)
-}
-
-var _ autobuild.LayeredMemoryProvider = (*LayeredFilesystemMemory)(nil)

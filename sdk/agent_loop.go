@@ -48,8 +48,10 @@ type AgentLoopConfig struct {
 	// SandboxID is the specific sandbox environment for tool execution.
 	SandboxID string
 
-	// Events is an optional EventBus to emit "agent.turn" events.
-	Events EventBus
+	// Permissions optionally installs the v3 PermissionEngine on the
+	// dispatcher created for this loop. nil = use legacy per-tool
+	// CheckPermissions only.
+	Permissions *PermissionEngine
 
 	// ── Limits ────────────────────────────────────────────────────
 
@@ -151,26 +153,17 @@ func RunAgentLoop(ctx context.Context, cfg AgentLoopConfig, messages []ChatMessa
 	var dispatcher *ToolDispatcher
 	if cfg.Tools != nil {
 		dispatcher = NewToolDispatcher(cfg.Tools, cfg.Sandbox)
+		if cfg.Permissions != nil {
+			dispatcher.WithPermissions(cfg.Permissions)
+		}
 	}
 
 	// ─── The loop ─────────────────────────────────────────────────
 	result := &AgentLoopResult{
-		Messages: req.Messages,
+		Messages:       req.Messages,
 		ReasoningTrace: make([]ReasoningStep, 0, 8),
 	}
 	traceSeq := 0
-	if cfg.Events != nil {
-		cfg.Events.Publish(Event{
-			Type:      EventAgentLoopStarted,
-			Source:    "agent_loop",
-			Timestamp: time.Now(),
-			Payload: map[string]any{
-				"model":            cfg.Model,
-				"max_turns":        maxTurns,
-				"initial_messages": len(req.Messages),
-			},
-		})
-	}
 	appendTrace := func(stepType, title, content string, details []string) {
 		traceSeq++
 		step := ReasoningStep{
@@ -181,33 +174,12 @@ func RunAgentLoop(ctx context.Context, cfg AgentLoopConfig, messages []ChatMessa
 			Details: details,
 		}
 		result.ReasoningTrace = append(result.ReasoningTrace, step)
-		if cfg.Events != nil {
-			cfg.Events.Publish(Event{
-				Type:      EventAgentTraceStep,
-				Source:    "agent_loop",
-				Timestamp: time.Now(),
-				Payload: map[string]any{
-					"step": step,
-				},
-			})
-		}
 	}
 
 	for turn := 1; turn <= maxTurns; turn++ {
 		// Call LLM
 		resp, err := callWithRetry(ctx, cfg.Provider, req, maxRetries, cfg.OnError)
 		if err != nil {
-			if cfg.Events != nil {
-				cfg.Events.Publish(Event{
-					Type:      EventAgentLoopFailed,
-					Source:    "agent_loop",
-					Timestamp: time.Now(),
-					Payload: map[string]any{
-						"turn":  turn,
-						"error": err.Error(),
-					},
-				})
-			}
 			result.StopReason = "error"
 			return result, fmt.Errorf("turn %d: %w", turn, err)
 		}
@@ -230,38 +202,10 @@ func RunAgentLoop(ctx context.Context, cfg AgentLoopConfig, messages []ChatMessa
 			fmt.Sprintf("Tokens this turn: %d", resp.Usage.TotalTokens),
 		})
 
-		// Emit event (if EventBus provided)
-		if cfg.Events != nil {
-			cfg.Events.Publish(Event{
-				Type:      EventAgentTurnCompleted,
-				Source:    "agent_loop",
-				Timestamp: time.Now(),
-				Payload: map[string]any{
-					"turn":          turn,
-					"finish_reason": resp.FinishReason,
-					"tool_calls":    len(resp.ToolCalls),
-					"tokens":        resp.Usage.TotalTokens,
-					"model":         resp.Model,
-				},
-			})
-			cfg.Events.Publish(Event{
-				Type:      EventType("agent.turn"),
-				Source:    "agent_loop",
-				Timestamp: time.Now(),
-				Payload: map[string]any{
-					"turn":          turn,
-					"finish_reason": resp.FinishReason,
-					"tool_calls":    len(resp.ToolCalls),
-					"tokens":        resp.Usage.TotalTokens,
-				},
-			})
-		}
-
 		// OnTurn callback
 		if cfg.OnTurn != nil && !cfg.OnTurn(turn, resp) {
 			result.FinalContent = resp.Content
 			result.StopReason = "aborted"
-			publishAgentLoopCompleted(cfg.Events, result)
 			return result, nil
 		}
 
@@ -272,7 +216,6 @@ func RunAgentLoop(ctx context.Context, cfg AgentLoopConfig, messages []ChatMessa
 			result.Messages = append(result.Messages, ChatMessage{
 				Role: RoleAssistant, Content: resp.Content,
 			})
-			publishAgentLoopCompleted(cfg.Events, result)
 			return result, nil
 		}
 
@@ -283,7 +226,6 @@ func RunAgentLoop(ctx context.Context, cfg AgentLoopConfig, messages []ChatMessa
 			result.Messages = append(result.Messages, ChatMessage{
 				Role: RoleAssistant, Content: resp.Content,
 			})
-			publishAgentLoopCompleted(cfg.Events, result)
 			return result, nil
 		}
 
@@ -291,17 +233,6 @@ func RunAgentLoop(ctx context.Context, cfg AgentLoopConfig, messages []ChatMessa
 		if dispatcher == nil {
 			result.FinalContent = resp.Content
 			result.StopReason = "error"
-			if cfg.Events != nil {
-				cfg.Events.Publish(Event{
-					Type:      EventAgentLoopFailed,
-					Source:    "agent_loop",
-					Timestamp: time.Now(),
-					Payload: map[string]any{
-						"turn":  turn,
-						"error": "LLM requested tool calls but no ToolRegistry is configured",
-					},
-				})
-			}
 			return result, fmt.Errorf("LLM requested tool calls but no ToolRegistry is configured")
 		}
 
@@ -340,30 +271,7 @@ func RunAgentLoop(ctx context.Context, cfg AgentLoopConfig, messages []ChatMessa
 	}
 
 	result.StopReason = "max_turns"
-	publishAgentLoopCompleted(cfg.Events, result)
 	return result, nil
-}
-
-func publishAgentLoopCompleted(events EventBus, result *AgentLoopResult) {
-	if events == nil || result == nil {
-		return
-	}
-
-	events.Publish(Event{
-		Type:      EventAgentLoopCompleted,
-		Source:    "agent_loop",
-		Timestamp: time.Now(),
-		Payload: map[string]any{
-			"stop_reason":      result.StopReason,
-			"total_turns":      result.TotalTurns,
-			"final_content":    result.FinalContent,
-				"provider_reasoning": result.ProviderReasoning,
-			"trace_steps":      len(result.ReasoningTrace),
-			"prompt_tokens":    result.TotalUsage.PromptTokens,
-			"completion_tokens": result.TotalUsage.CompletionTokens,
-			"total_tokens":     result.TotalUsage.TotalTokens,
-		},
-	})
 }
 
 func previewReasoningJSON(value string, limit int) string {
@@ -392,11 +300,9 @@ func previewReasoningText(value string, limit int) string {
 }
 
 // ─── Convenience: RunAgentLoopWithEngine ──────────────────────────────
-// For users who already have an Engine, this resolves Provider, Tools,
-// Sandbox, Events, and Mode automatically. It's a thin wrapper.
 
 // RunAgentLoopWithEngine is a convenience that extracts Provider, Tools,
-// Sandbox, and Events from an Engine and resolves the mode. Use this when
+// and Sandbox from an Engine and resolves the mode. Use this when
 // you have a full Engine. Use RunAgentLoop directly for maximum control.
 func RunAgentLoopWithEngine(ctx context.Context, engine *Engine, modeID string, cfg AgentLoopConfig, messages []ChatMessage) (*AgentLoopResult, error) {
 	// Track whether the caller already supplied a fully-assembled SystemPrompt.
@@ -458,9 +364,6 @@ func RunAgentLoopWithEngine(ctx context.Context, engine *Engine, modeID string, 
 	}
 	if cfg.Sandbox == nil && engine.HasSandbox() {
 		cfg.Sandbox = engine.Sandbox
-	}
-	if cfg.Events == nil && engine.HasEvents() {
-		cfg.Events = engine.Events
 	}
 
 	return RunAgentLoop(ctx, cfg, messages)

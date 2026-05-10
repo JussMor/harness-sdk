@@ -2,36 +2,34 @@ package autobuild
 
 import (
 	"context"
-	"crypto/hmac"
-	"crypto/sha256"
-	"encoding/hex"
 	"encoding/json"
 	"testing"
 	"time"
 )
 
-// TestInterruptGate_ApprovalRoundTrip exercises the legacy ApprovalGate facade
-// over the new InterruptGate.
+// TestInterruptGate_ApprovalRoundTrip exercises an Approval interrupt
+// directly on InterruptGate.
 func TestInterruptGate_ApprovalRoundTrip(t *testing.T) {
-	gate := NewApprovalGate(4)
+	gate := NewInterruptGate(4)
 
 	go func() {
 		req := <-gate.Requests()
-		if req.ID == "" || req.ToolCall.Name != "bash" {
+		if req.ID == "" || req.Kind != InterruptKindApproval || req.Approval == nil || req.Approval.ToolCall.Name != "bash" {
 			t.Errorf("unexpected request: %#v", req)
 		}
-		if !gate.Respond(ApprovalResponse{ID: req.ID, Approved: true}) {
+		if !gate.Respond(InterruptResponse{ID: req.ID, Approved: true}) {
 			t.Errorf("respond returned false")
 		}
 	}()
 
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
-	resp, err := gate.Wait(ctx, ApprovalRequest{
+	resp, err := gate.Wait(ctx, InterruptRequest{
 		ID:        "apr_test",
-		ToolCall:  ToolCallEntry{Name: "bash", Arguments: `{"cmd":"ls"}`},
+		Kind:      InterruptKindApproval,
 		Reason:    "test",
 		CreatedAt: time.Now(),
+		Approval:  &ApprovalPayload{ToolCall: ToolCallEntry{Name: "bash", Arguments: `{"cmd":"ls"}`}},
 	})
 	if err != nil {
 		t.Fatalf("wait error: %v", err)
@@ -138,26 +136,6 @@ func TestInterruptGate_ResolutionToken(t *testing.T) {
 	expired, _ := gate.IssueResolutionToken("int_token", -time.Second)
 	if err := gate.ResolveByToken(expired, InterruptResponse{Approved: true}); err == nil {
 		t.Fatalf("expected expired error")
-	}
-}
-
-// TestVerifyWebhookSignature_RoundTrip checks HMAC signing matches verification.
-func TestVerifyWebhookSignature_RoundTrip(t *testing.T) {
-	secret := []byte("super-secret")
-	body := []byte(`{"hello":"world"}`)
-
-	mac := hmac.New(sha256.New, secret)
-	mac.Write(body)
-	header := "sha256=" + hex.EncodeToString(mac.Sum(nil))
-
-	if err := VerifyWebhookSignature(secret, body, header); err != nil {
-		t.Fatalf("verify: %v", err)
-	}
-	if err := VerifyWebhookSignature(secret, []byte(`{"hello":"mars"}`), header); err == nil {
-		t.Fatalf("expected mismatch")
-	}
-	if err := VerifyWebhookSignature(secret, body, "md5=deadbeef"); err == nil {
-		t.Fatalf("expected unsupported scheme error")
 	}
 }
 

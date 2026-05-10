@@ -22,7 +22,6 @@ const (
 //	id: code-agent
 //	name: Code Agent
 //	base_mode: balanced
-//	prompt_strategy: additions
 //	tools_mode: allowlist
 //	tools:
 //	  - computer-ops
@@ -37,7 +36,6 @@ type ModeMeta struct {
 	ID              string   `json:"id"`
 	Name            string   `json:"name"`
 	BaseMode        string   `json:"base_mode"`
-	PromptStrategy  string   `json:"prompt_strategy,omitempty"` // "additions" or "replace"
 	ToolsMode       string   `json:"tools_mode,omitempty"`      // "allowlist" or "denylist"
 	Tools           []string `json:"tools,omitempty"`
 	Model           string   `json:"model,omitempty"`
@@ -58,17 +56,6 @@ const (
 	ToolsModeDenylist ToolsMode = "denylist"
 )
 
-// PromptStrategy determines how PromptContent merges with the base mode prompt.
-type PromptStrategy string
-
-const (
-	// PromptStrategyAdditions appends PromptContent after the base prompt.
-	PromptStrategyAdditions PromptStrategy = "additions"
-
-	// PromptStrategyReplace replaces the base prompt entirely.
-	PromptStrategyReplace PromptStrategy = "replace"
-)
-
 // ModelSettings overrides the default model configuration for a mode.
 type ModelSettings struct {
 	Model           string  `json:"model,omitempty"`
@@ -84,14 +71,13 @@ type ModelSettings struct {
 type Mode struct {
 	// Meta holds all frontmatter fields parsed from the system.md header.
 	Meta           ModeMeta       `json:"meta"`
-	ID             string         `json:"id"`
-	Name           string         `json:"name"`
-	BaseModeID     BaseMode       `json:"base_mode_id"`
-	PromptStrategy PromptStrategy `json:"prompt_strategy,omitempty"`
-	PromptContent  string         `json:"prompt_content,omitempty"`
-	ModelSettings  *ModelSettings `json:"model_settings,omitempty"`
-	ToolsMode      ToolsMode      `json:"tools_mode,omitempty"`
-	ToolsList      []string       `json:"tools_list,omitempty"`
+	ID            string         `json:"id"`
+	Name          string         `json:"name"`
+	BaseModeID    BaseMode       `json:"base_mode_id"`
+	PromptContent string         `json:"prompt_content,omitempty"`
+	ModelSettings *ModelSettings `json:"model_settings,omitempty"`
+	ToolsMode     ToolsMode      `json:"tools_mode,omitempty"`
+	ToolsList     []string       `json:"tools_list,omitempty"`
 }
 
 // IsToolAllowed returns whether a tool name is permitted under this mode's

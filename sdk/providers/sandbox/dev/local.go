@@ -1,5 +1,8 @@
-// Package sandbox provides SandboxDriver implementations for the autobuild SDK.
-package sandbox
+//go:build !production
+
+// Package sandboxdev provides a development-only sandbox that runs commands
+// directly on the host without isolation. Do NOT use in production.
+package sandboxdev
 
 import (
 	"context"
@@ -13,7 +16,7 @@ import (
 )
 
 // LocalSandbox runs commands directly on the host without isolation.
-// Use ONLY for development and testing. For production, use DockerSandbox.
+// Use ONLY for development and testing — not production.
 //
 // WARNING: LocalSandbox gives the agent unrestricted access to the host
 // filesystem and environment. Pair with SafetyFilter to prevent dangerous
@@ -21,7 +24,7 @@ import (
 //
 // Each "sandbox" is a temporary directory. Destroy() removes it.
 type LocalSandbox struct {
-	mu      sync.Mutex
+	mu        sync.Mutex
 	sandboxes map[string]*localInstance
 }
 
@@ -159,7 +162,6 @@ func (s *LocalSandbox) ExecStream(ctx context.Context, id string, command string
 	go func() {
 		defer close(out)
 		buf := make([]byte, 4096)
-		// Drain stdout
 		go func() {
 			for {
 				n, err := stdout.Read(buf)
@@ -171,7 +173,6 @@ func (s *LocalSandbox) ExecStream(ctx context.Context, id string, command string
 				}
 			}
 		}()
-		// Drain stderr
 		for {
 			n, err := stderr.Read(buf)
 			if n > 0 {

@@ -65,10 +65,10 @@ export function ToolTraceCard({ trace }: ToolTraceCardProps) {
   const summary = isSubagentDispatch
     ? `${trace.subagents!.length} subagent${trace.subagents!.length === 1 ? "" : "s"}`
     : trace.status === "running"
-      ? "Executing…"
+      ? describeRunning(trace.name, trace.args)
       : trace.error
         ? "Failed"
-        : "Done"
+        : describeDone(trace.name, trace.args)
 
   return (
     <div className={`tool-trace ${statusClass}`}>
@@ -170,6 +170,57 @@ function SubagentCard({ sub }: SubagentCardProps) {
       )}
     </div>
   )
+}
+
+function describeRunning(name: string, args?: Record<string, unknown>): string {
+  switch (name) {
+    case "bash": {
+      const cmd = String(args?.command ?? "").split("\n")[0].slice(0, 60)
+      return cmd ? `$ ${cmd}…` : "Running…"
+    }
+    case "file_write":
+      return args?.path ? `Writing ${shortPath(String(args.path))}…` : "Writing…"
+    case "file_read":
+      return args?.path ? `Reading ${shortPath(String(args.path))}…` : "Reading…"
+    case "glob":
+      return args?.pattern ? `Globbing ${String(args.pattern)}…` : "Searching…"
+    case "grep":
+      return args?.pattern ? `Grep "${String(args.pattern).slice(0, 40)}"…` : "Searching…"
+    case "todo_write":
+      return "Updating tasks…"
+    case "code_interpreter":
+      return "Executing code…"
+    default:
+      return "Running…"
+  }
+}
+
+function describeDone(name: string, args?: Record<string, unknown>): string {
+  switch (name) {
+    case "bash": {
+      const cmd = String(args?.command ?? "").split("\n")[0].slice(0, 50)
+      return cmd ? `Ran \`${cmd}\`` : "Done"
+    }
+    case "file_write":
+      return args?.path ? `Wrote ${shortPath(String(args.path))}` : "Done"
+    case "file_read":
+      return args?.path ? `Read ${shortPath(String(args.path))}` : "Done"
+    case "glob":
+      return args?.pattern ? `Glob ${String(args.pattern)}` : "Done"
+    case "grep":
+      return args?.pattern ? `Grep "${String(args.pattern).slice(0, 40)}"` : "Done"
+    case "todo_write":
+      return "Tasks updated"
+    case "code_interpreter":
+      return "Code executed"
+    default:
+      return "Done"
+  }
+}
+
+function shortPath(p: string): string {
+  const parts = p.split("/")
+  return parts.length > 2 ? `…/${parts.slice(-2).join("/")}` : p
 }
 
 function truncate(value: string, limit: number): string {

@@ -36,10 +36,6 @@ const (
 	// Refreshed each session — not hardcoded.
 	LayerMemory SystemPromptLayer = "memory"
 
-	// LayerSkills contains the content of currently loaded skills.
-	// Added/removed dynamically as skills are loaded/unloaded.
-	LayerSkills SystemPromptLayer = "skills"
-
 	// LayerSession holds ephemeral situational context for this conversation.
 	// Includes: current time, active thread ID, what the user is viewing,
 	// recent observations worth surfacing.
@@ -55,7 +51,6 @@ var layerOrder = []SystemPromptLayer{
 	LayerCore,
 	LayerBehavior,
 	LayerMemory,
-	LayerSkills,
 	LayerSession,
 	LayerMode,
 }
@@ -69,7 +64,6 @@ var layerOrder = []SystemPromptLayer{
 //	builder := NewSystemPromptBuilder()
 //	builder.Set(LayerCore, corePrompt)
 //	builder.Set(LayerMemory, memoryContent)
-//	builder.Set(LayerSkills, skill1.Content+"\n\n"+skill2.Content)
 //	prompt := builder.Build()
 type SystemPromptBuilder struct {
 	layers         map[SystemPromptLayer]string
@@ -86,12 +80,10 @@ func NewSystemPromptBuilder() *SystemPromptBuilder {
 
 // SetMaxLayerTokens caps the token count for a specific layer.
 // When Build() is called with a tokenizer, layers exceeding their cap are
-// truncated before concatenation. This prevents LayerSkills from exploding
-// the system prompt when many skills are loaded simultaneously.
+// truncated before concatenation.
 //
-// Example — cap skills to 4k tokens:
+// Example — cap memory to 8k tokens:
 //
-//	builder.SetMaxLayerTokens(LayerSkills, 4000)
 //	builder.SetMaxLayerTokens(LayerMemory, 8000)
 func (b *SystemPromptBuilder) SetMaxLayerTokens(layer SystemPromptLayer, maxTokens int) {
 	b.maxLayerTokens[layer] = maxTokens
@@ -157,57 +149,3 @@ func (b *SystemPromptBuilder) Clear(layer SystemPromptLayer) {
 	delete(b.layers, layer)
 }
 
-// ── Default behavior layer ───────────────────────────────────────────────────
-
-// DefaultBehaviorPrompt returns the behavior layer that makes an agent
-// operate like Claude: tool selection logic, memory discipline, search
-// judgment, formatting defaults.
-//
-// This is the closest you can get to replicating Claude's operating model
-// without access to Anthropic's training data. It is a system prompt, not
-// a replacement for RLHF — but it closes a significant gap.
-const DefaultBehaviorPrompt = `## Operating Principles
-
-### Tool selection
-Use tools when the answer requires current information, personal data, or
-file operations. Do not use tools for questions you can answer reliably from
-knowledge. When in doubt about recency, search.
-
-Scale tool calls to complexity:
-- Single fact → 1 search
-- Research task → 3-5 searches + fetch for depth
-- Complex multi-domain → up to 10 calls, plan before executing
-
-### Parallelism
-Execute independent tool calls in the same turn. Only serialize when the
-output of one call determines the input of another.
-
-### Memory discipline
-Read memory at conversation start. Write to memory only when something has
-leverage for future sessions: decisions that affect multiple future actions,
-user preferences that change output format, project state that must survive
-across threads. Do not write ephemeral facts — use ObservationStore instead.
-
-Layer priority when facts conflict: Explicit > Inferred > Session.
-
-### Skill loading
-Check skill triggers against the user's request before acting. Load relevant
-skills before execution, not after. A loaded skill persists for the thread —
-unload when no longer needed to free context budget.
-
-### Phase discipline
-Follow the 6-phase lifecycle. Do not execute before aligning. Do not close
-before verifying. When verification fails, retry execution — do not close
-with known errors.
-
-Propose a plan before execution when the task has 3+ executables. One
-question maximum during alignment — make it the most important one.
-
-### Formatting
-Lead with the answer. No preamble. Use prose over lists unless the content
-is genuinely list-shaped. Short responses for simple questions. Longer
-responses only when the topic requires depth.
-
-### Checkpoints
-Create a checkpoint before any destructive or irreversible operation.
-Create another after successful completion. No checkpoint = no rollback.`

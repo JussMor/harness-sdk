@@ -24,8 +24,6 @@ packages:
       StreamingLLMProvider: "unknown"
       Runtime: "unknown"
       InterruptStore: "unknown"
-      WebhookStore: "unknown"
-      WebhookDispatcher: "unknown"
       InterruptGate: "unknown"
       ApprovalGate: "unknown"
       HumanApprovalFilter: "unknown"

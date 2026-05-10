@@ -92,7 +92,7 @@ export type StreamEvent =
   | { type: "tool_result"; data: StreamToolResult }
   | { type: "sandbox_output"; data: StreamSandboxOutput }
   | { type: "plan_proposed"; data: StreamPlanProposed }
-  | { type: "subagent_result"; data: StreamSubagentResult }
+  | { type: "agent_result"; data: StreamSubagentResult }
   | { type: "interrupt_required"; data: StreamInterruptRequest }
   | {
       type: "interrupt_resolved"
@@ -100,8 +100,13 @@ export type StreamEvent =
     }
   | { type: "artifact_created"; data: StreamComponentArtifact }
   | { type: "artifact_updated"; data: StreamComponentArtifact }
+  | { type: "compaction"; data: StreamCompaction }
+  | { type: "plan_mode_changed"; data: StreamPlanMode }
   | { type: "done"; data: StreamDone }
-  | { type: "error"; data: { error?: string } }
+  | {
+      type: "error"
+      data: { error?: string; category?: string; detail?: string }
+    }
 
 // ── Generic interrupt types (new HIL system) ─────────────────────────────────
 
@@ -111,7 +116,18 @@ export interface StreamInterruptRequest {
   id: string
   kind: InterruptKind
   reason?: string
-  approval?: { tool_call?: { name?: string; args?: Record<string, unknown> } }
+  approval?: {
+    tool_call?: {
+      id?: string
+      name?: string
+      /** Raw JSON-encoded argument string as the LLM emitted it. Parse to
+       *  inspect specific fields (e.g. `plan` for ExitPlanMode). */
+      arguments?: string
+      /** Legacy/optional pre-parsed args. Backend currently sends
+       *  `arguments` only; kept here for compat. */
+      args?: Record<string, unknown>
+    }
+  }
   question?: { prompt: string; choices?: Array<string>; multi?: boolean }
   form?: { title?: string; schema?: Record<string, unknown>; ui_hint?: string }
 }
@@ -152,6 +168,26 @@ export interface StreamPlanProposed {
   title: string
   objective: string
   executables: Array<StreamPlanExecutable>
+}
+
+// ── Compaction & plan-mode signals ──────────────────────────────────────────
+
+/** Emitted when the runtime had to summarise older history because the
+ *  context budget was exceeded. The frontend should surface a brief
+ *  "memory compacted" indicator. */
+export interface StreamCompaction {
+  messages_dropped: number
+  overflow_tokens: number
+  summary?: string
+}
+
+/** Emitted on plan-mode transitions (EnterPlanMode / approved or rejected
+ *  ExitPlanMode). The frontend uses this to badge the chat surface and
+ *  surface the plan dialog. */
+export interface StreamPlanMode {
+  state: "entered" | "exited"
+  plan?: string
+  reason?: string
 }
 
 export interface StreamPlanExecutable {
@@ -195,6 +231,8 @@ export interface ArtifactRecord {
   title: string
   createdAt: string
   versions?: Array<ArtifactVersion>
+  /** Most recent version content, populated by the list endpoint. */
+  latestContent?: string
 }
 
 export interface ArtifactStorageResponse {

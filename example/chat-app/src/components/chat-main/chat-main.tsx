@@ -19,12 +19,15 @@ import type {
 import { componentCatalog } from "@/lib/component-catalog"
 import { ArtifactRenderer } from "@harness/react"
 import {
+  AlertTriangle,
   Bot,
   Brain,
   Check,
   ChevronDown,
   ChevronRight,
+  ClipboardList,
   Copy,
+  Database,
   LoaderCircle,
   RefreshCw,
   SendHorizontal,
@@ -34,7 +37,6 @@ import {
   Square,
   ThumbsDown,
   ThumbsUp,
-  User,
 } from "lucide-react"
 import { useCallback, useEffect, useMemo, useRef, useState } from "react"
 import ReactMarkdown from "react-markdown"
@@ -104,6 +106,32 @@ export function ChatMain({
   const [hilEnabled, setHilEnabled] = useState(true)
   const [pendingInterrupt, setPendingInterrupt] =
     useState<StreamInterruptRequest | null>(null)
+
+  // ── Plan-mode state ──────────────────────────────────────────────────────
+  // The agent has entered plan mode (EnterPlanMode tool fired). The flag
+  // remains true until a plan_mode_changed event with state === "exited"
+  // arrives (approval, rejection, or auto-restore).
+  const [inPlanMode, setInPlanMode] = useState(false)
+
+  // ── Compaction signal ────────────────────────────────────────────────────
+  // Last compaction event the runtime emitted. When non-null, a transient
+  // banner shows "Memory compacted — N messages summarised". Cleared after
+  // a few seconds.
+  const [lastCompaction, setLastCompaction] = useState<{
+    at: number
+    dropped: number
+    summary?: string
+  } | null>(null)
+
+  // ── Stream error banner ──────────────────────────────────────────────────
+  // Last fatal stream error (e.g. provider billing / rate limit). Renders a
+  // dismissible banner above the input. Cleared on next sendPrompt or by the
+  // user.
+  const [streamError, setStreamError] = useState<{
+    message: string
+    category?: string
+    detail?: string
+  } | null>(null)
 
   // ── Generative UI artifacts (component artifacts from the SDK) ─────────────
   const [componentArtifacts, setComponentArtifacts] = useState<
@@ -237,22 +265,33 @@ export function ChatMain({
         })
       })
 
-      // Reconstruct artifacts from persisted metadata
-      const restored: Array<Artifact> = []
-      for (const msg of payload) {
-        if (msg.metadata?.artifacts) {
-          for (const a of msg.metadata.artifacts) {
-            restored.push({
-              id: `restored-${msg.id}-${restored.length}`,
-              language: a.language,
-              content: a.content,
-              complete: true,
-              title: a.path.split("/").pop() || a.path,
-            })
-          }
-        }
+      // Reconstruct artifacts from the artifacts API (real DB UUIDs + latest content).
+      // This ensures onSaveVersion can target the correct DB record and version
+      // navigation works after a page reload.
+      try {
+        const dbArtifacts = await api.listArtifacts(targetChatID)
+        const restored: Array<Artifact> = dbArtifacts.map((a) => ({
+          id: a.id,
+          language: a.language,
+          content: a.latestContent ?? "",
+          complete: true,
+          title: a.title || `${a.language} artifact`,
+        }))
+        setAllArtifacts(restored)
+        // If the currently-displayed artifact was a temp local one (e.g. "file-…"),
+        // replace it with its DB counterpart so save operations have a real ID.
+        setActiveArtifact((prev) => {
+          if (!prev) return prev
+          const match = restored.find(
+            (r) =>
+              r.id === prev.id ||
+              (r.language === prev.language && r.title === prev.title)
+          )
+          return match ?? prev
+        })
+      } catch {
+        // Non-fatal — keep whatever was already in allArtifacts from the stream.
       }
-      setAllArtifacts(restored)
     },
     [api]
   )
@@ -327,6 +366,14 @@ export function ChatMain({
       streamControllerRef.current?.abort()
     }
   }, [])
+
+  // Auto-dismiss the "memory compacted" banner after a short window so it
+  // doesn't linger across turns. Cleared eagerly when a new event arrives.
+  useEffect(() => {
+    if (!lastCompaction) return
+    const t = setTimeout(() => setLastCompaction(null), 6000)
+    return () => clearTimeout(t)
+  }, [lastCompaction])
 
   const stopStream = useCallback(() => {
     if (!streamControllerRef.current) {
@@ -461,6 +508,43 @@ export function ChatMain({
           pendingFilePreviewsRef.current.shift()
         }
 
+        // dispatch-subagents — surface every file each subagent wrote so
+        // they show up in the canvas alongside files written directly by
+        // the parent agent. The backend tracks them via fileWriteTracker
+        // and embeds them under `files_created` in the tool result.
+        if (
+          toolName === "dispatch-subagents" &&
+          !event.data.error &&
+          event.data.content
+        ) {
+          try {
+            const parsed = JSON.parse(event.data.content) as {
+              files_created?: Array<{ path?: string; content?: string }>
+            }
+            const files = parsed.files_created ?? []
+            if (files.length > 0) {
+              const newArtifacts: Array<Artifact> = files
+                .filter((f) => f && f.path && f.content)
+                .map((f) => ({
+                  id: `subagent-${Date.now()}-${Math.random()
+                    .toString(36)
+                    .slice(2, 8)}`,
+                  language: inferLanguageFromPath(f.path!),
+                  content: f.content!,
+                  complete: true,
+                  title: f.path!.split("/").pop() || f.path!,
+                }))
+              if (newArtifacts.length > 0) {
+                setAllArtifacts((prev) => [...prev, ...newArtifacts])
+                setActiveArtifact(newArtifacts[newArtifacts.length - 1])
+                setIsArtifactStreaming(false)
+              }
+            }
+          } catch {
+            // tool may have returned a non-JSON error string — ignore
+          }
+        }
+
         const subagents = parseSubagentResult(toolName, event.data.content)
 
         setMessages((prev) =>
@@ -527,8 +611,26 @@ export function ChatMain({
       }
 
       if (event.type === "error") {
-        const errorMessage = event.data.error || "Unknown stream error"
+        const errorMessage =
+          event.data.error ||
+          "Ocurrió un error procesando la respuesta. Reintenta."
+        const category = event.data.category
+        const detail = event.data.detail
+        setStreamError({ message: errorMessage, category, detail })
         pushTimeline(`Stream error: ${errorMessage}`, "error")
+        // Replace the pending assistant bubble with the error so the chat
+        // history reflects what happened instead of staying blank.
+        setMessages((prev) =>
+          prev.map((m) =>
+            m.id === pendingAssistantId
+              ? {
+                  ...m,
+                  pending: false,
+                  content: m.content || `⚠️ ${errorMessage}`,
+                }
+              : m
+          )
+        )
         return
       }
 
@@ -546,7 +648,7 @@ export function ChatMain({
         return
       }
 
-      if (event.type === "subagent_result") {
+      if (event.type === "agent_result") {
         const result = event.data
         const level: TimelineEvent["level"] = result.error ? "error" : "success"
         pushTimeline(`Subagent ${result.id}: ${result.error || "done"}`, level)
@@ -565,6 +667,18 @@ export function ChatMain({
 
       if (event.type === "interrupt_required") {
         const req = event.data
+        // Form-input interrupts paired with a UIHint (component name) are
+        // already rendered as an interactive component artifact — the
+        // QuestionnaireForm/PatientIntakeForm modal posts its own resolution
+        // via interaction.token. Suppress the generic InterruptDialog so
+        // the user only sees one surface and only one resolve fires.
+        if (req.kind === "form_input" && req.form?.ui_hint) {
+          pushTimeline(
+            `Awaiting input: ${req.form.title ?? req.form.ui_hint}`,
+            "info"
+          )
+          return
+        }
         const label =
           req.kind === "approval"
             ? `Awaiting approval: ${req.approval?.tool_call?.name ?? "tool"}`
@@ -633,6 +747,41 @@ export function ChatMain({
         return
       }
 
+      if (event.type === "compaction") {
+        // Surface a transient banner + timeline note. Lets the user know
+        // why earlier messages might appear summarised in subsequent turns.
+        const dropped = event.data.messages_dropped ?? 0
+        setLastCompaction({
+          at: Date.now(),
+          dropped,
+          summary: event.data.summary,
+        })
+        pushTimeline(
+          dropped > 0
+            ? `Memory compacted — ${dropped} message${dropped === 1 ? "" : "s"} summarised`
+            : "Memory compacted",
+          "info"
+        )
+        return
+      }
+
+      if (event.type === "plan_mode_changed") {
+        const state = event.data.state
+        if (state === "entered") {
+          setInPlanMode(true)
+          pushTimeline("Plan mode engaged — agent will not edit", "info")
+        } else {
+          setInPlanMode(false)
+          pushTimeline(
+            event.data.reason
+              ? `Plan mode exited: ${event.data.reason}`
+              : "Plan mode exited",
+            "info"
+          )
+        }
+        return
+      }
+
       if (event.type === "done") {
         // Mark stream as done — syncMessages() after streamChat resolves
         // handles full message and artifact restoration from backend.
@@ -664,6 +813,7 @@ export function ChatMain({
     setInput("")
     setStatusText("Streaming response...")
     setIsStreaming(true)
+    setStreamError(null)
 
     // Reset artifact detector for the new response
     detectorRef.current = createDetectorState()
@@ -766,19 +916,130 @@ export function ChatMain({
       className={`chat-main-root ${activeArtifact || canvasComponent ? "chat-main-root--with-canvas" : ""}`}
     >
       <div className="chat-main-panel">
-        {showGreeting && messages.length === 0 && (
-          <header className="chat-main-greeting">
-            <p className="chat-main-badge">
+        <header className="chat-main-header">
+          <span className="chat-main-header-title">
+            {activeChatID ? `Chat #${activeChatID}` : "New Chat"}
+          </span>
+          <span className="chat-main-header-sub">{selectedMode}</span>
+          {inPlanMode ? (
+            <span
+              className="chat-mode-badge chat-mode-badge--plan"
+              title="Plan mode — agent is gathering info and will not modify anything until you approve"
+            >
+              <ClipboardList size={12} />
+              Plan mode
+            </span>
+          ) : null}
+          <button
+            type="button"
+            title={
+              hilEnabled
+                ? "Human-in-the-loop ON — click to disable"
+                : "Human-in-the-loop OFF — click to enable"
+            }
+            onClick={() => setHilEnabled((v) => !v)}
+            disabled={isStreaming}
+            className={`chat-hil-toggle ${hilEnabled ? "chat-hil-toggle--on" : ""}`}
+          >
+            {hilEnabled ? <ShieldAlert size={14} /> : <Shield size={14} />}
+          </button>
+          <div className="chat-main-status">
+            {isStreaming ? (
+              <LoaderCircle className="spin" size={14} />
+            ) : (
               <Sparkles size={14} />
-              Stream Runtime Ready
-            </p>
-            <h1>Hola {userName}, el backend ya esta conectado con SSE real.</h1>
-            <p>
-              Crea un chat, elige provider y modo, y mira deltas + eventos de
-              tools en tiempo real.
-            </p>
-          </header>
-        )}
+            )}
+            <span>{statusText}</span>
+          </div>
+        </header>
+
+        {lastCompaction ? (
+          <div
+            className="chat-compaction-banner"
+            role="status"
+            aria-live="polite"
+          >
+            <Database size={14} />
+            <span>
+              Memory compacted
+              {lastCompaction.dropped > 0
+                ? ` — ${lastCompaction.dropped} earlier message${
+                    lastCompaction.dropped === 1 ? "" : "s"
+                  } summarised`
+                : ""}
+            </span>
+            <button
+              type="button"
+              className="chat-compaction-banner-close"
+              onClick={() => setLastCompaction(null)}
+              aria-label="Dismiss"
+            >
+              ×
+            </button>
+          </div>
+        ) : null}
+
+        {streamError ? (
+          <div
+            className="chat-error-banner"
+            role="alert"
+            aria-live="assertive"
+            style={{
+              display: "flex",
+              alignItems: "flex-start",
+              gap: 8,
+              padding: "10px 14px",
+              margin: "8px 12px",
+              borderRadius: 8,
+              background: "rgba(220, 38, 38, 0.08)",
+              border: "1px solid rgba(220, 38, 38, 0.35)",
+              color: "var(--text, #b91c1c)",
+              fontSize: 13,
+            }}
+          >
+            <AlertTriangle size={16} style={{ flexShrink: 0, marginTop: 2 }} />
+            <div style={{ flex: 1 }}>
+              <div style={{ fontWeight: 600 }}>
+                {streamError.category && streamError.category !== "unknown"
+                  ? `Error (${streamError.category})`
+                  : "Error"}
+              </div>
+              <div>{streamError.message}</div>
+              {streamError.detail ? (
+                <details style={{ marginTop: 4, opacity: 0.75 }}>
+                  <summary style={{ cursor: "pointer", fontSize: 12 }}>
+                    Detalle técnico
+                  </summary>
+                  <pre
+                    style={{
+                      whiteSpace: "pre-wrap",
+                      wordBreak: "break-word",
+                      fontSize: 11,
+                      marginTop: 4,
+                    }}
+                  >
+                    {streamError.detail}
+                  </pre>
+                </details>
+              ) : null}
+            </div>
+            <button
+              type="button"
+              onClick={() => setStreamError(null)}
+              aria-label="Dismiss"
+              style={{
+                background: "transparent",
+                border: "none",
+                cursor: "pointer",
+                color: "inherit",
+                fontSize: 18,
+                lineHeight: 1,
+              }}
+            >
+              ×
+            </button>
+          </div>
+        ) : null}
 
         <div className="chat-main-toolbar">
           <select
@@ -811,35 +1072,11 @@ export function ChatMain({
             )}
           </select>
 
-          <div className="chat-main-status">
-            {isStreaming ? (
-              <LoaderCircle className="spin" size={14} />
-            ) : (
-              <Sparkles size={14} />
-            )}
-            <span>{statusText}</span>
-            {allArtifacts.length > 0 && (
-              <span className="chat-main-artifact-count">
-                {allArtifacts.length} artifact
-                {allArtifacts.length > 1 ? "s" : ""}
-              </span>
-            )}
-          </div>
-
-          <button
-            type="button"
-            title={
-              hilEnabled
-                ? "Human-in-the-loop ON — click to disable"
-                : "Human-in-the-loop OFF — click to enable"
-            }
-            onClick={() => setHilEnabled((v) => !v)}
-            disabled={isStreaming}
-            className={`chat-hil-toggle ${hilEnabled ? "chat-hil-toggle--on" : ""}`}
-          >
-            {hilEnabled ? <ShieldAlert size={14} /> : <Shield size={14} />}
-            <span>{hilEnabled ? "HIL on" : "HIL off"}</span>
-          </button>
+          {allArtifacts.length > 0 && (
+            <span className="chat-main-artifact-count">
+              {allArtifacts.length} artifact{allArtifacts.length > 1 ? "s" : ""}
+            </span>
+          )}
         </div>
 
         {pendingInterrupt && (
@@ -857,18 +1094,40 @@ export function ChatMain({
                 setPendingInterrupt(null)
               }
             }}
-            onCancel={() => setPendingInterrupt(null)}
+            onCancel={async () => {
+              // Dismiss === Reject. Without sending a denial the backend
+              // gate stays blocked, the agent loop hangs forever, and the
+              // model never gets a tool result.
+              if (chatID) {
+                try {
+                  await api.resolveInterrupt(pendingInterrupt.id, chatID, {
+                    approved: false,
+                  })
+                } catch {
+                  // best-effort: still clear the dialog so the user
+                  // doesn't get stuck
+                }
+              }
+              setPendingInterrupt(null)
+            }}
           />
         )}
 
-        {
-          componentArtifacts.filter(
-            (a) => (a.placement ?? "canvas") === "canvas"
-          ).length > 0 && null /* canvas components rendered in side panel */
-        }
-
         <div className="chat-main-grid">
           <div className="chat-main-feed">
+            {showGreeting && messages.length === 0 && (
+              <div className="chat-main-greeting">
+                <p className="chat-main-badge">
+                  <Sparkles size={14} />
+                  Stream Runtime Ready
+                </p>
+                <h1>Hello, {userName}</h1>
+                <p>
+                  Choose a mode and provider above, then start a conversation.
+                </p>
+              </div>
+            )}
+
             {messages.map((message) => (
               <article
                 key={message.id}
@@ -878,69 +1137,68 @@ export function ChatMain({
                     : "chat-bubble-user"
                 }`}
               >
-                <div className="chat-bubble-meta">
-                  {message.role === "assistant" ? (
-                    <Bot size={14} />
-                  ) : (
-                    <User size={14} />
-                  )}
-                  <span>
-                    {message.role === "assistant"
-                      ? message.model || "assistant"
-                      : "you"}
-                  </span>
-                  {message.pending && (
-                    <LoaderCircle className="spin" size={13} />
-                  )}
-                </div>
-                {message.traces && message.traces.length > 0 && (
-                  <div className="chat-bubble-traces">
-                    {message.traces.map((trace) => (
-                      <ToolTraceCard key={trace.id} trace={trace} />
-                    ))}
+                {message.role === "user" ? (
+                  <div className="chat-bubble-user-inner">
+                    <MessageContent message={message} />
                   </div>
+                ) : (
+                  <>
+                    <div className="chat-bubble-meta">
+                      <Bot size={14} />
+                      <span>{message.model || "assistant"}</span>
+                      {message.pending && (
+                        <LoaderCircle className="spin" size={13} />
+                      )}
+                    </div>
+                    {message.traces && message.traces.length > 0 && (
+                      <div className="chat-bubble-traces">
+                        {message.traces.map((trace) => (
+                          <ToolTraceCard key={trace.id} trace={trace} />
+                        ))}
+                      </div>
+                    )}
+                    {message.plan && (
+                      <PlanBlock
+                        plan={message.plan}
+                        defaultOpen={!!message.pending}
+                      />
+                    )}
+                    {message.subagentResults &&
+                      message.subagentResults.length > 0 && (
+                        <SubagentResultsBlock
+                          results={message.subagentResults}
+                          defaultOpen={!!message.pending}
+                        />
+                      )}
+                    {message.thinking && (
+                      <ThinkingBlock
+                        content={message.thinking}
+                        isStreaming={!!message.pending}
+                      />
+                    )}
+                    <MessageContent message={message} />
+                    {message.role === "assistant" &&
+                      !message.pending &&
+                      !isStreaming && (
+                        <MessageActions
+                          content={message.content}
+                          onRetry={() => {
+                            const idx = messages.findIndex(
+                              (m) => m.id === message.id
+                            )
+                            const prev = messages
+                              .slice(0, idx)
+                              .reverse()
+                              .find((m) => m.role === "user")
+                            if (prev) {
+                              setInput(prev.content)
+                              setTimeout(() => void sendPrompt(), 0)
+                            }
+                          }}
+                        />
+                      )}
+                  </>
                 )}
-                {message.plan && (
-                  <PlanBlock
-                    plan={message.plan}
-                    defaultOpen={!!message.pending}
-                  />
-                )}
-                {message.subagentResults &&
-                  message.subagentResults.length > 0 && (
-                    <SubagentResultsBlock
-                      results={message.subagentResults}
-                      defaultOpen={!!message.pending}
-                    />
-                  )}
-                {message.thinking && (
-                  <ThinkingBlock
-                    content={message.thinking}
-                    isStreaming={!!message.pending}
-                  />
-                )}
-                <MessageContent message={message} />
-                {/* Actions row — only for complete assistant messages */}
-                {message.role === "assistant" &&
-                  !message.pending &&
-                  !isStreaming && (
-                    <MessageActions
-                      content={message.content}
-                      onRetry={() => {
-                        const idx = messages.findIndex(
-                          (m) => m.id === message.id
-                        )
-                        const prev = messages
-                          .slice(0, idx)
-                          .reverse()
-                          .find((m) => m.role === "user")
-                        if (prev) {
-                          setInput(prev.content)
-                          setTimeout(() => void sendPrompt(), 0)
-                        }
-                      }}
-                    />
-                  )}
               </article>
             ))}
 
@@ -959,86 +1217,100 @@ export function ChatMain({
                 </div>
               ))}
 
-            <div ref={listEndRef} />
-          </div>
-
-          <aside className="chat-main-events">
-            <h2>Live Events</h2>
-            {timeline.length === 0 && allArtifacts.length === 0 ? (
-              <p className="chat-empty-events">
-                Tool calls and stream milestones appear here.
-              </p>
-            ) : (
-              timeline.map((event) => (
-                <p
-                  key={event.id}
-                  className={`chat-event chat-event-${event.level}`}
-                >
-                  {event.text}
-                </p>
-              ))
-            )}
-
             {allArtifacts.length > 0 && (
               <div className="chat-artifacts-list">
-                <h3 className="chat-artifacts-list__title">Artifacts</h3>
-                {allArtifacts.map((artifact) => (
-                  <button
-                    key={artifact.id}
-                    type="button"
-                    className={`chat-artifact-item ${activeArtifact?.id === artifact.id ? "chat-artifact-item--active" : ""}`}
-                    onClick={() => {
-                      setActiveArtifact(artifact)
-                      setIsArtifactStreaming(false)
-                    }}
-                  >
-                    <span className="chat-artifact-item__lang">
-                      {artifact.language}
+                <div className="chat-artifacts-list__header">
+                  <h3 className="chat-artifacts-list__title">
+                    Artifacts
+                    <span className="chat-artifacts-list__count">
+                      {allArtifacts.length}
                     </span>
-                    <span className="chat-artifact-item__name">
-                      {artifact.title || `${artifact.language} artifact`}
-                    </span>
-                  </button>
-                ))}
+                  </h3>
+                </div>
+                <div className="chat-artifacts-list__grid">
+                  {allArtifacts.map((artifact) => {
+                    const isActive = activeArtifact?.id === artifact.id
+                    const title =
+                      artifact.title ||
+                      `${artifact.language || "text"} artifact`
+                    const lang = (artifact.language || "txt").toLowerCase()
+                    const lines = artifact.content
+                      ? artifact.content.split("\n").length
+                      : 0
+                    return (
+                      <button
+                        key={artifact.id}
+                        type="button"
+                        className={`chat-artifact-card ${isActive ? "chat-artifact-card--active" : ""}`}
+                        onClick={() => {
+                          setActiveArtifact(artifact)
+                          setIsArtifactStreaming(false)
+                        }}
+                        title={title}
+                      >
+                        <span
+                          className="chat-artifact-card__lang"
+                          data-lang={lang}
+                        >
+                          {lang}
+                        </span>
+                        <span className="chat-artifact-card__body">
+                          <span className="chat-artifact-card__name">
+                            {title}
+                          </span>
+                          <span className="chat-artifact-card__meta">
+                            {lines > 0
+                              ? `${lines} line${lines === 1 ? "" : "s"}`
+                              : "—"}
+                            {!artifact.complete ? " · streaming" : ""}
+                          </span>
+                        </span>
+                      </button>
+                    )
+                  })}
+                </div>
               </div>
             )}
-          </aside>
+
+            <div ref={listEndRef} />
+          </div>
         </div>
 
         <footer className="chat-main-input-wrap">
-          <textarea
-            value={input}
-            onChange={(event) => setInput(event.target.value)}
-            onKeyDown={(event) => {
-              if (event.key === "Enter" && !event.shiftKey) {
-                event.preventDefault()
-                void sendPrompt()
-              }
-            }}
-            className="chat-main-textarea"
-            placeholder="Escribe tu prompt. Enter para enviar, Shift+Enter para nueva linea"
-            disabled={isStreaming}
-          />
-
-          <div className="chat-main-actions">
-            <button
-              type="button"
-              className="chat-btn chat-btn-primary"
-              onClick={() => void sendPrompt()}
-              disabled={!input.trim() || isStreaming}
-            >
-              <SendHorizontal size={15} />
-              Send
-            </button>
-            <button
-              type="button"
-              className="chat-btn chat-btn-muted"
-              onClick={stopStream}
-              disabled={!isStreaming}
-            >
-              <Square size={13} />
-              Stop
-            </button>
+          <div className="chat-main-textarea-wrap">
+            <textarea
+              value={input}
+              onChange={(event) => setInput(event.target.value)}
+              onKeyDown={(event) => {
+                if (event.key === "Enter" && !event.shiftKey) {
+                  event.preventDefault()
+                  void sendPrompt()
+                }
+              }}
+              className="chat-main-textarea"
+              placeholder="Message… (Enter to send, Shift+Enter for new line)"
+              disabled={isStreaming}
+            />
+            <div className="chat-main-actions">
+              <button
+                type="button"
+                className="chat-btn chat-btn-muted"
+                onClick={stopStream}
+                disabled={!isStreaming}
+              >
+                <Square size={13} />
+                Stop
+              </button>
+              <button
+                type="button"
+                className="chat-btn chat-btn-primary"
+                onClick={() => void sendPrompt()}
+                disabled={!input.trim() || isStreaming}
+              >
+                <SendHorizontal size={15} />
+                Send
+              </button>
+            </div>
           </div>
         </footer>
       </div>
@@ -1053,7 +1325,17 @@ export function ChatMain({
             setIsArtifactStreaming(false)
           }}
           onSaveVersion={async (artifactId, newContent) => {
-            // Update local state immediately
+            // Persist the new version to the backend (best-effort).
+            // Only works for artifacts with real DB UUIDs (not temp local IDs).
+            const isDbId = artifactId.length === 36 && artifactId.includes("-")
+            if (isDbId) {
+              try {
+                await api.addArtifactVersion(artifactId, newContent)
+              } catch {
+                // Non-fatal — local state still reflects the edit.
+              }
+            }
+            // Always update local state so the canvas stays in sync.
             setAllArtifacts((prev) =>
               prev.map((a) =>
                 a.id === artifactId ? { ...a, content: newContent } : a
@@ -1114,6 +1396,13 @@ function toChatMessage(message: BackendMessage): ChatMessage {
     })
   )
 
+  // Restore subagentResults from dispatch-subagents tool traces so they
+  // survive page reload. SubagentTrace and StreamSubagentResult share the
+  // same shape so the cast is safe.
+  const subagentResults = traces
+    .flatMap((t) => t.subagents ?? [])
+    .map((s) => s as unknown as StreamSubagentResult)
+
   return {
     id: String(message.id),
     role: message.role,
@@ -1121,6 +1410,7 @@ function toChatMessage(message: BackendMessage): ChatMessage {
     model: message.model,
     pending: false,
     traces: traces.length > 0 ? traces : undefined,
+    subagentResults: subagentResults.length > 0 ? subagentResults : undefined,
   }
 }
 

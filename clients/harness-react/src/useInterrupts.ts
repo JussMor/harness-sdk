@@ -45,34 +45,9 @@ export function useInterrupts(
       setPending((prev) => prev.filter((p) => p.request.id !== id));
     });
 
-    // Legacy approval events keep older backends working. ApprovalRequest
-    // has no `json:` tags in Go so tygo emits PascalCase fields.
-    const offLegacy = session.on("confirmation_required", (ev: StreamEvent) => {
-      const legacy = ev.confirmation_request;
-      if (!legacy) return;
-      setPending((prev) =>
-        prev.some((p) => p.request.id === legacy.ID)
-          ? prev
-          : [
-              ...prev,
-              {
-                request: {
-                  id: legacy.ID,
-                  kind: "approval",
-                  reason: legacy.Reason,
-                  created_at: legacy.CreatedAt,
-                  approval: { tool_call: legacy.ToolCall },
-                } as InterruptRequest,
-                receivedAt: Date.now(),
-              },
-            ],
-      );
-    });
-
     return () => {
       offRequired();
       offResolved();
-      offLegacy();
     };
   }, [session]);
 

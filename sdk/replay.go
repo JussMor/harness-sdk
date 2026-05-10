@@ -158,7 +158,6 @@ type Snapshot struct {
 	Turns         int            `json:"turns"`
 	Usage         TokenUsage     `json:"usage"`
 	StopReason    string         `json:"stop_reason"`
-	SkillsLoaded  []string       `json:"skills_loaded,omitempty"`
 	MemoryWritten []string       `json:"memory_written,omitempty"`
 	CapturedAt    time.Time      `json:"captured_at"`
 }
@@ -178,7 +177,6 @@ func CaptureSnapshot(ctx context.Context, rt *Runtime, id, input string) (*Snaps
 		Turns:         rr.Turns,
 		Usage:         rr.Usage,
 		StopReason:    rr.StopReason,
-		SkillsLoaded:  rr.SkillsLoaded,
 		MemoryWritten: rr.MemoryWritten,
 		CapturedAt:    time.Now(),
 	}, nil
@@ -218,8 +216,6 @@ type SnapshotDiff struct {
 	LengthDelta       int           `json:"length_delta"`
 	TurnsDelta        int           `json:"turns_delta"`
 	UsageDelta        TokenUsage    `json:"usage_delta"`
-	SkillsAdded       []string      `json:"skills_added,omitempty"`
-	SkillsRemoved     []string      `json:"skills_removed,omitempty"`
 }
 
 // CompareSnapshot compares a current Runtime result against a saved snapshot.
@@ -237,8 +233,6 @@ func CompareSnapshot(snap *Snapshot, rr *RuntimeResult, input string) SnapshotDi
 			CompletionTokens: rr.Usage.CompletionTokens - snap.Usage.CompletionTokens,
 			TotalTokens:      rr.Usage.TotalTokens - snap.Usage.TotalTokens,
 		},
-		SkillsAdded:   diffStrings(rr.SkillsLoaded, snap.SkillsLoaded),
-		SkillsRemoved: diffStrings(snap.SkillsLoaded, rr.SkillsLoaded),
 	}
 	return diff
 }
