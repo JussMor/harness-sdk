@@ -1,376 +1,341 @@
-# harness-sdk — Análisis del SDK
+# harness-sdk — Project guide for Claude
 
-SDK para construir agentes de IA al estilo Claude. Módulo Go: `github.com/everfaz/autobuild-sdk` · Versión: `0.2.0` · Go 1.22+
+> Internal map of the SDK. Read this first when working in the repo.
+> Module: `github.com/everfaz/autobuild-sdk` · Go 1.22+ · Version `0.2.0`
 
 ---
 
-## Estructura del repositorio
+## Repo layout
 
 ```
 harness-sdk/
-├── sdk/                          # SDK Go core
-│   ├── *.go                      # Abstracciones e interfaces
-│   └── providers/                # Implementaciones concretas
+├── sdk/                          # SDK Go core (one module)
+│   ├── *.go                      # abstractions
+│   └── providers/                # concrete impls
 │       ├── llm/                  # anthropic.go, openai.go, ollama.go
-│       ├── memory/               # filesystem.go
-│       ├── sandbox/              # opensandbox.go, local.go
-│       ├── skills/               # memory.go
+│       ├── memory/               # filesystem.go (memdir on disk)
+│       ├── sandbox/              # opensandbox.go + dev/ (in-process)
+│       ├── store/                # filesystem.go (ConversationStore)
 │       ├── thread/               # sqlite.go, postgres.go, memory.go
-│       ├── tokenizers/           # tiktoken.go, byte.go, auto.go
-│       └── embedders/            # voyage.go, local.go
-├── example/
-│   ├── backend-chat/             # Servidor Go completo (puerto :9090)
-│   └── chat-app/                 # Frontend React/Vite (puerto :3000)
+│       └── tokenizers/           # tiktoken.go, byte.go, auto.go
 ├── clients/
-│   ├── harness-client/           # Cliente TypeScript
-│   └── harness-react/            # Hooks React (useHarness, useArtifacts, useInterrupts)
-└── scripts/gen-events/           # Generador de código (tygo)
+│   ├── harness-client/           # TS client (SSE + REST)
+│   ├── harness-react/            # React hooks
+│   └── tygo.yaml                 # Go → TS type generation
+├── example/
+│   ├── backend-chat/             # canonical Go server (:9090, SQLite)
+│   └── chat-app/                 # React/Vite UI (:3000)
+├── scripts/gen-events/           # generates clients/.../events.ts
+├── docs/claude-model.md          # implementation deep-dive
+├── Makefile                      # `make client`, `make client-types-check`
+└── go.work
 ```
+
+There is **no** central `Skills` provider, `EventBus`, `CheckpointProvider`,
+`Verification` module, `ObservationStore`, or standalone `Subagent` module.
+Older notes that mention them are stale.
 
 ---
 
-## Engine — punto de composición (`engine.go:20`)
-
-Todos los campos son opcionales (opt-in).
+## Engine — composition root (`sdk/engine.go`)
 
 ```go
 type Engine struct {
-  Memory       MemoryProvider
-  Sandbox      SandboxDriver
-  Tools        *ToolRegistry
-  Skills       SkillProvider
-  Threads      ThreadProvider
-  Checkpoints  CheckpointProvider
-  Modes        ModeProvider
-  Events       EventBus
-  LLM          LLMProvider
-  Execution    ExecutionContext      // fase + plan + todos
-  Observations ObservationStore     // memoria de trabajo (sesión)
-  Prompt       *SystemPromptBuilder // prompt en capas
-  Budget       *ContextBudget       // límites de tokens
+    Memory  MemoryProvider
+    Sandbox SandboxDriver
+    Tools   *ToolRegistry
+    Threads ThreadProvider
+    Modes   ModeProvider
+    LLM     LLMProvider
+    Prompt  *SystemPromptBuilder
+    Budget  *ContextBudget
 }
 
 New(opts ...Option) *Engine
-NewWithDefaults(windowSize int) *Engine  // in-memory, presupuesto automático
+NewWithDefaults(windowSize int) *Engine  // sets Prompt + Budget only
 ```
+
+Every field is opt-in. `Has*()` helpers report what's wired.
+
+Skills, plan mode and sub-agents are **tools**, not engine fields:
+
+- `skill_tool.go`  — `skill` tool: discover/load skills as system context
+- `plan_tool.go`   — `enter_plan_mode` / `exit_plan_mode` driven by `PlanController`
+- `agent_tool.go`  — `agent` tool: spawn a sub-agent loop
 
 ---
 
-## Ciclo de vida — 6 fases (`execution_context.go:10`)
-
-```
-0: PhaseOrientation  → leer memoria, cargar skills, construir prompt
-1: PhaseAlignment    → proponer plan si la tarea es compleja
-2: PhasePreparation  → checkpoint, budget enforcement, compaction
-3: PhaseExecution    → loop LLM ↔ tools (agent_loop.go)
-4: PhaseVerification → verificar calidad del output, retry si falla
-5: PhaseClosure      → escribir memoria, expirar observaciones
-```
-
-`ExecutionContext` interface: `Phase()`, `Advance()`, `SetPhase()`, `Propose()`, `Approve()`, `ActivePlan()`, `Todos()`, `MarkDone()`
-
----
-
-## Runtime — orquestador (`runtime.go:34`)
+## Runtime — orchestrator (`sdk/runtime.go`)
 
 ```go
-Runtime.Run(ctx, conv, userMessage) (*RuntimeResult, error)
-Runtime.RunStream(ctx, conv, userMessage) <-chan StreamEvent
-
-// 22 opciones encadenables:
 NewRuntime(engine).
-  WithMode(modeID).
-  WithMemoryRoots(roots...).
+  WithMode("balanced").
+  WithModel("anthropic/claude-sonnet-4-5").
+  WithSafety(safetyChain).
+  WithPermissions(permEngine).
+  WithTokenizer(tok).
+  WithConversationStore(store).
+  WithSessionContext(prov).
+  WithCompactor(&LLMCompactor{LLM: engine.LLM}).
+  WithPlanController(planCtl).
   WithMaxMemoryTokens(8_000).
-  WithSafety(chain).
-  WithOutputFilter(chain).
-  WithVerification(chain).
-  WithMaxVerifyRetry(1).
-  WithCompactor(&EpisodicCompactor{}).
-  WithPlanner(&LLMPlanner{}).
-  WithAutoApprovePlan(true).
-  WithThinkingBudget(n)
+  WithMemoryRoots(DefaultMemoryRoots...).
+  WithThinkingBudget(2048)
+
+runtime.Run(ctx, conv, userMessage)        // (*RuntimeResult, error)
 ```
 
-`RuntimeResult` contiene: `Response`, `Turns`, `Usage`, `StopReason`, `SkillsLoaded`, `MemoryWritten`, `Trace`, `PlanProposed`, `WellbeingSignal`, `VerificationVerdict`
+There is currently **no separate `RunStream` on Runtime** — for streaming you
+either consume the LLM provider directly or use `RunAgentLoopWithEngine` with
+a `Streaming` LLM. The example backend bridges `StreamEvent`s to SSE.
+
+`RuntimeResult`: `Response`, `Turns`, `Usage`, `StopReason`, `MemoryWritten`,
+`Trace`, `PlanProposed`, `WellbeingSignal`.
 
 ---
 
-## AgentLoop — loop LLM↔tool (`agent_loop.go:132`)
-
-Loop de bajo nivel sin dependencias de Engine. Útil para casos custom.
+## AgentLoop — low-level (`sdk/agent_loop.go`)
 
 ```go
 RunAgentLoop(ctx, AgentLoopConfig, messages) (*AgentLoopResult, error)
 RunAgentLoopWithEngine(ctx, engine, modeID, cfg, messages) (*AgentLoopResult, error)
-
-AgentLoopConfig{
-  Provider, SystemPrompt, Model, Tools, Sandbox, SandboxID, Events,
-  MaxTurns, MaxRetries,
-  OnTurn, OnToolCall, OnToolResult, ShouldStop, OnError, BuildRequest,
-}
 ```
 
-- Retry exponencial: 1s → 2s → 4s → 8s → 16s → 30s (cap)
-- Transient errors: 429, 5xx, timeout, EOF
-- Permanent errors: 401, 403, 400, context_length_exceeded
+- Retry/backoff on transient errors (429, 5xx, timeout, EOF)
+- Permanent: 401 / 403 / 400 / `context_length_exceeded`
 
 ---
 
-## Interfaces de providers
+## Layered system prompt (`sdk/system_prompt.go`)
 
-### LLMProvider (`llm.go:178`)
-```go
-interface LLMProvider {
-  Chat(ctx, ChatRequest) (*ChatResponse, error)
-}
-interface StreamingLLMProvider {
-  ChatStream(ctx, ChatRequest) (<-chan StreamEvent, error)
-}
-// Multi-modelo:
-RoutedLLMProvider → ParseModelRef("anthropic/claude-sonnet") → ("anthropic", "claude-sonnet")
+Six layers, assembled in priority order each turn:
+
 ```
-Providers: `providers/llm/anthropic.go`, `openai.go` (compatible con Groq/Together/Mistral), `ollama.go`
-
-### MemoryProvider (`memory.go:25`)
-```go
-interface MemoryProvider {
-  View / Create / StrReplace / Delete / Rename / List / Search
-}
-// Scopes: ScopeUser (cross-project), ScopeProject, ScopeSession
-// Layers: MemoryLayerExplicit > MemoryLayerInferred > MemoryLayerSession
-// DefaultMemoryRoots: /profile, /facts (user) + / (project)
-```
-Impl: `providers/memory/filesystem.go` — archivos en `{root}/user/` y `{root}/project/`
-
-### SandboxDriver (`sandbox.go:7`)
-```go
-interface SandboxDriver {
-  Create(ctx, SandboxConfig) (id, error)
-  Exec(ctx, id, command) (ExecResult, error)
-  ExecStream(ctx, id, command) (<-chan ExecOutput, error)  // nil = no soportado
-  WriteFile / ReadFile / Destroy / Status / IP
-}
-SandboxConfig{ Image, DefaultCwd, Env, Labels, Volumes []Volume }
-Volume{ Name, MountPath, ReadOnly, PVC *PVCVolumeSource, SubPath }
-```
-- `providers/sandbox/opensandbox.go` → `OpenSandboxDriver` (server local/remoto en :8080)
-- `providers/sandbox/local.go` → `LocalSandbox` (tmpdir en host, **solo dev/test**)
-
-### SkillProvider (`skill.go:129`)
-```go
-interface SkillProvider { Load / Unload / Loaded / Match / List / Get }
-Skill{ Meta (YAML frontmatter), Triggers, GrantedTools, Content (markdown) }
-MatchScore(text) → 0–1 por trigger hits + especificidad
-SkillReloader (skill_reload.go) → polling SHA-1 cada 5s, auto-reload
+Core      → invariant identity (set once)
+Behavior  → DefaultBehaviorPrompt
+Memory    → injected from MemoryProvider on conversation start
+Skills    → content of currently loaded skills (via skill_tool)
+Session   → ephemeral context (time, current state)
+Mode      → active mode overlay (most specific)
 ```
 
-### ToolRegistry (`tool.go:86`)
-```go
-Tool{ Name, Description, Category, Parameters, Execute func(ctx,sandboxID,args), Hidden }
-ToolRegistry: Register / Get / List / ByCategory / Search / Reveal / Hide / ToolDefs
-ToolDispatcher: Dispatch / DispatchAll / DispatchParallel / AreIndependent
-```
-Categorías: `Workspace`, `Compute`, `Data`, `Web`, `Planning`, `Comm`, `Integrations`, `Memory`, `Custom`
-
-### ThreadProvider (`thread.go:39`)
-```go
-interface ThreadProvider { Create / Get / Archive / SendMessage }
-interface MultiUserThreadProvider extends ThreadProvider {
-  CreateForUser / GetForUser / ListByUser
-}
-Thread{ ID, UserID, ProjectID, ModeID, Status, ParentID }
-```
-Impls: `providers/thread/sqlite.go`, `postgres.go`, `memory.go`
-
-### ModeProvider (`mode.go:120`)
-```go
-Mode{ ID, Name, BaseModeID, PromptContent, ModelSettings, ToolsMode, ToolsList }
-Mode.IsToolAllowed(name) bool
-BaseModes: balanced | analyst | deep_work
-```
+`Build()`, `BuildWithBudget(tok)`, `Set(layer, content)`, `Append`, `Clear`,
+`SetMaxLayerTokens(layer, n)`.
 
 ---
 
-## Sistemas auxiliares
+## Memory — typed memdir (`sdk/memdir.go`, `sdk/memory.go`, `sdk/memory_tool.go`)
 
-### SystemPromptBuilder (`system_prompt.go:74`)
-6 capas en orden: `Core → Behavior → Memory → Skills → Session → Mode`
+Mirrors Claude Code's `memdir/` 1:1.
+
+- **Closed taxonomy:** `user | feedback | project | reference`
+- **Two scopes:** `ScopeUser` (cross-project) and `ScopeProject`
+- **Index file:** `MEMORY.md` per scope
+  - Auto-seeded on first `create`
+  - Auto-appended `- [Title](file.md) — hook` line on every subsequent `create`
+  - Idempotent (skips if `(filename.md)` already in index)
+  - Skipped when path itself is `MEMORY.md`
+- **Tool:** single multi-op tool `memory` with operations:
+  `view`, `create`, `str_replace`, `delete`, `rename`, `list`, `search`, `find_relevant`
+- **Read-before-write contract:** `ReadBeforeWriteTracker` requires a `view` (or
+  fresh `create`) before `str_replace`/`delete` in the same session. Disable for
+  scripted seeding via `MemoryToolConfig.DisableReadBeforeWrite`.
+- **Per-turn `<system-reminder>`:** wraps the manifest + per-scope `MEMORY.md`,
+  capped at `MaxMemdirEntrypointLines` (200).
+
+`MemoryProvider` interface:
+
 ```go
-Build() / BuildWithBudget(tok) / Set(layer, content) / Append / Clear / Get
-SetMaxLayerTokens(layer, n)
+View / Create / StrReplace / Delete / Rename / List / Search
 ```
 
-### ContextBudget (`context_budget.go:16`)
+Some impls also satisfy `MemoryStater` (used by the tool to do an exists-check
+without confusing populated scopes with phantom files).
+
+Filesystem layout (used by `providers/memory/filesystem.go` and the example):
+
 ```
-DefaultContextBudget(windowSize) → 10% skills · 15% memory · 60% history · 15% reserve
-Enforce() → evict skills LRU + truncate history + EnforcementResult
-```
-
-### Compaction (`compaction.go`)
-| Impl | Estrategia |
-|------|-----------|
-| `LLMCompactor` | LLM resume mensajes eliminados (≤200 palabras) |
-| `BulletCompactor` | Heurístico offline: últimas 3 respuestas (≤600 chars) |
-| `EpisodicCompactor` | Scoring 0–1 por importancia + LLM con transcripción scored |
-
-### Safety (`safety.go`)
-```go
-// Pre-dispatch:
-SafetyFilter → SafetyVerdict{Allow/Block/Transform}
-DangerousCommandFilter → bloquea: rm -rf /, dd, mkfs, fork bombs, curl|sh
-SecretLeakFilter → bloquea: sk-ant-, ghp_, AKIA, xoxb-...
-SafetyChain → primer Block gana, Transforms se acumulan
-
-// Post-generación:
-OutputFilter → OutputVerdict{Allow/Block/Transform}
-SecretRedactionFilter → [REDACTED]
-MaxLengthFilter / DisclaimerFilter
-
-// Bienestar:
-DefaultWellbeingDetector → keywords EN+ES (crisis, self-harm, ED)
-WellbeingSeverity: None | Low | Medium | High
+memory/
+├── user/
+│   ├── MEMORY.md
+│   └── *.md
+└── project/
+    ├── MEMORY.md
+    └── *.md
 ```
 
-### Human-in-the-Loop (`human_in_loop.go`, `interrupt.go`)
-```go
-// Moderno:
-InterruptKind: Approval | Question | FormInput
-InterruptGate.Wait(ctx, req) / Respond(resp)
-IssueResolutionToken(id, ttl) → base64url(id||expiry).HMAC-SHA256
+**Anti-patterns to avoid in the agent:**
 
-// Legacy facade:
-ApprovalGate → facade sobre InterruptGate
-HumanApprovalFilter → pausa para aprobación (bash/file_write/file_delete por defecto)
-```
-
-### Streaming (`streaming.go`)
-```go
-StreamEvent.Type: delta | thinking | tool_call | tool_result | plan_proposed |
-                  interrupt_required | artifact_created | subagent_result | done | error
-FanOutStream(ch) → broadcast a múltiples consumidores
-CollectStream(ch) → drain a AgentLoopResult completo
-```
-
-### Artifacts (`artifact.go`)
-```go
-ArtifactKind: File | Component
-ArtifactPlacement: Canvas | Inline
-EmitArtifact(ctx, artifact) → adjuntar a turn de streaming
-RequestInterrupt(ctx, req) → pausar para input de usuario (form/pregunta)
-```
-
-### Subagents (`subagent.go`)
-```go
-Subagent{ Task, Engine, MaxTurns(10), Timeout(60s), AllowMemoryWrites(false) }
-Run(ctx) → SubagentResult{ Output, Turns, Usage, StopReason, Trace }
-SendFollowUp(ctx, message) → conversación persistente
-RunSubagentsInParallel(ctx, agents) → resultados en orden de entrada
-```
-
-### Observaciones (`observation.go`)
-```go
-ObservationStore: Record / Relevant(query, limit) / All / Expire / Clear
-// Solo scope sesión. Se expiran en PhaseClosure.
-// InMemoryObservationStore: keyword matching ponderado por campo Relevance
-```
-
-### Verificación (`verification.go`)
-```go
-VerificationStrategy.Verify(ctx, result, conv) → Verdict{Pass, Retry, Reason}
-Impls: NoOpVerification | CompletionVerification | LocalVerification |
-       IntrinsicVerification | CriteriaVerification (LLM) | VerificationChain
-```
-
-### EventBus (`event.go`)
-```go
-EventBus: Publish / Subscribe(eventType, fn) → *Subscription / Unsubscribe
-// Tipos: AgentLoop*, PhaseAdvanced, Plan*, SafetyBlocked,
-//        Verification*, MemoryWritten, Subagent*
-```
-
-### Plan/Planner (`plan.go`, `alignment.go`)
-```go
-Plan{ Executables []Executable, Approved, AutoApprove }
-Executable.Status: Planned → Queued → InProgress → Completed|Failed|Blocked|Cancelled
-Plan.NextReady() → listos (sin dependencias pendientes)
-Planner: HeuristicPlanner (keywords) | LLMPlanner (call extra)
-```
+- Calling `memory create` with empty `path` → rejected
+- Re-calling `create` after a collision → use `view` then `str_replace`
+- Shelling out via `bash` to read memory → forbidden by tool prompt
+- Storing code patterns / git history as memory → not derivable rule violated
 
 ---
 
-## Cómo se ensambla en backend-chat
+## Streaming (`sdk/streaming.go`)
 
-`example/backend-chat/` es el ejemplo canónico de uso completo.
+`StreamEvent.Type`:
 
 ```
-main.go           → HTTP en :9090, SQLite, Centrifugo, R2
-llm_factory.go    → RoutedLLMProvider: anthropic + openai + ollama + EchoLLM (fallback)
-mode_provider.go  → newModeEngine(): ensambla Engine + Runtime por chat
-runner_runtime.go → agentRuntime, buildToolRegistry() (con/sin sandbox)
-sandbox_provider.go → sandboxManager singleton, tools: bash/code_interpreter/file_read/file_write
+delta · thinking · tool_call · tool_result ·
+plan_mode_changed · interrupt_required · interrupt_resolved ·
+artifact_created · artifact_updated · agent_result ·
+turn_complete · compaction · done · error
 ```
 
-**Ensamblaje del Engine** (`mode_provider.go:70`):
-```go
-engine := ab.NewWithDefaults(128_000)
-engine.LLM = provider
-engine.Skills = skills
-engine.Memory = memory
-// ... tools, threads, checkpoints, modes, prompt layers
-```
+Helpers: `FanOutStream(ch)`, `CollectStream(ch)`.
 
-**Sandbox** (`sandbox_provider.go:31`):
-- `isSandboxAvailable()` → chequea `OPEN_SANDBOX_API_KEY`
-- `OpenSandboxDriver` para el servidor en `localhost:8080`
-- `LocalSandbox` para dev sin servidor
+In `example/backend-chat/main.go` (~line 651) each type maps to an SSE event
+name. The frontend `handleStreamEvent` in `chat-main.tsx` consumes them.
+
+The `error` event MUST be terminal; the backend always emits a final `done`
+afterwards so clients can stop waiting. `classifyStreamError` (backend-chat)
+maps raw provider errors → `{billing, rate_limit, auth, context_length,
+timeout, network, unknown}` with friendly Spanish messages.
 
 ---
 
-## Dependencias Go (`sdk/go.mod`)
+## Other key files
 
-| Paquete | Uso |
-|---------|-----|
-| `github.com/alibaba/OpenSandbox/sdks/sandbox/go v1.0.0` | Driver sandbox remoto |
-| `github.com/dlclark/regexp2 v1.9.0` | Regex avanzado (UTF-16, .NET flavor) |
-| `github.com/mattn/go-sqlite3 v1.14.44` | Persistencia local (threads, conversations) |
-| `github.com/tiktoken-go/tokenizer v0.3.0` | Conteo de tokens BPE |
-
----
-
-## Variables de entorno relevantes (backend-chat)
-
-| Variable | Descripción |
-|----------|-------------|
-| `ANTHROPIC_API_KEY` | Clave Anthropic |
-| `OPENAI_API_KEY` | Clave OpenAI |
-| `OPENAI_BASE_URL` | Base URL compatible OpenAI |
-| `OLLAMA_BASE_URL` | Ollama (default localhost:11434) |
-| `BACKEND_MODEL` | Modelo por defecto |
-| `OPEN_SANDBOX_API_KEY` | Activa sandbox tools |
-| `OPEN_SANDBOX_DOMAIN` | Host del servidor sandbox |
-| `OPEN_SANDBOX_PROTOCOL` | `http` o `https` |
-| `OPEN_SANDBOX_TTL_SECONDS` | TTL del sandbox (default 21600) |
-| `CENTRIFUGO_API_URL` | Pub/sub realtime |
-| `CENTRIFUGO_API_KEY` | Auth Centrifugo |
+| File | What it is |
+|------|------------|
+| `agent_tool.go`         | `agent` tool — sub-agent loop |
+| `skill_tool.go`         | `skill` tool — discover/load skills as context |
+| `plan_tool.go`          | `enter_plan_mode` / `exit_plan_mode` + `PlanController` |
+| `interrupt.go`          | HIL: `Approval`, `Question`, `FormInput` |
+| `interrupt_store.go`    | Persistence of pending interrupts |
+| `compaction.go`         | `LLMCompactor` / `BulletCompactor` / `EpisodicCompactor` |
+| `context_budget.go`     | Skills / memory / history / reserve enforcement |
+| `safety.go`             | Pre-dispatch filters + secret leak detection |
+| `permissions.go`        | Per-tool / per-path permission engine |
+| `reasoning.go`          | Thinking budget for reasoning models |
+| `system_reminder.go`    | `<system-reminder>` injection (per-turn dynamic) |
+| `replay.go` / `tracing.go` | Trace capture and replay |
+| `conversation_store.go` | Persistence of `Conversation` state |
+| `session_context.go`    | Pluggable session-context provider |
 
 ---
 
-## Clients TypeScript
+## Bundled providers
 
-**harness-client** (`clients/harness-client/`):
+| Kind | Path | Implementations |
+|------|------|-----------------|
+| LLM        | `providers/llm/`        | `anthropic`, `openai` (works for Groq/Together/Mistral via base URL), `ollama` |
+| Memory     | `providers/memory/`     | `filesystem` |
+| Sandbox    | `providers/sandbox/`    | `opensandbox` (remote/local server), `dev` (in-process) |
+| Threads    | `providers/thread/`     | `sqlite`, `postgres`, `memory` |
+| Tokenizers | `providers/tokenizers/` | `tiktoken`, `byte`, `auto` |
+| Stores     | `providers/store/`      | `filesystem` ConversationStore |
+
+Multi-model routing via `RoutedLLMProvider` (`sdk/llm_router.go`):
+`runtime.WithModel("anthropic/claude-sonnet-4-5")` →
+`ParseModelRef` → `("anthropic", "claude-sonnet-4-5")`.
+
+---
+
+## Example backend-chat (`example/backend-chat/`)
+
+The canonical end-to-end reference. Wires everything in `main.go` + helpers:
+
+| File | Role |
+|------|------|
+| `main.go`              | HTTP + SSE on `:9090`, SQLite, Centrifugo, R2; `classifyStreamError` |
+| `llm_factory.go`       | `RoutedLLMProvider`: anthropic + openai + ollama + Echo fallback |
+| `mode_provider.go`     | `newModeEngine`: assembles Engine + Runtime per chat |
+| `runner_runtime.go`    | `agentRuntime`, `buildToolRegistry()` (with/without sandbox) |
+| `sandbox_provider.go`  | `sandboxManager` singleton; tools: `bash` / `code_interpreter` / `file_read` / `file_write` |
+| `memory_provider.go`   | Wires the filesystem memdir under `./memory/` |
+| `thread_provider.go`   | SQLite ThreadProvider |
+| `interrupt_registry.go`| HIL adapter for SSE interrupts |
+| `webhook_handlers.go`  | Async event ingest |
+
+DB: `chat.db` (SQLite). **Never run two backend processes against the same DB**
+— SQLite WAL doesn't tolerate two writers and the file will corrupt. Recovery:
+`cp chat.db chat.db.bak && sqlite3 chat.db.bak .recover > recovered.sql && rm chat.db && sqlite3 chat.db < recovered.sql`.
+
+### Env vars
+
+| Variable | Purpose |
+|----------|---------|
+| `ANTHROPIC_API_KEY`           | Anthropic key |
+| `OPENAI_API_KEY` / `OPENAI_BASE_URL` | OpenAI-compatible endpoint |
+| `OLLAMA_BASE_URL`             | Ollama (default `http://localhost:11434`) |
+| `BACKEND_MODEL`               | Default model ref (e.g. `anthropic/claude-sonnet-4-5`) |
+| `OPEN_SANDBOX_API_KEY` / `OPEN_SANDBOX_DOMAIN` / `OPEN_SANDBOX_PROTOCOL` / `OPEN_SANDBOX_TTL_SECONDS` | OpenSandbox |
+| `CENTRIFUGO_API_URL` / `CENTRIFUGO_API_KEY` | Real-time pub/sub |
+
+---
+
+## Frontend chat-app (`example/chat-app/`)
+
+React + Vite, port `:3000`.
+
+- `features/chat/types.ts`           — wire types (mirrors generated `events.ts`)
+- `features/chat/api.ts`             — `adaptSSEEvent` parses SSE → `StreamEvent`
+- `components/chat-main/chat-main.tsx` — `handleStreamEvent` consumes events
+  - Includes `case "error"` that:
+    - sets a dismissible red banner via `streamError` state
+    - replaces the empty assistant bubble with `⚠️ <message>`
+  - Plus `case "compaction"`, `case "plan_mode_changed"`, etc.
+
+The `StreamEvent` discriminated union uses a `done` literal as last variant —
+TypeScript will mark `case "error"` after `case "done"` as unreachable. Put
+`error` **before** `done`.
+
+---
+
+## TS clients & code generation
+
+```bash
+make client              # tygo + gen-events
+make client-types-check  # CI guard — fails on diff
+```
+
+Sources of truth:
+- `sdk/*.go` → `clients/harness-client/src/generated/types.ts` via tygo (`clients/tygo.yaml`)
+- `sdk/streaming.go` → `clients/harness-client/src/generated/events.ts` via `scripts/gen-events`
+
+Always commit regenerated files alongside Go changes that touch exported
+streaming/protocol types — CI fails otherwise.
+
+React entrypoint:
+
 ```ts
-connect(options: ConnectOptions): HarnessSession
-HarnessSession.on<T>(type, handler) → unsubscribe
-HarnessSession.resolveInterrupt(chatId, id, response)
-HarnessSession.done() → Promise<void>
-```
-
-**harness-react** (`clients/harness-react/`):
-```ts
-useHarness(options) → { session, events, lastEvent, error, done, send, on }
+useHarness({ baseUrl, chatId }) → { session, events, lastEvent, send, on }
 useArtifacts(session) → Artifact[]
 useInterrupts(session) → { requests, respond }
 ```
 
-Tipos generados automáticamente desde Go via `tygo` (`clients/tygo.yaml`) → `make client-types`
+---
+
+## Build & test
+
+```bash
+# SDK
+cd sdk && go build ./... && go test ./...
+
+# example backend
+cd example/backend-chat && go build ./... && go run .
+
+# example frontend
+cd example/chat-app && pnpm install && pnpm exec tsc --noEmit && pnpm dev
+```
+
+The repo uses `go.work`. The SDK and `example/backend-chat` are **separate
+modules**; `go build ./...` from the repo root won't work.
+
+---
+
+## Lessons (recurring)
+
+- **SQLite single-writer** — never run two backends against the same `chat.db`.
+- **Stream consumers must handle every event type** — silent hangs come from
+  missing branches in `handleStreamEvent`.
+- **Always emit a terminal `done`** even on error so the client stops waiting.
+- **Memory tool: read-first** — `view` before any write; never shell out via
+  `bash`; never create with empty `path`.
+- **TS discriminated unions:** `error` must come before `done` in the switch
+  or TS marks it unreachable.
+- **`error` SSE payload** should be `{error, category, detail}` — frontend
+  surfaces `category` as a badge and shows `detail` under a `<details>`.
